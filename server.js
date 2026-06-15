@@ -42,9 +42,38 @@ app.post('/api/admin/regenerate-ea-key',auth,(req,res)=>{if(req.user.role!=='adm
 app.delete('/api/admin/delete-user/:id',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),i=d.users.findIndex(x=>x.id===req.params.id);if(i<0)return res.status(404).json({error:'Tidak ditemukan'});if(d.users[i].role==='admin')return res.status(400).json({error:'Admin tidak boleh dihapus'});let del=d.users.splice(i,1)[0];saveDb(d);res.json({success:true,deleted:del.email})});
 
 app.get('/api/ea/verify',eaAuth,(req,res)=>res.json({ok:true,user:safe(req.eaUser)}));
-app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{let symbol=String(req.query.symbol||'').toUpperCase(),tf=String(req.query.tf||'');let arr=eadb().signals.filter(s=>String(s.engine||'').toUpperCase().includes('SNIPER')&&['OPEN LONG','OPEN SHORT'].includes(s.signal)&&isGradeAPlus(s.grade));if(symbol)arr=arr.filter(s=>String(s.pair).toUpperCase()===symbol);if(tf)arr=arr.filter(s=>String(s.tf)===tf);arr.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));res.json({ok:true,signal:arr[0]||null})});
+app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
+  try{
+    let symbol=String(req.query.symbol||'').toUpperCase();
+    let tf=String(req.query.tf||'');
+    let all=eadb().signals.filter(s=>{
+      const engine=String(s.engine||'').toUpperCase();
+      const isEntry=['OPEN LONG','OPEN SHORT'].includes(s.signal);
+      const isSmc=engine.includes('SMC')&&!engine.includes('HYBRID');
+      const isSniper=engine.includes('SNIPER')&&!engine.includes('HYBRID');
+      return isEntry && isGradeAPlus(s.grade) && (isSmc || isSniper);
+    });
+    if(symbol)all=all.filter(s=>String(s.pair||'').toUpperCase()===symbol);
+    if(tf)all=all.filter(s=>String(s.tf||'')===tf);
 
-app.post('/api/signals/upsert',auth,(req,res)=>{let s=req.body||{};if(!s.pair||!s.signal||!s.entry)return res.status(400).json({error:'Data signal kurang'});let d=sigdb(),key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`,old=d.signals.find(x=>x.key===key);let item={id:old?old.id:uuid(),key,...s,createdAt:s.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),result:String(s.status||'').includes('SL HIT')?'LOSS':String(s.status||'').includes('TP')?'WIN':'RUNNING'};if(old)Object.assign(old,item);else d.signals.push(item);saveSig(d);if(String(s.engine||'').toUpperCase().includes('SNIPER')&&['OPEN LONG','OPEN SHORT'].includes(s.signal)&&isGradeAPlus(s.grade)){let ed=eadb(),eo=ed.signals.find(x=>x.key===key),ei={id:eo?eo.id:uuid(),key,pair:s.pair,tf:s.tf,signal:s.signal,engine:s.engine,grade:s.grade,entry:s.entry,tp1:s.tp1,tp2:s.tp2,tp3:s.tp3,sl:s.sl,createdAt:s.createdAt||new Date().toISOString()};if(eo)Object.assign(eo,ei);else ed.signals.push(ei);saveEa(ed)}res.json({success:true})});
+    const rank=s=>{
+      const e=String(s.engine||'').toUpperCase();
+      if(e.includes('SMC')&&!e.includes('HYBRID'))return 1;
+      if(e.includes('SNIPER')&&!e.includes('HYBRID'))return 2;
+      return 9;
+    };
+
+    all.sort((a,b)=>{
+      const pa=rank(a),pb=rank(b);
+      if(pa!==pb)return pa-pb;
+      return new Date(b.createdAt||0)-new Date(a.createdAt||0);
+    });
+
+    res.json({ok:true,priority:'SMC > SNIPER A/A+ | HYBRID ignored',signal:all[0]||null});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
+app.post('/api/signals/upsert',auth,(req,res)=>{let s=req.body||{};if(!s.pair||!s.signal||!s.entry)return res.status(400).json({error:'Data signal kurang'});let d=sigdb(),key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`,old=d.signals.find(x=>x.key===key);let item={id:old?old.id:uuid(),key,...s,createdAt:s.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),result:String(s.status||'').includes('SL HIT')?'LOSS':String(s.status||'').includes('TP')?'WIN':'RUNNING'};if(old)Object.assign(old,item);else d.signals.push(item);saveSig(d);if((String(s.engine||'').toUpperCase().includes('SMC')||String(s.engine||'').toUpperCase().includes('SNIPER'))&&!String(s.engine||'').toUpperCase().includes('HYBRID')&&['OPEN LONG','OPEN SHORT'].includes(s.signal)&&isGradeAPlus(s.grade)){let ed=eadb(),eo=ed.signals.find(x=>x.key===key),ei={id:eo?eo.id:uuid(),key,pair:s.pair,tf:s.tf,signal:s.signal,engine:s.engine,grade:s.grade,entry:s.entry,tp1:s.tp1,tp2:s.tp2,tp3:s.tp3,sl:s.sl,createdAt:s.createdAt||new Date().toISOString()};if(eo)Object.assign(eo,ei);else ed.signals.push(ei);saveEa(ed)}res.json({success:true})});
 app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
 
 app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});
@@ -56,4 +85,4 @@ app.get('/api/binance/candles',auth,async(req,res)=>{let symbol=String(req.query
 app.get('/api/twelvedata/candles',auth,async(req,res)=>{if(!KEYS.length)return res.status(500).json({error:'Belum ada Twelve Data key'});let symbol=String(req.query.symbol||'XAU/USD').toUpperCase(),interval=req.query.interval||'5min',n=Math.min(Number(req.query.outputsize||180),500),ck=`T|${symbol}|${interval}|${n}`,c=getC(ck);if(c)return res.json({...c,cached:true});let key=KEYS[keyIndex++%KEYS.length],url=new URL('https://api.twelvedata.com/time_series');url.searchParams.set('symbol',symbol);url.searchParams.set('interval',interval);url.searchParams.set('outputsize',String(n));url.searchParams.set('format','JSON');url.searchParams.set('apikey',key);let r=await fetch(url),d=await r.json();if(!r.ok||d.status==='error')return res.status(502).json({error:d.message||'Twelve Data error'});let out={symbol,interval,source:'Twelve Data',values:d.values,cached:false};setC(ck,out);res.json(out)});
 app.get('/api/health',(req,res)=>res.json({ok:true}));
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
-ensureAdmin().then(()=>{setupPush();app.listen(PORT,'0.0.0.0',()=>console.log('DEWA SMC V7.3 EXACT SMC PINE running at http://0.0.0.0:'+PORT))});
+ensureAdmin().then(()=>{setupPush();app.listen(PORT,'0.0.0.0',()=>console.log('DEWA SMC V7.4 EA SMC PRIORITY running at http://0.0.0.0:'+PORT))});

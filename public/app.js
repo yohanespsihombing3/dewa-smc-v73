@@ -1000,3 +1000,72 @@ function analyzeSMCPine(symbol,candles,source,htfCandles){
     aiAnalysis
   };
 }
+
+
+/* =========================================================
+   V7.4 EA PRIORITY UPDATE
+   Rule:
+   - EA execute: SMC Grade A/A+ prioritas pertama.
+   - Jika tidak ada SMC A/A+, EA boleh execute SNIPER Grade A/A+.
+   - HYBRID tidak dipakai EA.
+   - Notifikasi dikirim untuk SMC A/A+ dan SNIPER A/A+.
+   ========================================================= */
+function isGradeAPlusV74(g){
+  g=String(g||"").toUpperCase();
+  return g==="A" || g==="A+";
+}
+function isEaAllowedEngineV74(engine){
+  engine=String(engine||"").toUpperCase();
+  if(engine.includes("HYBRID")) return false;
+  return engine.includes("SMC") || engine.includes("SNIPER");
+}
+saveSignal = async function(sym,r){
+  try{
+    if(!r.entry)return;
+    const payload={
+      key:`${sym}|${r.tf||tfLabel()}|${r.signal}|${r.entry}`,
+      pair:sym,
+      tf:r.tf||tfLabel(),
+      signal:r.signal,
+      entry:r.entry,
+      tp1:r.tp1,
+      tp2:r.tp2,
+      tp3:r.tp3,
+      sl:r.sl,
+      status:r.status,
+      createdAt:r.createdAt||new Date().toISOString(),
+      grade:r.grade,
+      engine:r.engine
+    };
+    await api("/api/signals/upsert",{method:"POST",body:JSON.stringify(payload)});
+  }catch(e){}
+};
+broadcastSignal = async function(sym,r){
+  try{
+    const isEntry=["OPEN LONG","OPEN SHORT"].includes(r.signal);
+    const isA=isGradeAPlusV74(r.grade);
+    const allowed=isEaAllowedEngineV74(r.engine);
+    if(!isEntry || !isA || !allowed){
+      log("Notif/EA skip: hanya SMC/SNIPER Grade A/A+. "+sym+" engine="+(r.engine||"-")+" grade="+(r.grade||"-"));
+      return;
+    }
+    await api("/api/push/broadcast",{
+      method:"POST",
+      body:JSON.stringify({
+        pair:sym,
+        signal:r.signal,
+        grade:r.grade,
+        engine:r.engine,
+        priority:String(r.engine||"").toUpperCase().includes("SMC")?"SMC PRIORITY":"SNIPER BACKUP",
+        entry:priceFmt(sym,r.entry),
+        tp1:priceFmt(sym,r.tp1),
+        tp2:priceFmt(sym,r.tp2),
+        tp3:priceFmt(sym,r.tp3),
+        sl:priceFmt(sym,r.sl)
+      })
+    });
+    log("Notif dikirim: "+sym+" "+r.signal+" "+(r.engine||"-")+" Grade "+r.grade);
+  }catch(e){
+    log("Broadcast notif gagal: "+e.message);
+  }
+};

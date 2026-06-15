@@ -125,3 +125,24 @@ SMC sudah dipatch berdasarkan Pine Script DewaSMC ELITE yang Anda upload:
 Estimasi SMC sekarang:
 - SMC core: ±94–97% mirip Pine pada data feed yang sama.
 - Selisih tetap mungkin dari feed TradingView vs Binance/TwelveData dan detail internal `ta.pivot*` pada candle real-time.
+
+
+## V7.4 EA SMC Priority
+Aturan terbaru:
+- EA tidak memakai HYBRID.
+- EA prioritas pertama: SMC Grade A/A+.
+- Jika tidak ada SMC Grade A/A+, EA boleh mengambil SNIPER Grade A/A+.
+- SMC dan SNIPER boleh sama-sama aktif di dashboard.
+- Endpoint EA `/api/ea/latest-signal` memilih prioritas:
+  1. SMC A/A+
+  2. SNIPER A/A+
+- Notifikasi dikirim untuk:
+  - SMC A/A+
+  - SNIPER A/A+
+- Grade B/C tidak execute EA.
+- Partial TP tetap konsep lama:
+  - TP1 dibuka dulu.
+  - TP2 dibuka setelah TP1 selesai.
+  - TP3 dibuka setelah TP2 selesai.
+  - TP2/TP3 bisa dinonaktifkan dari input EA.
+  - Jika salah satu posisi close loss/SL, EA close semua posisi DEWA.

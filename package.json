@@ -1,6 +1,6 @@
 {
-  "name": "dewa-smc-v73-exact-smc-pine-final",
-  "version": "7.3.0",
+  "name": "dewa-smc-v75-ea-pending-chain-final",
+  "version": "7.5.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

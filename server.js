@@ -2,6 +2,37 @@
 require('dotenv').config();
 const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
 const app=express(),PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET||'change-me',CACHE_MS=Number(process.env.CACHE_SECONDS||120)*1000;
+const webpush = require('web-push');
+const fs = require('fs');
+const path = require('path');
+
+app.use(express.json());
+
+const SUB_FILE = path.join(__dirname, 'data', 'push-subscriptions.json');
+
+function readSubscriptions() {
+  try {
+    if (!fs.existsSync(SUB_FILE)) {
+      fs.mkdirSync(path.dirname(SUB_FILE), { recursive: true });
+      fs.writeFileSync(SUB_FILE, JSON.stringify({ subscriptions: [] }, null, 2));
+    }
+
+    const data = fs.readFileSync(SUB_FILE, 'utf8');
+    return JSON.parse(data).subscriptions || [];
+  } catch (err) {
+    console.error('Read subscriptions error:', err);
+    return [];
+  }
+}
+
+function saveSubscriptions(subscriptions) {
+  try {
+    fs.mkdirSync(path.dirname(SUB_FILE), { recursive: true });
+    fs.writeFileSync(SUB_FILE, JSON.stringify({ subscriptions }, null, 2));
+  } catch (err) {
+    console.error('Save subscriptions error:', err);
+  }
+}
 const KEYS=[process.env.TWELVE_DATA_API_KEY_1,process.env.TWELVE_DATA_API_KEY_2,process.env.TWELVE_DATA_API_KEY_3].filter(Boolean);
 let keyIndex=0;const cache=new Map(),DATA=path.join(__dirname,'data'),UF=path.join(DATA,'users.json'),SF=path.join(DATA,'signals.json'),EF=path.join(DATA,'ea-signals.json'),PF=path.join(DATA,'push-subscriptions.json'),KF=path.join(DATA,'push-keys.json');
 app.use(cors());app.use(express.json({limit:'3mb'}));app.use(express.static(path.join(__dirname,'public')));
@@ -30,6 +61,68 @@ app.post('/api/auth/register',async(req,res)=>{
     saveDb(d);
     res.json({success:true});
   }catch(e){res.status(500).json({error:e.message})}
+});
+app.get('/api/subscriptions', (req, res) => {
+  const subscriptions = readSubscriptions();
+  res.json({ subscriptions });
+});
+
+app.post('/api/subscribe', (req, res) => {
+  const subscription = req.body;
+
+  if (!subscription || !subscription.endpoint) {
+    return res.status(400).json({
+      success: false,
+      error: 'Subscription tidak valid'
+    });
+  }
+
+  const subscriptions = readSubscriptions();
+
+  const exists = subscriptions.find(
+    item => item.endpoint === subscription.endpoint
+  );
+
+  if (!exists) {
+    subscriptions.push(subscription);
+    saveSubscriptions(subscriptions);
+  }
+
+  res.json({
+    success: true,
+    total: subscriptions.length
+  });
+});
+
+app.post('/api/test-notification', async (req, res) => {
+  try {
+    const subscriptions = readSubscriptions();
+
+    const payload = JSON.stringify({
+      title: '⚡ DEWA SMC SIGNAL',
+      body: 'Signal baru tersedia.',
+      icon: '/icon-192.png',
+      url: '/'
+    });
+
+    for (const sub of subscriptions) {
+      try {
+        await webpush.sendNotification(sub, payload);
+      } catch (err) {
+        console.error('Push send error:', err.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      sent: subscriptions.length
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
 });
 app.post('/api/auth/login',async(req,res)=>{try{let email=String(req.body.email||'').toLowerCase().trim(),pw=String(req.body.password||''),u=db().users.find(x=>x.email===email);if(!u||!u.passwordHash||!await bcrypt.compare(pw,u.passwordHash))return res.status(401).json({error:'Login gagal'});if(!active(u))return res.status(403).json({error:'Belum approve / expired'});res.json({token:makeToken(u),user:safe(u)})}catch(e){res.status(500).json({error:e.message})}});
 app.post('/api/auth/change-password',auth,async(req,res)=>{let d=db(),u=d.users.find(x=>x.id===req.user.id),p=String(req.body.password||'');if(p.length<6)return res.status(400).json({error:'Password minimal 6'});u.passwordHash=await bcrypt.hash(p,10);u.mustChangePassword=false;saveDb(d);res.json({success:true})});

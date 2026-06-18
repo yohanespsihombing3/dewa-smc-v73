@@ -105,16 +105,42 @@ app.get('/api/subscriptions', (req, res) => {
 });
 app.get('/test-notification', async (req, res) => {
   try {
-    const result = await sendPushToAll({
+    setupPush();
+
+    const data = pushdb();
+
+    const payload = JSON.stringify({
       title: '🧪 TEST DEWA SMC',
-      body: 'Push notification dari Render berhasil dikirim.',
-      url: '/',
-      tag: 'dewa-smc-test-url',
+      body: 'Push notification berhasil dikirim',
+      icon: '/icon-192.png',
+      url: '/'
     });
 
-    res.json({ success: true, ...result });
+    let sent = 0;
+
+    for (const item of data.subscriptions) {
+      try {
+        const sub = item.subscription || item;
+
+        await webpush.sendNotification(sub, payload);
+
+        sent++;
+      } catch (err) {
+        console.error(err.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      sent,
+      total: data.subscriptions.length
+    });
+
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));

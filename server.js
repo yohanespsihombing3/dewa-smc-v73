@@ -103,5 +103,19 @@ app.get('/api/subscriptions', (req, res) => {
     });
   }
 });
+app.get('/test-notification', async (req, res) => {
+  try {
+    const result = await sendPushToAll({
+      title: '🧪 TEST DEWA SMC',
+      body: 'Push notification dari Render berhasil dikirim.',
+      url: '/',
+      tag: 'dewa-smc-test-url',
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
 ensureAdmin().then(()=>{setupPush();app.listen(PORT,'0.0.0.0',()=>console.log('DEWA SMC V7.5 EA PENDING CHAIN running at http://0.0.0.0:'+PORT))});

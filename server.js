@@ -1,13 +1,71 @@
 
 require('dotenv').config();
 const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
+const { createClient } = require('@supabase/supabase-js');
 const app=express(),PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET||'change-me',CACHE_MS=Number(process.env.CACHE_SECONDS||120)*1000;
+const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
+
+const supabase = USE_SUPABASE
+  ? createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SECRET_KEY
+    )
+  : null;
 const KEYS=[process.env.TWELVE_DATA_API_KEY_1,process.env.TWELVE_DATA_API_KEY_2,process.env.TWELVE_DATA_API_KEY_3].filter(Boolean);
 let keyIndex=0;const cache=new Map(),DATA=path.join(__dirname,'data'),UF=path.join(DATA,'users.json'),SF=path.join(DATA,'signals.json'),EF=path.join(DATA,'ea-signals.json'),PF=path.join(DATA,'push-subscriptions.json'),KF=path.join(DATA,'push-keys.json');
 app.use(cors());app.use(express.json({limit:'3mb'}));app.use(express.static(path.join(__dirname,'public')));
 function ensure(){if(!fs.existsSync(DATA))fs.mkdirSync(DATA,{recursive:true});for(const [f,d] of [[UF,'{"users":[]}'],[SF,'{"signals":[]}'],[EF,'{"signals":[]}'],[PF,'{"subscriptions":[]}']])if(!fs.existsSync(f))fs.writeFileSync(f,d);if(!fs.existsSync(KF))fs.writeFileSync(KF,JSON.stringify(webpush.generateVAPIDKeys(),null,2))}
 function read(f,x){ensure();try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return x}}function write(f,d){ensure();fs.writeFileSync(f,JSON.stringify(d,null,2))}
-function db(){return read(UF,{users:[]})}function saveDb(d){write(UF,d)}function sigdb(){return read(SF,{signals:[]})}function saveSig(d){write(SF,d)}function eadb(){return read(EF,{signals:[]})}function saveEa(d){write(EF,d)}function pushdb(){return read(PF,{subscriptions:[]})}function savePush(d){write(PF,d)}
+function db(){return read(UF,{users:[]})}
+function saveDb(d){write(UF,d)}
+function sigdb(){return read(SF,{signals:[]})}
+function saveSig(d){write(SF,d)}
+function eadb(){return read(EF,{signals:[]})}
+function saveEa(d){write(EF,d)}
+
+let PUSH_CACHE = {subscriptions:[]};
+
+async function loadPushFromSupabase(){
+  if(!USE_SUPABASE || !supabase) return read(PF,{subscriptions:[]});
+
+  const { data, error } = await supabase
+    .from('push_subscriptions_data')
+    .select('id,data');
+
+  if(error){
+    console.error('Supabase load push error:', error.message);
+    return read(PF,{subscriptions:[]});
+  }
+
+  return {
+    subscriptions: (data || []).map(x => x.data)
+  };
+}
+
+async function savePushToSupabase(d){
+  if(!USE_SUPABASE || !supabase){
+    write(PF,d);
+    return;
+  }
+
+  for(const item of d.subscriptions || []){
+    await supabase
+      .from('push_subscriptions_data')
+      .upsert({
+        id: item.id || item.endpoint || uuid(),
+        data: item
+      });
+  }
+}
+
+function pushdb(){
+  return PUSH_CACHE;
+}
+
+function savePush(d){
+  PUSH_CACHE = d;
+  savePushToSupabase(d).catch(e=>console.error('Save push supabase error:',e.message));
+}
 function keys(){return read(KF,webpush.generateVAPIDKeys())}function setupPush(){let k=keys();webpush.setVapidDetails('mailto:admin@dewa.ai',k.publicKey,k.privateKey)}
 function addDays(n){let d=new Date();d.setDate(d.getDate()+Number(n||0));return d.toISOString()}function newKey(){return 'DEWA-'+crypto.randomBytes(24).toString('hex').toUpperCase()}
 function active(u){return u.role==='admin'||((u.status||'ACTIVE')==='ACTIVE'&&u.expiredAt&&new Date(u.expiredAt)>Date.now())}
@@ -144,4 +202,13 @@ app.get('/test-notification', async (req, res) => {
   }
 });
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
-ensureAdmin().then(()=>{setupPush();app.listen(PORT,'0.0.0.0',()=>console.log('DEWA SMC V7.5 EA PENDING CHAIN running at http://0.0.0.0:'+PORT))});
+ensureAdmin().then(async()=>{
+  setupPush();
+  PUSH_CACHE = await loadPushFromSupabase();
+
+  app.listen(PORT,'0.0.0.0',()=>{
+    console.log('DEWA SMC V7.5 EA PENDING CHAIN running at http://0.0.0.0:'+PORT);
+    console.log('Push subscriptions loaded:', PUSH_CACHE.subscriptions.length);
+    console.log('Supabase:', USE_SUPABASE ? 'ON' : 'OFF');
+  });
+});

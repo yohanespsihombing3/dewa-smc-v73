@@ -3,45 +3,48 @@ const $=id=>document.getElementById(id),PRESETS={crypto:["BTC/USD","ETH/USD","SO
 function fmt(x){return Number.isFinite(x)?Number(x).toLocaleString("en-US",{maximumFractionDigits:6}):"-"}function priceFmt(pair,x){if(!Number.isFinite(x))return"-";pair=String(pair||"");if(pair.includes("JPY"))return Number(x).toLocaleString("en-US",{maximumFractionDigits:3});if(pair.includes("/")&&!pair.includes("XAU")&&!pair.includes("XAG"))return Number(x).toLocaleString("en-US",{maximumFractionDigits:5});if(pair.includes("XAU")||pair.includes("XAG"))return Number(x).toLocaleString("en-US",{maximumFractionDigits:2});if(Number(x)>=1000)return Number(x).toLocaleString("en-US",{maximumFractionDigits:2});return Number(x).toLocaleString("en-US",{maximumFractionDigits:4})}
 function authLog(x){$("authLog").textContent=new Date().toLocaleTimeString()+" - "+x+"\n"+$("authLog").textContent}function log(x){$("log").textContent=new Date().toLocaleTimeString()+" - "+x+"\n"+$("log").textContent}function headers(){return{"Content-Type":"application/json","Authorization":"Bearer "+token}}async function api(p,o={}){let r=await fetch(p,{...o,headers:{...(o.headers||{}),...headers()}}),d=await r.json().catch(()=>({}));if(!r.ok||d.error)throw Error(d.error||"API error");return d}
 async function login(){try{let r=await fetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:$("email").value,password:$("password").value})}),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"Login gagal");token=d.token;localStorage.setItem("TOKEN",token);await loadMe()}catch(e){authLog(e.message)}}async function requestAccess(){try{let r=await fetch("/api/auth/request-access",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:$("email").value})}),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"Request gagal");authLog("Request access berhasil. Tunggu approval admin.")}catch(e){authLog(e.message)}}function logout(){localStorage.removeItem("TOKEN");location.reload()}async function loadMe(){try{let d=await api("/api/auth/me");me=d.user;limits=d.limits;$("authScreen").classList.add("hidden");$("appScreen").classList.remove("hidden");$("uEmail").textContent=me.email;$("uPlan").textContent=me.plan;$("uStatus").textContent=me.status;$("uExpired").textContent=(me.expiredAt||"-").slice(0,10);$("uEaKey").textContent=me.eaApiKey||"-";$("adminPanel").style.display=me.role==="admin"?"block":"none";if(me.mustChangePassword)showChangePassword();applyMarket()}catch(e){localStorage.removeItem("TOKEN");authLog(e.message)}}if(token)loadMe();
-function showChangePassword(){$("changePasswordCard").classList.remove("hidden")}async function changePassword(){try{await api("/api/auth/change-password",{method:"POST",body:JSON.stringify({password:$("newPassword").value})});$("changePasswordCard").classList.add("hidden");log("Password berhasil diganti.");await loadMe()}catch(e){log(e.message)}}function saveLocks(){localStorage.setItem("DEWA_V6_LOCKS",JSON.stringify(locks))}function saveLastDir(){localStorage.setItem("DEWA_LAST_DIR",JSON.stringify(DEWA_LAST_DIR))}function symbols(){return $("symbols").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean)}function sleep(ms){return new Promise(r=>setTimeout(r,ms))}function applyMarket(){let m=$("market").value;if(m!=="custom")$("symbols").value=PRESETS[m].join(",")}function stop(){if(autoTimer)clearInterval(autoTimer);autoTimer=null;queueRunning=false;$("scanStatus").textContent="Stopped";log("Stopped")}function resetSignals(){locks={};saveLocks();render()}function start(){stop();scanQueue();autoTimer=setInterval(scanQueue,Number($("refresh").value)*1000);$("scanStatus").textContent="Auto ON"}function isCryptoSymbol(s){return !s.includes("/")&&!s.includes(":")}function tfLabel(){let v=$("tf").value;return v==="60"?"1H":v==="240"?"4H":v+"m"}function getHTFTf(){let tf=String($("tf").value);if(tf==="5")return"60";if(["15","30","60"].includes(tf))return"240";if(tf==="240")return"D";return"60"}function intervalFromTf(src,tf){if(src==="binance"){return tf==="5"?"5m":tf==="15"?"15m":tf==="30"?"30m":tf==="60"?"1h":tf==="240"?"4h":tf==="D"?"1d":"5m"}return tf==="5"?"5min":tf==="15"?"15min":tf==="30"?"30min":tf==="60"?"1h":tf==="240"?"4h":tf==="D"?"1day":"5min"}async function fetchCandles(symbol, customTf=null){
-  let src = "twelvedata";
-  let path = "/api/twelvedata/candles";
-  let tf = customTf || $("tf").value;
+function showChangePassword(){$("changePasswordCard").classList.remove("hidden")}async function changePassword(){try{await api("/api/auth/change-password",{method:"POST",body:JSON.stringify({password:$("newPassword").value})});$("changePasswordCard").classList.add("hidden");log("Password berhasil diganti.");await loadMe()}catch(e){log(e.message)}}function saveLocks(){localStorage.setItem("DEWA_V6_LOCKS",JSON.stringify(locks))}function saveLastDir(){localStorage.setItem("DEWA_LAST_DIR",JSON.stringify(DEWA_LAST_DIR))}function symbols(){return $("symbols").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean)}function sleep(ms){return new Promise(r=>setTimeout(r,ms))}function applyMarket(){let m=$("market").value;if(m!=="custom")$("symbols").value=PRESETS[m].join(",")}function stop(){if(autoTimer)clearInterval(autoTimer);autoTimer=null;queueRunning=false;$("scanStatus").textContent="Stopped";log("Stopped")}function resetSignals(){locks={};saveLocks();render()}function start(){stop();scanQueue();autoTimer=setInterval(scanQueue,Number($("refresh").value)*1000);$("scanStatus").textContent="Auto ON"}function isCryptoSymbol(s){return !s.includes("/")&&!s.includes(":")}function tfLabel(){let v=$("tf").value;return v==="60"?"1H":v==="240"?"4H":v+"m"}function getHTFTf(){let tf=String($("tf").value);if(tf==="5")return"60";if(["15","30","60"].includes(tf))return"240";if(tf==="240")return"D";return"60"}function intervalFromTf(src,tf){
+  if(tf==="5")return"5min";
+  if(tf==="15")return"15min";
+  if(tf==="30")return"30min";
+  if(tf==="60")return"1h";
+  if(tf==="240")return"4h";
+  if(tf==="D")return"1day";
+  return"5min";
+}
 
-  let url = path
-    + "?symbol=" + encodeURIComponent(symbol)
-    + "&interval=" + intervalFromTf("twelvedata", tf)
-    + "&outputsize=180";
+async function fetchCandles(symbol, customTf=null){
+  let tf=customTf||$("tf").value;
+  let url="/api/twelvedata/candles"
+    +"?symbol="+encodeURIComponent(symbol)
+    +"&interval="+intervalFromTf("twelvedata",tf)
+    +"&outputsize=180";
 
-  let r = await fetch(url, {
-    cache: "no-store",
-    headers: {
-      "Authorization": "Bearer " + token
-    }
+  let r=await fetch(url,{
+    cache:"no-store",
+    headers:{"Authorization":"Bearer "+token}
   });
 
-  let d = await r.json();
+  let d=await r.json();
 
-  if(!r.ok || d.error) throw Error(d.error || "Twelve Data error");
+  if(!r.ok||d.error)throw Error(d.error||"Twelve Data error");
 
-  let candles = d.values
-    .map(v => ({
-      time: v.datetime,
-      open: +v.open,
-      high: +v.high,
-      low: +v.low,
-      close: +v.close,
-      volume: +(v.volume || 1)
+  let candles=(d.values||[])
+    .map(v=>({
+      time:v.datetime,
+      open:+v.open,
+      high:+v.high,
+      low:+v.low,
+      close:+v.close,
+      volume:+(v.volume||1)
     }))
-    .filter(c => Number.isFinite(c.close))
+    .filter(c=>Number.isFinite(c.close))
     .reverse();
 
-  if(candles.length < 40) throw Error("Candle < 40");
+  if(candles.length<40)throw Error("Candle < 40");
 
-  return {
-    candles,
-    source: "Twelve Data"
-  };
+  return{candles,source:"Twelve Data"};
+}
 }let src=isCryptoSymbol(symbol)?"binance":"twelvedata",path=src==="binance"?"/api/twelvedata/candles":"/api/twelvedata/candles",tf=customTf||$("tf").value,url=path+"?symbol="+encodeURIComponent(symbol)+"&interval="+intervalFromTf(src,tf)+"&outputsize=180",r=await fetch(url,{cache:"no-store",headers:{"Authorization":"Bearer "+token}}),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"API error");let candles=d.values.map(v=>({time:v.datetime,open:+v.open,high:+v.high,low:+v.low,close:+v.close,volume:+(v.volume||1)})).filter(c=>Number.isFinite(c.close)).reverse();if(candles.length<40)throw Error("Candle < 40");return{candles,source:d.source||src}}
 function lockExpired(sym){let L=locks[sym];if(!L)return true;let age=Date.now()-new Date(L.createdAt||0).getTime();return age>Number($("tf").value||5)*3*60*1000||["🔴 SL HIT","🏆 FULL TP"].includes(L.status)}async function scanQueue(){if(queueRunning)return;queueRunning=true;let list=symbols();if(limits&&list.length>limits.maxPairs){list=list.slice(0,limits.maxPairs)}results=[];render();for(let i=0;i<list.length;i++){let sym=list[i];try{let data=await fetchCandles(sym),htf=null;try{htf=await fetchCandles(sym,getHTFTf())}catch(e){}let sig=analyzeEngine(sym,data.candles,data.source,htf?htf.candles:null),live=sig.livePrice;if(locks[sym]){if(lockExpired(sym)){delete locks[sym];saveLocks()}else{let updated=updateLockedSignal(sym,live);sig={...sig,...updated,candles:sig.candles,locked:true,source:data.source}}}if(!locks[sym]&&["SMC LONG","SMC SHORT","SNIPER LONG","SNIPER SHORT","HYBRID CONFIRM"].includes(sig.status)){locks[sym]={signal:sig.signal,status:"🔵 RUNNING",color:"blue",entry:sig.entry,tp1:sig.tp1,tp2:sig.tp2,tp3:sig.tp3,sl:sig.sl,createdAt:new Date().toISOString(),tf:tfLabel(),pair:sym,grade:sig.grade,engine:sig.engine};saveLocks();sig.status="🔵 RUNNING";sig.color="blue";sig.locked=true;saveSignal(sym,sig);broadcastSignal(sym,sig)}results.push(sig);log(sym+" OK")}catch(e){results.push({symbol:sym,source:"-",signal:"ERROR",status:e.message,color:"yellow",candles:[]});log(sym+" error: "+e.message)}render();if(results.length===1)pick(results[0].symbol);if(i<list.length-1)await sleep(Math.max(Number($("delay").value),limits?limits.delayMs:0))}$("scanStatus").textContent="Scan complete";queueRunning=false;loadAnalytics()}function updateLockedSignal(sym,price){let L=locks[sym];if(!L||!Number.isFinite(price))return L;if(L.signal==="OPEN LONG"){if(price>=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price>=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price>=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price<=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}if(L.signal==="OPEN SHORT"){if(price<=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price<=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price<=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price>=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}saveSignal(sym,L);return L}async function saveSignal(sym,r){try{if(!r.entry)return;await api("/api/signals/upsert",{method:"POST",body:JSON.stringify({key:`${sym}|${r.tf||tfLabel()}|${r.signal}|${r.entry}`,pair:sym,tf:r.tf||tfLabel(),signal:r.signal,entry:r.entry,tp1:r.tp1,tp2:r.tp2,tp3:r.tp3,sl:r.sl,status:r.status,createdAt:r.createdAt||new Date().toISOString(),grade:r.grade,engine:r.engine})})}catch(e){}}
 function ema(a,p){if(!a.length)return NaN;let k=2/(p+1),e=a[0];for(let i=1;i<a.length;i++)e=a[i]*k+e*(1-k);return e}function atr(c,p=14){let t=[];for(let i=1;i<c.length;i++)t.push(Math.max(c[i].high-c[i].low,Math.abs(c[i].high-c[i-1].close),Math.abs(c[i].low-c[i-1].close)));let s=t.slice(-p);return s.length?s.reduce((a,b)=>a+b,0)/s.length:0}function sma(a,p){let s=a.slice(-p);return s.length?s.reduce((x,y)=>x+y,0)/s.length:0}function seriesEma(v,p){let out=Array(v.length).fill(null),k=2/(p+1),e=v[0];out[0]=e;for(let i=1;i<v.length;i++){e=v[i]*k+e*(1-k);out[i]=e}return out}function pineRsi(v,p=14){if(v.length<=p)return 50;let g=0,l=0;for(let i=1;i<=p;i++){let d=v[i]-v[i-1];if(d>=0)g+=d;else l-=d}let ag=g/p,al=l/p;for(let i=p+1;i<v.length;i++){let d=v[i]-v[i-1];ag=(ag*(p-1)+Math.max(d,0))/p;al=(al*(p-1)+Math.max(-d,0))/p}if(al===0)return 100;return 100-(100/(1+ag/al))}function pineMacd(v){let e12=seriesEma(v,12),e26=seriesEma(v,26),m=v.map((_,i)=>(e12[i]||0)-(e26[i]||0)),s=seriesEma(m,9),i=v.length-1;return{macdVal:m[i]||0,macdSig:s[i]||0,macdHist:(m[i]||0)-(s[i]||0)}}function getGrade(s){if(s>=8)return"A+";if(s>=6.5)return"A";if(s>=5)return"B";return"C"}function dmi(c,p=14){let trs=[],pd=[],md=[];for(let i=1;i<c.length;i++){let up=c[i].high-c[i-1].high,down=c[i-1].low-c[i].low;trs.push(Math.max(c[i].high-c[i].low,Math.abs(c[i].high-c[i-1].close),Math.abs(c[i].low-c[i-1].close)));pd.push(up>down&&up>0?up:0);md.push(down>up&&down>0?down:0)}let tr=sma(trs,p),diPlus=tr?100*sma(pd,p)/tr:0,diMinus=tr?100*sma(md,p)/tr:0,adx=(diPlus+diMinus)?100*Math.abs(diPlus-diMinus)/(diPlus+diMinus):0;return{adx,diPlus,diMinus}}function vwap(c){let pv=0,v=0;for(let k of c){let vol=k.volume||1,typ=(k.high+k.low+k.close)/3;pv+=typ*vol;v+=vol}return v?pv/v:c[c.length-1].close}

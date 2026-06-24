@@ -205,7 +205,15 @@ app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')))
 ensureAdmin().then(async()=>{
   setupPush();
   PUSH_CACHE = await loadPushFromSupabase();
-
+app.get('/debug/users', (req,res)=>{
+  res.json(db().users.map(u=>({
+    email:u.email,
+    role:u.role,
+    status:u.status,
+    active:active(u),
+    hasPassword:!!u.passwordHash
+  })));
+});
   app.listen(PORT,'0.0.0.0',()=>{
     console.log('DEWA SMC V7.5 EA PENDING CHAIN running at http://0.0.0.0:'+PORT);
     console.log('Push subscriptions loaded:', PUSH_CACHE.subscriptions.length);

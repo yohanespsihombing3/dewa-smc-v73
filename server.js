@@ -205,7 +205,7 @@ app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')))
 ensureAdmin().then(async()=>{
   setupPush();
   PUSH_CACHE = await loadPushFromSupabase();
-  
+
 app.get('/debug/users', (req,res)=>{
   res.json(db().users.map(u=>({
     email:u.email,
@@ -216,9 +216,9 @@ app.get('/debug/users', (req,res)=>{
   })));
 });
 
-app.get('*',(req,res)=>
-  res.sendFile(path.join(__dirname,'public','index.html'))
-);
+app.get('*',(req,res)=>{
+  res.sendFile(path.join(__dirname,'public','index.html'));
+});
 
 ensureAdmin().then(async()=>{
   setupPush();

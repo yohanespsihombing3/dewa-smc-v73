@@ -1,16 +1,276 @@
-let token=localStorage.getItem("TOKEN")||"",me=null,limits=null,autoTimer=null,queueRunning=false,results=[],selected=null,locks=JSON.parse(localStorage.getItem("DEWA_V6_LOCKS")||"{}"),DEWA_LAST_DIR=JSON.parse(localStorage.getItem("DEWA_LAST_DIR")||"{}");
-const $=id=>document.getElementById(id),PRESETS={crypto:["BTC/USD","ETH/USD","SOL/USD","XRP/USD","ADA/USD"],forex:["EUR/USD","GBP/USD","USD/JPY","AUD/USD","USD/CAD"],gold:["XAU/USD","XAG/USD"],hybrid:["BTC/USD","ETH/USD","XAU/USD","EUR/USD"]};
-function fmt(x){return Number.isFinite(x)?Number(x).toLocaleString("en-US",{maximumFractionDigits:6}):"-"}function priceFmt(pair,x){if(!Number.isFinite(x))return"-";pair=String(pair||"");if(pair.includes("JPY"))return Number(x).toLocaleString("en-US",{maximumFractionDigits:3});if(pair.includes("/")&&!pair.includes("XAU")&&!pair.includes("XAG"))return Number(x).toLocaleString("en-US",{maximumFractionDigits:5});if(pair.includes("XAU")||pair.includes("XAG"))return Number(x).toLocaleString("en-US",{maximumFractionDigits:2});if(Number(x)>=1000)return Number(x).toLocaleString("en-US",{maximumFractionDigits:2});return Number(x).toLocaleString("en-US",{maximumFractionDigits:4})}
-function authLog(x){$("authLog").textContent=new Date().toLocaleTimeString()+" - "+x+"\n"+$("authLog").textContent}function log(x){$("log").textContent=new Date().toLocaleTimeString()+" - "+x+"\n"+$("log").textContent}function headers(){return{"Content-Type":"application/json","Authorization":"Bearer "+token}}async function api(p,o={}){let r=await fetch(p,{...o,headers:{...(o.headers||{}),...headers()}}),d=await r.json().catch(()=>({}));if(!r.ok||d.error)throw Error(d.error||"API error");return d}
-async function login(){try{let r=await fetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:$("email").value,password:$("password").value})}),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"Login gagal");token=d.token;localStorage.setItem("TOKEN",token);await loadMe()}catch(e){authLog(e.message)}}async function requestAccess(){try{let r=await fetch("/api/auth/request-access",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:$("email").value})}),d=await r.json();if(!r.ok||d.error)throw Error(d.error||"Request gagal");authLog("Request access berhasil. Tunggu approval admin.")}catch(e){authLog(e.message)}}function logout(){localStorage.removeItem("TOKEN");location.reload()}async function loadMe(){try{let d=await api("/api/auth/me");me=d.user;limits=d.limits;$("authScreen").classList.add("hidden");$("appScreen").classList.remove("hidden");$("uEmail").textContent=me.email;$("uPlan").textContent=me.plan;$("uStatus").textContent=me.status;$("uExpired").textContent=(me.expiredAt||"-").slice(0,10);$("uEaKey").textContent=me.eaApiKey||"-";$("adminPanel").style.display=me.role==="admin"?"block":"none";if(me.mustChangePassword)showChangePassword();applyMarket()}catch(e){localStorage.removeItem("TOKEN");authLog(e.message)}}if(token)loadMe();
-}function showChangePassword(){$("changePasswordCard").classList.remove("hidden")}async function changePassword(){try{await api("/api/auth/change-password",{method:"POST",body:JSON.stringify({password:$("newPassword").value})});$("changePasswordCard").classList.add("hidden");log("Password berhasil diganti.");await loadMe()}catch(e){log(e.message)}}function saveLocks(){localStorage.setItem("DEWA_V6_LOCKS",JSON.stringify(locks))}function saveLastDir(){localStorage.setItem("DEWA_LAST_DIR",JSON.stringify(DEWA_LAST_DIR))}function symbols(){return $("symbols").value.split(",").map(x=>x.trim().toUpperCase()).filter(Boolean)}function sleep(ms){return new Promise(r=>setTimeout(r,ms))}function applyMarket(){let m=$("market").value;if(m!=="custom")$("symbols").value=PRESETS[m].join(",")}function stop(){if(autoTimer)clearInterval(autoTimer);autoTimer=null;queueRunning=false;$("scanStatus").textContent="Stopped";log("Stopped")}function resetSignals(){locks={};saveLocks();render()}function start(){stop();scanQueue();autoTimer=setInterval(scanQueue,Number($("refresh").value)*1000);$("scanStatus").textContent="Auto ON"}function isCryptoSymbol(s){return !s.includes("/")&&!s.includes(":")}function tfLabel(){let v=$("tf").value;return v==="60"?"1H":v==="240"?"4H":v+"m"}function getHTFTf(){let tf=String($("tf").value);if(tf==="5")return"60";if(["15","30","60"].includes(tf))return"240";if(tf==="240")return"D";return"60"}function intervalFromTf(src,tf){
-  if(tf==="5")return"5min";
-  if(tf==="15")return"15min";
-  if(tf==="30")return"30min";
-  if(tf==="60")return"1h";
-  if(tf==="240")return"4h";
-  if(tf==="D")return"1day";
-  return"5min";
+let token = localStorage.getItem("TOKEN") || "";
+let me = null;
+let limits = null;
+let autoTimer = null;
+let queueRunning = false;
+let results = [];
+let selected = null;
+let locks = JSON.parse(localStorage.getItem("DEWA_V6_LOCKS") || "{}");
+let DEWA_LAST_DIR = JSON.parse(localStorage.getItem("DEWA_LAST_DIR") || "{}");
+
+const $ = id => document.getElementById(id);
+
+const PRESETS = {
+  crypto: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"],
+  forex: ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD"],
+  gold: ["XAU/USD", "XAG/USD"],
+  hybrid: ["BTC/USD", "ETH/USD", "XAU/USD", "EUR/USD"]
+};
+
+function fmt(x) {
+  return Number.isFinite(x)
+    ? Number(x).toLocaleString("en-US", { maximumFractionDigits: 6 })
+    : "-";
+}
+
+function priceFmt(pair, x) {
+  if (!Number.isFinite(x)) return "-";
+
+  pair = String(pair || "");
+
+  if (pair.includes("JPY")) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 3 });
+  }
+
+  if (pair.includes("/") && !pair.includes("XAU") && !pair.includes("XAG")) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 5 });
+  }
+
+  if (pair.includes("XAU") || pair.includes("XAG")) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  }
+
+  if (Number(x) >= 1000) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  }
+
+  return Number(x).toLocaleString("en-US", { maximumFractionDigits: 4 });
+}
+
+function authLog(x) {
+  $("authLog").textContent =
+    new Date().toLocaleTimeString() + " - " + x + "\n" + $("authLog").textContent;
+}
+
+function log(x) {
+  $("log").textContent =
+    new Date().toLocaleTimeString() + " - " + x + "\n" + $("log").textContent;
+}
+
+function headers() {
+  return {
+    "Content-Type": "application/json",
+    Authorization: "Bearer " + token
+  };
+}
+
+async function api(p, o = {}) {
+  const r = await fetch(p, {
+    ...o,
+    headers: {
+      ...(o.headers || {}),
+      ...headers()
+    }
+  });
+
+  const d = await r.json().catch(() => ({}));
+
+  if (!r.ok || d.error) {
+    throw Error(d.error || "API error");
+  }
+
+  return d;
+}
+
+async function login() {
+  try {
+    const r = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        email: $("email").value,
+        password: $("password").value
+      })
+    });
+
+    const d = await r.json();
+
+    if (!r.ok || d.error) {
+      throw Error(d.error || "Login gagal");
+    }
+
+    token = d.token;
+    localStorage.setItem("TOKEN", token);
+
+    await loadMe();
+  } catch (e) {
+    authLog(e.message);
+  }
+}
+
+async function requestAccess() {
+  try {
+    const r = await fetch("/api/auth/request-access", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        email: $("email").value
+      })
+    });
+
+    const d = await r.json();
+
+    if (!r.ok || d.error) {
+      throw Error(d.error || "Request gagal");
+    }
+
+    authLog("Request access berhasil. Tunggu approval admin.");
+  } catch (e) {
+    authLog(e.message);
+  }
+}
+
+function logout() {
+  localStorage.removeItem("TOKEN");
+  location.reload();
+}
+
+async function loadMe() {
+  try {
+    const d = await api("/api/auth/me");
+
+    me = d.user;
+    limits = d.limits;
+
+    $("authScreen").classList.add("hidden");
+    $("appScreen").classList.remove("hidden");
+    $("uEmail").textContent = me.email;
+    $("uPlan").textContent = me.plan;
+    $("uStatus").textContent = me.status;
+    $("uExpired").textContent = (me.expiredAt || "-").slice(0, 10);
+    $("uEaKey").textContent = me.eaApiKey || "-";
+    $("adminPanel").style.display = me.role === "admin" ? "block" : "none";
+
+    if (me.mustChangePassword) {
+      showChangePassword();
+    }
+
+    applyMarket();
+  } catch (e) {
+    localStorage.removeItem("TOKEN");
+    authLog(e.message);
+  }
+}
+
+if (token) {
+  loadMe();
+}
+
+function showChangePassword() {
+  $("changePasswordCard").classList.remove("hidden");
+}
+
+async function changePassword() {
+  try {
+    await api("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({
+        password: $("newPassword").value
+      })
+    });
+
+    $("changePasswordCard").classList.add("hidden");
+    log("Password berhasil diganti.");
+
+    await loadMe();
+  } catch (e) {
+    log(e.message);
+  }
+}
+
+function saveLocks() {
+  localStorage.setItem("DEWA_V6_LOCKS", JSON.stringify(locks));
+}
+
+function saveLastDir() {
+  localStorage.setItem("DEWA_LAST_DIR", JSON.stringify(DEWA_LAST_DIR));
+}
+
+function symbols() {
+  return $("symbols").value
+    .split(",")
+    .map(x => x.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function applyMarket() {
+  const m = $("market").value;
+
+  if (m !== "custom") {
+    $("symbols").value = PRESETS[m].join(",");
+  }
+}
+
+function stop() {
+  if (autoTimer) {
+    clearInterval(autoTimer);
+  }
+
+  autoTimer = null;
+  queueRunning = false;
+  $("scanStatus").textContent = "Stopped";
+  log("Stopped");
+}
+
+function resetSignals() {
+  locks = {};
+  saveLocks();
+  render();
+}
+
+function start() {
+  stop();
+  scanQueue();
+  autoTimer = setInterval(scanQueue, Number($("refresh").value) * 1000);
+  $("scanStatus").textContent = "Auto ON";
+}
+
+function isCryptoSymbol(s) {
+  return !s.includes("/") && !s.includes(":");
+}
+
+function tfLabel() {
+  const v = $("tf").value;
+  return v === "60" ? "1H" : v === "240" ? "4H" : v + "m";
+}
+
+function getHTFTf() {
+  const tf = String($("tf").value);
+
+  if (tf === "5") return "60";
+  if (["15", "30", "60"].includes(tf)) return "240";
+  if (tf === "240") return "D";
+
+  return "60";
+}
+
+function intervalFromTf(src, tf) {
+  if (tf === "5") return "5min";
+  if (tf === "15") return "15min";
+  if (tf === "30") return "30min";
+  if (tf === "60") return "1h";
+  if (tf === "240") return "4h";
+  if (tf === "D") return "1day";
+
+  return "5min";
 }
 
 async function fetchCandles(symbol, customTf=null){

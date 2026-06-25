@@ -1370,3 +1370,12 @@ broadcastSignal = async function(sym,r){
     log("Broadcast notif gagal: "+e.message);
   }
 };
+
+window.login = login;
+window.requestAccess = requestAccess;
+window.logout = logout;
+window.changePassword = changePassword;
+window.start = start;
+window.stop = stop;
+window.resetSignals = resetSignals;
+window.enablePush = enablePush;

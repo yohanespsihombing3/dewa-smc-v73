@@ -1370,6 +1370,65 @@ broadcastSignal = async function(sym,r){
     log("Broadcast notif gagal: "+e.message);
   }
 };
+/* ================================
+   DEWA V7.6 REVERSE STATE PATCH
+================================ */
+
+let DEWA_REVERSE_STATE = JSON.parse(localStorage.getItem("DEWA_REVERSE_STATE") || "{}");
+
+function saveReverseState(){
+  localStorage.setItem("DEWA_REVERSE_STATE", JSON.stringify(DEWA_REVERSE_STATE));
+}
+
+function isReverseCooldownOk(symbol){
+  const tf = Number($("tf").value || 5);
+  const last = DEWA_REVERSE_STATE[symbol];
+  if(!last) return true;
+  return Date.now() - last.ts > tf * 3 * 60 * 1000;
+}
+
+function markReverse(symbol){
+  DEWA_REVERSE_STATE[symbol] = { ts: Date.now() };
+  saveReverseState();
+}
+
+function normalizeSignalName(signal){
+  if(signal === "OPEN LONG") return "NEW LONG";
+  if(signal === "OPEN SHORT") return "NEW SHORT";
+  return signal;
+}
+
+function oppositeSignal(activeSignal, newSignal){
+  const a = String(activeSignal || "");
+  const n = String(newSignal || "");
+  if(a.includes("LONG") && n.includes("SHORT")) return "REVERSE SHORT";
+  if(a.includes("SHORT") && n.includes("LONG")) return "REVERSE LONG";
+  return null;
+}
+
+function reverseAllowed(symbol, activeLock, newSig){
+  if(!activeLock || !newSig) return false;
+
+  const rev = oppositeSignal(activeLock.signal, newSig.signal);
+  if(!rev) return false;
+
+  const grade = String(newSig.grade || "").toUpperCase();
+  if(!(grade === "A" || grade === "A+")) return false;
+
+  const atrVal = Number(newSig.atr || 0);
+  const entryOld = Number(activeLock.entry);
+  const entryNew = Number(newSig.entry);
+
+  if(!Number.isFinite(atrVal) || atrVal <= 0) return false;
+  if(!Number.isFinite(entryOld) || !Number.isFinite(entryNew)) return false;
+
+  const distanceOk = Math.abs(entryNew - entryOld) >= atrVal * 0.5;
+  if(!distanceOk) return false;
+
+  if(!isReverseCooldownOk(symbol)) return false;
+
+  return rev;
+}
 
 window.login = login;
 window.requestAccess = requestAccess;

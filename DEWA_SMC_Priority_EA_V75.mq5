@@ -397,20 +397,29 @@ int OnInit()
    return(INIT_SUCCEEDED);
 }
 
-void OnDeinit(const int reason)
-{
-   EventKillTimer();
-}
-
 void OnTimer()
 {
-   if(OneSetupPerSymbol && (HasDewaPosition() || HasDewaOrder()))
-      return;
-
    if(FetchSignal())
-      PlaceFullSetup();
-}
+   {
+      if(sigSide=="REVERSE LONG" || sigSide=="REVERSE SHORT")
+      {
+         Print("REVERSE signal detected.");
 
+         EmergencyCloseAll();
+
+         Sleep(1000);
+
+         PlaceFullSetup();
+
+         return;
+      }
+
+      if(OneSetupPerSymbol && (HasDewaPosition() || HasDewaOrder()))
+         return;
+
+      PlaceFullSetup();
+   }
+}
 void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &request,const MqlTradeResult &result)
 {
    if(trans.type==TRADE_TRANSACTION_DEAL_ADD)

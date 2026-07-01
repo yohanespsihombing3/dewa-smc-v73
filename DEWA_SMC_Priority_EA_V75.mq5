@@ -235,7 +235,13 @@ bool FetchSignal()
 
    if(StringFind(engine,"HYBRID")>=0)return false;
    if(StringFind(engine,"SMC")<0 && StringFind(engine,"SNIPER")<0)return false;
-   if(signal!="OPEN LONG" && signal!="OPEN SHORT")return false;
+   if(
+   signal!="OPEN LONG" &&
+   signal!="OPEN SHORT" &&
+   signal!="REVERSE LONG" &&
+   signal!="REVERSE SHORT"
+)
+   return false;
    if(!ValidGrade(json))return false;
 
    double entry=JsonNumber(json,"entry");

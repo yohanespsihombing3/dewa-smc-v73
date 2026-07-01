@@ -403,7 +403,7 @@ void OnTimer()
    {
       if(sigSide=="REVERSE LONG" || sigSide=="REVERSE SHORT")
       {
-         Print("REVERSE signal detected.");
+         Print("REVERSE signal detected. Closing old setup and opening reverse setup.");
 
          EmergencyCloseAll();
 

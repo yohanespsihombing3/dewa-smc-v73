@@ -136,8 +136,39 @@ app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=al
 
 app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});
 app.post('/api/push/subscribe',auth,(req,res)=>{let sub=req.body.subscription;if(!sub||!sub.endpoint)return res.status(400).json({error:'Invalid'});let d=pushdb(),old=d.subscriptions.find(x=>x.endpoint===sub.endpoint);if(old)old.subscription=sub;else d.subscriptions.push({id:uuid(),userId:req.user.id,email:req.user.email,endpoint:sub.endpoint,subscription:sub});savePush(d);res.json({success:true})});
-app.post('/api/push/broadcast',auth,async(req,res)=>{setupPush();let s=req.body,title=s.signal==='OPEN LONG'?'🟢 DEWA SMC SIGNAL LONG':'🔴 DEWA SMC SIGNAL SHORT',body=`${s.pair} • ${s.signal}\nEntry: ${s.entry} | TP1: ${s.tp1} | SL: ${s.sl}`,payload=JSON.stringify({title,body,url:'/'}),d=pushdb();for(let it of d.subscriptions){try{await webpush.sendNotification(it.subscription,payload)}catch(e){}}res.json({success:true})});
+app.post('/api/push/broadcast',auth,async(req,res)=>{
+  setupPush();
 
+  let s=req.body||{};
+  let title='⚡ DEWA SIGNAL';
+
+  if(s.signal==='OPEN LONG') title='🟢 NEW LONG';
+  else if(s.signal==='OPEN SHORT') title='🔴 NEW SHORT';
+  else if(s.signal==='REVERSE LONG') title='🔄 REVERSE LONG';
+  else if(s.signal==='REVERSE SHORT') title='🔄 REVERSE SHORT';
+
+  let action='';
+  if(s.signal==='REVERSE LONG') action='Close SELL → Open BUY\n';
+  if(s.signal==='REVERSE SHORT') action='Close BUY → Open SELL\n';
+
+  let body=`${s.pair} • ${s.signal}\n${action}Entry: ${s.entry} | TP1: ${s.tp1} | SL: ${s.sl}`;
+
+  let payload=JSON.stringify({
+    title,
+    body,
+    url:'/'
+  });
+
+  let d=pushdb();
+
+  for(let it of d.subscriptions){
+    try{
+      await webpush.sendNotification(it.subscription,payload);
+    }catch(e){}
+  }
+
+  res.json({success:true});
+});
 function getC(k){let o=cache.get(k);return o&&Date.now()-o.t<CACHE_MS?o.d:null}function setC(k,d){cache.set(k,{t:Date.now(),d})}
 app.get('/api/binance/candles',auth,async(req,res)=>{let symbol=String(req.query.symbol||'BTCUSDT').toUpperCase().replace(/[^A-Z0-9]/g,''),interval=req.query.interval||'5m',n=Math.min(Number(req.query.outputsize||180),500),ck=`B|${symbol}|${interval}|${n}`,c=getC(ck);if(c)return res.json({...c,cached:true});let r=await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${n}`),d=await r.json();if(!r.ok||!Array.isArray(d))return res.status(502).json({error:'Binance error'});let values=d.map(k=>({datetime:new Date(k[0]).toISOString(),open:k[1],high:k[2],low:k[3],close:k[4],volume:k[5]})).reverse(),out={symbol,interval,source:'Binance',values,cached:false};setC(ck,out);res.json(out)});
 app.get('/api/twelvedata/candles',auth,async(req,res)=>{if(!KEYS.length)return res.status(500).json({error:'Belum ada Twelve Data key'});let symbol=String(req.query.symbol||'XAU/USD').toUpperCase(),interval=req.query.interval||'5min',n=Math.min(Number(req.query.outputsize||180),500),ck=`T|${symbol}|${interval}|${n}`,c=getC(ck);if(c)return res.json({...c,cached:true});let key=KEYS[keyIndex++%KEYS.length],url=new URL('https://api.twelvedata.com/time_series');url.searchParams.set('symbol',symbol);url.searchParams.set('interval',interval);url.searchParams.set('outputsize',String(n));url.searchParams.set('format','JSON');url.searchParams.set('apikey',key);let r=await fetch(url),d=await r.json();if(!r.ok||d.status==='error')return res.status(502).json({error:d.message||'Twelve Data error'});let out={symbol,interval,source:'Twelve Data',values:d.values,cached:false};setC(ck,out);res.json(out)});

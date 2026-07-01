@@ -51,9 +51,15 @@ string UrlEncode(string s)
    return s;
 }
 
-bool IsLong(){ return sigSide=="OPEN LONG"; }
-bool IsShort(){ return sigSide=="OPEN SHORT"; }
+bool IsLong()
+{
+   return sigSide=="OPEN LONG" || sigSide=="REVERSE LONG";
+}
 
+bool IsShort()
+{
+   return sigSide=="OPEN SHORT" || sigSide=="REVERSE SHORT";
+}
 double NormalizePrice(double price){ return NormalizeDouble(price,_Digits); }
 
 double NormalizeVolume(double lots)

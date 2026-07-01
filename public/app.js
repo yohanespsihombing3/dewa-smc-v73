@@ -1486,10 +1486,26 @@ function reverseAllowed(symbol, activeLock, newSig){
 }
 
 function displaySignalName(signal, status){
+  status = String(status || "");
+  signal = String(signal || "");
+
+  if(status.includes("TP1")) return "TP1 HIT";
+  if(status.includes("TP2")) return "TP2 HIT";
+  if(status.includes("TP3")) return "TP3 HIT";
+  if(status.includes("FULL TP")) return "TP3 HIT";
+  if(status.includes("SL")) return "SL HIT";
+
   if(status === "REVERSE LONG") return "REVERSE LONG";
   if(status === "REVERSE SHORT") return "REVERSE SHORT";
+
+  if(status.includes("ACTIVE") || status.includes("RUNNING")){
+    if(signal.includes("LONG")) return "ACTIVE LONG";
+    if(signal.includes("SHORT")) return "ACTIVE SHORT";
+  }
+
   if(signal === "OPEN LONG") return "NEW LONG";
   if(signal === "OPEN SHORT") return "NEW SHORT";
+
   return signal || "-";
 }
 

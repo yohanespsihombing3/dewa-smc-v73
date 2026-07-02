@@ -1508,6 +1508,81 @@ function displaySignalName(signal, status){
 
   return signal || "-";
 }
+/* ==================================
+   DEWA V7.7 REPLACE STATE PATCH
+================================== */
+
+let DEWA_REPLACE_STATE =
+  JSON.parse(localStorage.getItem("DEWA_REPLACE_STATE") || "{}");
+
+function saveReplaceState(){
+  localStorage.setItem(
+    "DEWA_REPLACE_STATE",
+    JSON.stringify(DEWA_REPLACE_STATE)
+  );
+}
+
+function isReplaceCooldownOk(symbol){
+  const tf = Number($("tf").value || 5);
+  const last = DEWA_REPLACE_STATE[symbol];
+
+  if(!last) return true;
+
+  return Date.now() - last.ts > tf * 3 * 60 * 1000;
+}
+
+function markReplace(symbol){
+  DEWA_REPLACE_STATE[symbol] = {
+    ts: Date.now()
+  };
+  saveReplaceState();
+}
+
+function replaceAllowed(symbol, activeLock, newSig){
+
+  if(!activeLock || !newSig) return false;
+
+  const oldDir =
+    String(activeLock.signal || "").includes("LONG")
+      ? "LONG"
+      : "SHORT";
+
+  const newDir =
+    String(newSig.signal || "").includes("LONG")
+      ? "LONG"
+      : "SHORT";
+
+  if(oldDir !== newDir) return false;
+
+  const grade = String(newSig.grade || "").toUpperCase();
+
+  if(!(grade === "A" || grade === "A+"))
+    return false;
+
+  const atrVal = Number(newSig.atr || 0);
+
+  if(!Number.isFinite(atrVal) || atrVal <= 0)
+    return false;
+
+  const oldEntry = Number(activeLock.entry);
+  const newEntry = Number(newSig.entry);
+
+  if(!Number.isFinite(oldEntry) || !Number.isFinite(newEntry))
+    return false;
+
+  const distanceOk =
+    Math.abs(newEntry - oldEntry) >= atrVal * 0.5;
+
+  if(!distanceOk)
+    return false;
+
+  if(!isReplaceCooldownOk(symbol))
+    return false;
+
+  return oldDir === "LONG"
+    ? "REPLACE LONG"
+    : "REPLACE SHORT";
+}
 
 window.login = login;
 window.requestAccess = requestAccess;

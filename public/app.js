@@ -1536,7 +1536,8 @@ function displaySignalName(signal, status){
 
   if(status === "REVERSE LONG") return "REVERSE LONG";
   if(status === "REVERSE SHORT") return "REVERSE SHORT";
-
+  if(status === "REPLACE LONG") return "REPLACE LONG";
+  if(status === "REPLACE SHORT") return "REPLACE SHORT";
   if(status.includes("ACTIVE") || status.includes("RUNNING")){
     if(signal.includes("LONG")) return "ACTIVE LONG";
     if(signal.includes("SHORT")) return "ACTIVE SHORT";

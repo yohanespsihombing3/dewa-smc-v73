@@ -305,98 +305,172 @@ async function fetchCandles(symbol, customTf=null){
 
   return{candles,source:"Twelve Data"};
 }
-function lockExpired(sym){let L=locks[sym];if(!L)return true;let age=Date.now()-new Date(L.createdAt||0).getTime();return age>Number($("tf").value||5)*3*60*1000||["🔴 SL HIT","🏆 FULL TP"].includes(L.status)}async function scanQueue(){if(queueRunning)return;queueRunning=true;let list=symbols();if(limits&&list.length>limits.maxPairs){list=list.slice(0,limits.maxPairs)}results=[];render();for(let i=0;i<list.length;i++){let sym=list[i];try{let data=await fetchCandles(sym),htf=null;try{htf=await fetchCandles(sym,getHTFTf())}catch(e){}let sig=analyzeEngine(sym,data.candles,data.source,htf?htf.candles:null),live=sig.livePrice;if(locks[sym]){
+function lockExpired(sym){let L=locks[sym];if(!L)return true;let age=Date.now()-new Date(L.createdAt||0).getTime();return age>Number($("tf").value||5)*3*60*1000||["🔴 SL HIT","🏆 FULL TP"].includes(L.status)}
+async function scanQueue(){
+  if(queueRunning)return;
 
-  const reverseStatus = reverseAllowed(sym, locks[sym], sig);
+  queueRunning=true;
 
-if(reverseStatus){
+  let list=symbols();
 
-   sig.signal = reverseStatus === "REVERSE LONG"
-      ? "OPEN LONG"
-      : "OPEN SHORT";
+  if(limits&&list.length>limits.maxPairs){
+    list=list.slice(0,limits.maxPairs);
+  }
 
-   sig.status = reverseStatus;
-   sig.color = "purple";
-   sig.locked = true;
+  results=[];
+  render();
 
-   locks[sym] = {
-      signal:sig.signal,
-      status:sig.status,
-      color:sig.color,
-      entry:sig.entry,
-      tp1:sig.tp1,
-      tp2:sig.tp2,
-      tp3:sig.tp3,
-      sl:sig.sl,
-      createdAt:new Date().toISOString(),
-      tf:tfLabel(),
-      pair:sym,
-      grade:sig.grade,
-      engine:sig.engine,
-      reverse:true
-   };
+  for(let i=0;i<list.length;i++){
+    let sym=list[i];
 
-   markReverse(sym);
-   saveLocks();
+    try{
+      let data=await fetchCandles(sym);
+      let htf=null;
 
-   saveSignal(sym,sig);
-   broadcastSignal(sym,sig);
+      try{
+        htf=await fetchCandles(sym,getHTFTf());
+      }catch(e){}
 
-}
-else{
+      let sig=analyzeEngine(
+        sym,
+        data.candles,
+        data.source,
+        htf?htf.candles:null
+      );
 
-   const replaceStatus =
-      replaceAllowed(sym, locks[sym], sig);
+      let live=sig.livePrice;
 
-   if(replaceStatus){
+      if(locks[sym]){
+        const reverseStatus=reverseAllowed(sym,locks[sym],sig);
+        const replaceStatus=replaceAllowed(sym,locks[sym],sig);
 
-      sig.status = replaceStatus;
-      sig.color = "deepskyblue";
-      sig.locked = true;
+        if(reverseStatus){
+          sig.signal=reverseStatus;
+          sig.status=reverseStatus;
+          sig.color="purple";
+          sig.locked=true;
 
-      locks[sym] = {
-         signal:sig.signal,
-         status:sig.status,
-         color:sig.color,
-         entry:sig.entry,
-         tp1:sig.tp1,
-         tp2:sig.tp2,
-         tp3:sig.tp3,
-         sl:sig.sl,
-         createdAt:new Date().toISOString(),
-         tf:tfLabel(),
-         pair:sym,
-         grade:sig.grade,
-         engine:sig.engine,
-         replace:true
-      };
+          locks[sym]={
+            signal:sig.signal,
+            status:sig.status,
+            color:sig.color,
+            entry:sig.entry,
+            tp1:sig.tp1,
+            tp2:sig.tp2,
+            tp3:sig.tp3,
+            sl:sig.sl,
+            createdAt:new Date().toISOString(),
+            tf:tfLabel(),
+            pair:sym,
+            grade:sig.grade,
+            engine:sig.engine,
+            reverse:true
+          };
 
-      markReplace(sym);
-      saveLocks();
+          markReverse(sym);
+          saveLocks();
+          saveSignal(sym,sig);
+          broadcastSignal(sym,sig);
 
-      saveSignal(sym,sig);
-      broadcastSignal(sym,sig);
+        }else if(replaceStatus){
+          sig.signal=replaceStatus;
+          sig.status=replaceStatus;
+          sig.color="deepskyblue";
+          sig.locked=true;
 
-   }
-   else if(lockExpired(sym)){
+          locks[sym]={
+            signal:sig.signal,
+            status:sig.status,
+            color:sig.color,
+            entry:sig.entry,
+            tp1:sig.tp1,
+            tp2:sig.tp2,
+            tp3:sig.tp3,
+            sl:sig.sl,
+            createdAt:new Date().toISOString(),
+            tf:tfLabel(),
+            pair:sym,
+            grade:sig.grade,
+            engine:sig.engine,
+            replace:true
+          };
 
-      delete locks[sym];
-      saveLocks();
+          markReplace(sym);
+          saveLocks();
+          saveSignal(sym,sig);
+          broadcastSignal(sym,sig);
 
-   }
-   else{
+        }else if(lockExpired(sym)){
+          delete locks[sym];
+          saveLocks();
 
-      let updated=updateLockedSignal(sym,live);
+        }else{
+          let updated=updateLockedSignal(sym,live);
 
-      sig={
-         ...sig,
-         ...updated,
-         candles:sig.candles,
-         locked:true,
-         source:data.source
-      };
+          sig={
+            ...sig,
+            ...updated,
+            candles:sig.candles,
+            locked:true,
+            source:data.source
+          };
+        }
+      }
 
-   }
+      if(!locks[sym]&&["SMC LONG","SMC SHORT","SNIPER LONG","SNIPER SHORT","HYBRID CONFIRM"].includes(sig.status)){
+        locks[sym]={
+          signal:sig.signal,
+          status:"🔵 RUNNING",
+          color:"blue",
+          entry:sig.entry,
+          tp1:sig.tp1,
+          tp2:sig.tp2,
+          tp3:sig.tp3,
+          sl:sig.sl,
+          createdAt:new Date().toISOString(),
+          tf:tfLabel(),
+          pair:sym,
+          grade:sig.grade,
+          engine:sig.engine
+        };
+
+        saveLocks();
+        sig.status="🔵 RUNNING";
+        sig.color="blue";
+        sig.locked=true;
+
+        saveSignal(sym,sig);
+        broadcastSignal(sym,sig);
+      }
+
+      results.push(sig);
+      log(sym+" OK");
+
+    }catch(e){
+      results.push({
+        symbol:sym,
+        source:"-",
+        signal:"ERROR",
+        status:e.message,
+        color:"yellow",
+        candles:[]
+      });
+
+      log(sym+" error: "+e.message);
+    }
+
+    render();
+
+    if(results.length===1)pick(results[0].symbol);
+
+    if(i<list.length-1){
+      await sleep(Math.max(Number($("delay").value),limits?limits.delayMs:0));
+    }
+  }
+
+  $("scanStatus").textContent="Scan complete";
+  queueRunning=false;
+  loadAnalytics();
 }
   
 if(!locks[sym]&&["SMC LONG","SMC SHORT","SNIPER LONG","SNIPER SHORT","HYBRID CONFIRM"].includes(sig.status)){locks[sym]={signal:sig.signal,status:"🔵 RUNNING",color:"blue",entry:sig.entry,tp1:sig.tp1,tp2:sig.tp2,tp3:sig.tp3,sl:sig.sl,createdAt:new Date().toISOString(),tf:tfLabel(),pair:sym,grade:sig.grade,engine:sig.engine};saveLocks();sig.status="🔵 RUNNING";sig.color="blue";sig.locked=true;saveSignal(sym,sig);broadcastSignal(sym,sig)}results.push(sig);log(sym+" OK")}catch(e){results.push({symbol:sym,source:"-",signal:"ERROR",status:e.message,color:"yellow",candles:[]});log(sym+" error: "+e.message)}render();if(results.length===1)pick(results[0].symbol);if(i<list.length-1)await sleep(Math.max(Number($("delay").value),limits?limits.delayMs:0))}$("scanStatus").textContent="Scan complete";queueRunning=false;loadAnalytics()}function updateLockedSignal(sym,price){let L=locks[sym];if(!L||!Number.isFinite(price))return L;if(L.signal==="OPEN LONG"){if(price>=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price>=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price>=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price<=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}if(L.signal==="OPEN SHORT"){if(price<=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price<=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price<=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price>=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}saveSignal(sym,L);return L}async function saveSignal(sym,r){try{if(!r.entry)return;await api("/api/signals/upsert",{method:"POST",body:JSON.stringify({key:`${sym}|${r.tf||tfLabel()}|${r.signal}|${r.entry}`,pair:sym,tf:r.tf||tfLabel(),signal:r.signal,entry:r.entry,tp1:r.tp1,tp2:r.tp2,tp3:r.tp3,sl:r.sl,status:r.status,createdAt:r.createdAt||new Date().toISOString(),grade:r.grade,engine:r.engine})})}catch(e){}}

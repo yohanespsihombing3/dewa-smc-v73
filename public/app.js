@@ -473,7 +473,6 @@ async function scanQueue(){
   loadAnalytics();
 }
   
-if(!locks[sym]&&["SMC LONG","SMC SHORT","SNIPER LONG","SNIPER SHORT","HYBRID CONFIRM"].includes(sig.status)){
   locks[sym]={
     signal:sig.signal,
     status:"🔵 RUNNING",

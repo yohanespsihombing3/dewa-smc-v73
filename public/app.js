@@ -465,7 +465,7 @@ async function scanQueue(){
 
     if(i<list.length-1){
       await sleep(Math.max(Number($("delay").value),limits?limits.delayMs:0));
-  
+  }
   }
 
   $("scanStatus").textContent="Scan complete";

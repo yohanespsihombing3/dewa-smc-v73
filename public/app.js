@@ -1511,7 +1511,25 @@ saveSignal = async function(sym,r){
 };
 broadcastSignal = async function(sym,r){
   try{
-    const isEntry=["OPEN LONG","OPEN SHORT"].includes(r.signal);
+    const sig=String(r.signal||"");
+const stat=String(r.status||"");
+
+const isEntry=
+[
+  "OPEN LONG",
+  "OPEN SHORT",
+  "REVERSE LONG",
+  "REVERSE SHORT",
+  "NEW LONG",
+  "NEW SHORT"
+].includes(sig)
+||
+[
+  "REVERSE LONG",
+  "REVERSE SHORT",
+  "NEW LONG",
+  "NEW SHORT"
+].includes(stat);
     const isA=isGradeAPlusV74(r.grade);
     const allowed=isEaAllowedEngineV74(r.engine);
     if(!isEntry || !isA || !allowed){

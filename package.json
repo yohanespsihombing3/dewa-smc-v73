@@ -4,6 +4,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+    "worker": "node scanner-worker.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.50.0",

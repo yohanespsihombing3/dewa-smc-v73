@@ -54,11 +54,15 @@ const TFS = String(process.env.WORKER_TFS || "5,15")
   .map(x => x.trim())
   .filter(x => x === "5" || x === "15");
 
-const API_KEYS = [
-  process.env.TWELVE_DATA_API_KEY_1,
-  process.env.TWELVE_DATA_API_KEY_2,
-  process.env.TWELVE_DATA_API_KEY_3
-].filter(Boolean);
+const API_KEYS = Object.keys(process.env)
+  .filter(k => k.startsWith("TWELVE_DATA_API_KEY_"))
+  .sort((a, b) => {
+    const na = Number(a.match(/\d+$/)?.[0] || 0);
+    const nb = Number(b.match(/\d+$/)?.[0] || 0);
+    return na - nb;
+  })
+  .map(k => process.env[k])
+  .filter(Boolean);
 
 const STATE_FILE = path.join(__dirname, "data", "scanner-worker-state.json");
 

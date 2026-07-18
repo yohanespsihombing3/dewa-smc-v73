@@ -451,45 +451,84 @@ async function fetchCandles(pair, tf) {
     throw new Error("Twelve Data API key belum diisi");
   }
 
-  const apiKey = API_KEYS[keyIndex++ % API_KEYS.length];
-  const url = new URL("https://api.twelvedata.com/time_series");
+  let lastError = null;
 
-  url.searchParams.set("symbol", pair);
-  url.searchParams.set("interval", intervalFromTf(tf));
-  url.searchParams.set("outputsize", String(OUTPUT_SIZE));
-  url.searchParams.set("format", "JSON");
-  url.searchParams.set("apikey", apiKey);
+  for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
+    const currentIndex = keyIndex++ % API_KEYS.length;
+    const apiKey = API_KEYS[currentIndex];
 
-  const data = await getJson(url.toString());
+    const url = new URL("https://api.twelvedata.com/time_series");
 
-  if (data.status === "error") {
-    throw new Error(data.message || "Twelve Data error");
+    url.searchParams.set("symbol", pair);
+    url.searchParams.set("interval", intervalFromTf(tf));
+    url.searchParams.set("outputsize", String(OUTPUT_SIZE));
+    url.searchParams.set("format", "JSON");
+    url.searchParams.set("apikey", apiKey);
+
+    console.log(
+      "[API]",
+      pair,
+      tfLabel(tf),
+      "key",
+      currentIndex + 1,
+      "of",
+      API_KEYS.length
+    );
+
+    try {
+      const data = await getJson(url.toString());
+
+      if (data.status === "error") {
+        throw new Error(data.message || "Twelve Data error");
+      }
+
+      const candles = (data.values || [])
+        .map(v => ({
+          time: v.datetime,
+          open: Number(v.open),
+          high: Number(v.high),
+          low: Number(v.low),
+          close: Number(v.close),
+          volume: Number(v.volume || 1)
+        }))
+        .filter(c =>
+          Number.isFinite(c.open) &&
+          Number.isFinite(c.high) &&
+          Number.isFinite(c.low) &&
+          Number.isFinite(c.close)
+        )
+        .reverse();
+
+      if (candles.length < 70) {
+        throw new Error("Candle kurang dari 70");
+      }
+
+      return candles;
+
+    } catch (error) {
+      lastError = error;
+
+      if (error.status === 429 || String(error.message).includes("429")) {
+        console.warn(
+          "[API LIMIT]",
+          "key",
+          currentIndex + 1,
+          "limit, mencoba key berikutnya"
+        );
+
+        await sleep(500);
+        continue;
+      }
+
+      throw error;
+    }
   }
 
-  const candles = (data.values || [])
-    .map(v => ({
-      time: v.datetime,
-      open: Number(v.open),
-      high: Number(v.high),
-      low: Number(v.low),
-      close: Number(v.close),
-      volume: Number(v.volume || 1)
-    }))
-    .filter(c =>
-      Number.isFinite(c.open) &&
-      Number.isFinite(c.high) &&
-      Number.isFinite(c.low) &&
-      Number.isFinite(c.close)
-    )
-    .reverse();
-
-  if (candles.length < 70) {
-    throw new Error("Candle kurang dari 70");
-  }
-
-  return candles;
+  throw new Error(
+    "Semua Twelve Data API key terkena limit. " +
+    (lastError ? lastError.message : "")
+  );
 }
-
 async function saveSignal(signal) {
   return authorizedApi("/api/signals/upsert", {
     method: "POST",

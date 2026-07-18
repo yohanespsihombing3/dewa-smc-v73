@@ -70,6 +70,56 @@ let authToken = "";
 let keyIndex = 0;
 let running = false;
 
+const API_KEY_BLOCKED_UNTIL = new Map();
+
+function nextUtcMidnight(){
+  const now = new Date();
+
+  return Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0,
+    1,
+    0
+  );
+}
+
+function isApiKeyBlocked(index){
+  const blockedUntil = API_KEY_BLOCKED_UNTIL.get(index) || 0;
+
+  if(blockedUntil <= Date.now()){
+    API_KEY_BLOCKED_UNTIL.delete(index);
+    return false;
+  }
+
+  return true;
+}
+
+function blockApiKey(index, errorMessage){
+  const message = String(errorMessage || "").toLowerCase();
+
+  const isDailyLimit =
+    message.includes("credits for the day") ||
+    message.includes("daily") ||
+    message.includes("current limit being");
+
+  const blockedUntil = isDailyLimit
+    ? nextUtcMidnight()
+    : Date.now() + 70 * 1000;
+
+  API_KEY_BLOCKED_UNTIL.set(index, blockedUntil);
+
+  console.warn(
+    "[API KEY BLOCKED]",
+    "key",
+    index + 1,
+    "sampai",
+    new Date(blockedUntil).toISOString(),
+    isDailyLimit ? "(daily limit)" : "(minute limit)"
+  );
+}
+
 function ensureStateDir() {
   const dir = path.dirname(STATE_FILE);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -445,18 +495,34 @@ async function authorizedApi(pathname, options = {}, retry = true) {
     throw error;
   }
 }
-
 async function fetchCandles(pair, tf) {
   if (!API_KEYS.length) {
     throw new Error("Twelve Data API key belum diisi");
   }
 
   let lastError = null;
+  let availableKeyFound = false;
 
   for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
     const currentIndex = keyIndex++ % API_KEYS.length;
-    const apiKey = API_KEYS[currentIndex];
 
+    if (isApiKeyBlocked(currentIndex)) {
+      const blockedUntil = API_KEY_BLOCKED_UNTIL.get(currentIndex);
+
+      console.log(
+        "[API SKIP]",
+        "key",
+        currentIndex + 1,
+        "masih diblokir sampai",
+        new Date(blockedUntil).toISOString()
+      );
+
+      continue;
+    }
+
+    availableKeyFound = true;
+
+    const apiKey = API_KEYS[currentIndex];
     const url = new URL("https://api.twelvedata.com/time_series");
 
     url.searchParams.set("symbol", pair);
@@ -508,15 +574,14 @@ async function fetchCandles(pair, tf) {
     } catch (error) {
       lastError = error;
 
-      if (error.status === 429 || String(error.message).includes("429")) {
-        console.warn(
-          "[API LIMIT]",
-          "key",
-          currentIndex + 1,
-          "limit, mencoba key berikutnya"
-        );
+      const message = String(error.message || "");
 
-        await sleep(500);
+      if (
+        error.status === 429 ||
+        message.includes("429") ||
+        message.toLowerCase().includes("credits for the day")
+      ) {
+        blockApiKey(currentIndex, message);
         continue;
       }
 
@@ -524,8 +589,22 @@ async function fetchCandles(pair, tf) {
     }
   }
 
+  if (!availableKeyFound) {
+    const blockedTimes = [...API_KEY_BLOCKED_UNTIL.values()];
+    const nearest = blockedTimes.length
+      ? Math.min(...blockedTimes)
+      : null;
+
+    throw new Error(
+      nearest
+        ? "Semua API key sedang diblokir sampai minimal " +
+          new Date(nearest).toISOString()
+        : "Semua API key sedang diblokir"
+    );
+  }
+
   throw new Error(
-    "Semua Twelve Data API key terkena limit. " +
+    "Semua Twelve Data API key gagal atau terkena limit. " +
     (lastError ? lastError.message : "")
   );
 }

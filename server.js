@@ -1,3 +1,124 @@
+require('dotenv').config();
+const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
+const { createClient } = require('@supabase/supabase-js');
+const app=express(),PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET||'change-me',CACHE_MS=Number(process.env.CACHE_SECONDS||120)*1000;
+const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
+const EA_SIGNAL_MAX_AGE_MINUTES = Math.max(
+  1,
+  Number(process.env.EA_SIGNAL_MAX_AGE_MINUTES || 20)
+);
+const EA_SIGNAL_MAX_AGE_MS = EA_SIGNAL_MAX_AGE_MINUTES * 60 * 1000;
+
+const supabase = USE_SUPABASE
+  ? createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SECRET_KEY
+    )
+  : null;
+const KEYS=[process.env.TWELVE_DATA_API_KEY_1,process.env.TWELVE_DATA_API_KEY_2,process.env.TWELVE_DATA_API_KEY_3].filter(Boolean);
+let keyIndex=0;const cache=new Map(),DATA=path.join(__dirname,'data'),UF=path.join(DATA,'users.json'),SF=path.join(DATA,'signals.json'),EF=path.join(DATA,'ea-signals.json'),PF=path.join(DATA,'push-subscriptions.json'),KF=path.join(DATA,'push-keys.json');
+app.use(cors());app.use(express.json({limit:'3mb'}));app.use(express.static(path.join(__dirname,'public')));
+function ensure(){if(!fs.existsSync(DATA))fs.mkdirSync(DATA,{recursive:true});for(const [f,d] of [[UF,'{"users":[]}'],[SF,'{"signals":[]}'],[EF,'{"signals":[]}'],[PF,'{"subscriptions":[]}']])if(!fs.existsSync(f))fs.writeFileSync(f,d);if(!fs.existsSync(KF))fs.writeFileSync(KF,JSON.stringify(webpush.generateVAPIDKeys(),null,2))}
+function read(f,x){ensure();try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return x}}function write(f,d){ensure();fs.writeFileSync(f,JSON.stringify(d,null,2))}
+function db(){return read(UF,{users:[]})}
+function saveDb(d){write(UF,d)}
+function sigdb(){return read(SF,{signals:[]})}
+function saveSig(d){write(SF,d)}
+function eadb(){return read(EF,{signals:[]})}
+function saveEa(d){write(EF,d)}
+
+let PUSH_CACHE = {subscriptions:[]};
+
+async function loadPushFromSupabase(){
+  if(!USE_SUPABASE || !supabase) return read(PF,{subscriptions:[]});
+
+  const { data, error } = await supabase
+    .from('push_subscriptions_data')
+    .select('id,data');
+
+  if(error){
+    console.error('Supabase load push error:', error.message);
+    return read(PF,{subscriptions:[]});
+  }
+
+  return {
+    subscriptions: (data || []).map(x => x.data)
+  };
+}
+
+async function savePushToSupabase(d){
+  if(!USE_SUPABASE || !supabase){
+    write(PF,d);
+    return;
+  }
+
+  for(const item of d.subscriptions || []){
+    await supabase
+      .from('push_subscriptions_data')
+      .upsert({
+        id: item.id || item.endpoint || uuid(),
+        data: item
+      });
+  }
+}
+
+function pushdb(){
+  return PUSH_CACHE;
+}
+
+function savePush(d){
+  PUSH_CACHE = d;
+  savePushToSupabase(d).catch(e=>console.error('Save push supabase error:',e.message));
+}
+function keys(){return read(KF,webpush.generateVAPIDKeys())}function setupPush(){let k=keys();webpush.setVapidDetails('mailto:admin@dewa.ai',k.publicKey,k.privateKey)}
+function addDays(n){let d=new Date();d.setDate(d.getDate()+Number(n||0));return d.toISOString()}function newKey(){return 'DEWA-'+crypto.randomBytes(24).toString('hex').toUpperCase()}
+function active(u){return u.role==='admin'||((u.status||'ACTIVE')==='ACTIVE'&&u.expiredAt&&new Date(u.expiredAt)>Date.now())}
+
+function normalizeEmail(value=''){
+  return String(value).toLowerCase().trim();
+}
+
+function normalizeMt5Account(value=''){
+  return String(value).replace(/\D/g,'');
+}
+
+function normalizeEaTimeframe(value=''){
+  const tf=String(value).toLowerCase().trim();
+  if(tf==='5m'||tf==='m5'||tf==='5min')return '5m';
+  if(tf==='15m'||tf==='m15'||tf==='15min')return '15m';
+  return '';
+}
+
+function normalizeEaSymbol(value=''){
+  const raw=String(value).toUpperCase().trim();
+  const compact=raw.replace(/[^A-Z0-9]/g,'');
+
+  const supported=[
+    ['XAUUSD','XAU/USD'],
+    ['XAGUSD','XAG/USD'],
+    ['BTCUSD','BTC/USD'],
+    ['ETHUSD','ETH/USD'],
+    ['EURUSD','EUR/USD'],
+    ['GBPUSD','GBP/USD'],
+    ['USDJPY','USD/JPY'],
+    ['AUDUSD','AUD/USD'],
+    ['USDCAD','USD/CAD'],
+    ['USDCHF','USD/CHF'],
+    ['NZDUSD','NZD/USD']
+  ];
+
+  for(const [brokerCode,serverPair] of supported){
+    if(compact.includes(brokerCode))return serverPair;
+  }
+
+  return '';
+}
+
+function isFreshEaSignal(signal){
+  const created=new Date(signal.createdAt||signal.updatedAt||0).getTime();
+  return Number.isFinite(created)&&created>0&&(Date.now()-created)<=EA_SIGNAL_MAX_AGE_MS;
+}
+
 function isGradeAPlus(g){return String(g||'').toUpperCase()==='A'||String(g||'').toUpperCase()==='A+'}
 function safe(u){return{id:u.id,email:u.email,role:u.role,plan:u.plan,status:u.status||'ACTIVE',expiredAt:u.expiredAt,active:active(u),mustChangePassword:!!u.mustChangePassword,eaApiKey:u.eaApiKey||'',eaEnabled:u.eaEnabled!==false,mt5Account:u.mt5Account||''}}
 function makeToken(u){return jwt.sign({id:u.id,email:u.email,role:u.role},SECRET,{expiresIn:'7d'})}

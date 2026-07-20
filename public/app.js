@@ -155,6 +155,19 @@ async function loadMe() {
     $("uEaKey").textContent = me.eaApiKey || "-";
     $("adminPanel").style.display = me.role === "admin" ? "block" : "none";
 
+    const mt5Input = $("memberMt5Account");
+    const mt5Status = $("memberMt5Status");
+
+    if (mt5Input) {
+      mt5Input.value = me.mt5Account || "";
+    }
+
+    if (mt5Status) {
+      mt5Status.textContent = me.mt5Account
+        ? "Terdaftar: " + me.mt5Account
+        : "Belum ada nomor akun MT5 yang terdaftar.";
+    }
+
     if (me.mustChangePassword) {
       showChangePassword();
     }
@@ -187,6 +200,76 @@ async function changePassword() {
     log("Password berhasil diganti.");
 
     await loadMe();
+  } catch (e) {
+    log(e.message);
+  }
+}
+
+
+async function saveMemberMt5Account() {
+  try {
+    const input = $("memberMt5Account");
+    const status = $("memberMt5Status");
+    const mt5Account = String(input ? input.value : "").replace(/\D/g, "");
+
+    if (!mt5Account) {
+      throw Error("Masukkan nomor akun MT5.");
+    }
+
+    if (status) {
+      status.textContent = "Menyimpan...";
+    }
+
+    const d = await api("/api/member/mt5-account", {
+      method: "POST",
+      body: JSON.stringify({ mt5Account })
+    });
+
+    me = d.user || me;
+
+    if (input) {
+      input.value = me.mt5Account || mt5Account;
+    }
+
+    if (status) {
+      status.textContent = "Terdaftar: " + (me.mt5Account || mt5Account);
+    }
+
+    log("Nomor akun MT5 berhasil disimpan.");
+  } catch (e) {
+    const status = $("memberMt5Status");
+
+    if (status) {
+      status.textContent = e.message;
+    }
+
+    log(e.message);
+  }
+}
+
+async function removeMemberMt5Account() {
+  try {
+    const ok = confirm("Hapus nomor akun MT5 yang terdaftar?");
+    if (!ok) return;
+
+    const d = await api("/api/member/mt5-account", {
+      method: "DELETE"
+    });
+
+    me = d.user || me;
+
+    const input = $("memberMt5Account");
+    const status = $("memberMt5Status");
+
+    if (input) {
+      input.value = "";
+    }
+
+    if (status) {
+      status.textContent = "Belum ada nomor akun MT5 yang terdaftar.";
+    }
+
+    log("Nomor akun MT5 berhasil dihapus.");
   } catch (e) {
     log(e.message);
   }

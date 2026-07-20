@@ -186,6 +186,75 @@ app.post('/api/auth/login',async(req,res)=>{try{let email=String(req.body.email|
 app.post('/api/auth/change-password',auth,async(req,res)=>{let d=db(),u=d.users.find(x=>x.id===req.user.id),p=String(req.body.password||'');if(p.length<6)return res.status(400).json({error:'Password minimal 6'});u.passwordHash=await bcrypt.hash(p,10);u.mustChangePassword=false;saveDb(d);res.json({success:true})});
 app.get('/api/auth/me',auth,(req,res)=>res.json({user:safe(req.user),limits:{maxPairs:req.user.plan==='VIP'?30:req.user.plan==='PRO'?15:3,delayMs:req.user.plan==='VIP'?2000:req.user.plan==='PRO'?5000:10000}}));
 
+app.post('/api/member/mt5-account',auth,(req,res)=>{
+  try{
+    const mt5Account=normalizeMt5Account(req.body.mt5Account);
+
+    if(!mt5Account){
+      return res.status(400).json({error:'Nomor akun MT5 wajib diisi'});
+    }
+
+    if(mt5Account.length<5||mt5Account.length>20){
+      return res.status(400).json({error:'Nomor akun MT5 tidak valid'});
+    }
+
+    const d=db();
+    const u=d.users.find(x=>x.id===req.user.id);
+
+    if(!u){
+      return res.status(404).json({error:'User tidak ditemukan'});
+    }
+
+    const duplicate=d.users.find(x=>
+      x.id!==u.id &&
+      normalizeMt5Account(x.mt5Account)===mt5Account
+    );
+
+    if(duplicate){
+      return res.status(409).json({
+        error:'Nomor akun MT5 sudah terdaftar pada member lain'
+      });
+    }
+
+    u.mt5Account=mt5Account;
+    u.eaEnabled=true;
+    u.mt5UpdatedAt=new Date().toISOString();
+    saveDb(d);
+
+    res.json({
+      success:true,
+      message:'Nomor akun MT5 berhasil disimpan',
+      user:safe(u)
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
+});
+
+app.delete('/api/member/mt5-account',auth,(req,res)=>{
+  try{
+    const d=db();
+    const u=d.users.find(x=>x.id===req.user.id);
+
+    if(!u){
+      return res.status(404).json({error:'User tidak ditemukan'});
+    }
+
+    u.mt5Account='';
+    u.mt5UpdatedAt=new Date().toISOString();
+    saveDb(d);
+
+    res.json({
+      success:true,
+      message:'Nomor akun MT5 berhasil dihapus',
+      user:safe(u)
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
+});
+
+
 app.get('/api/admin/users',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});res.json({users:db().users.map(safe)})});
 app.post('/api/admin/approve-user',auth,async(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);if(!u)return res.status(404).json({error:'User tidak ditemukan'});let tmp=req.body.password||'DEWA123456';u.passwordHash=await bcrypt.hash(tmp,10);u.status='ACTIVE';u.plan=req.body.plan||'FREE';u.expiredAt=addDays(req.body.days||30);u.mustChangePassword=true;u.eaApiKey=u.eaApiKey||newKey();u.eaEnabled=req.body.eaEnabled!==false;u.mt5Account=String(req.body.mt5Account||'');saveDb(d);res.json({success:true,tempPassword:tmp,user:safe(u)})});
 app.post('/api/admin/update-user',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);if(!u)return res.status(404).json({error:'User tidak ditemukan'});['plan','status','mt5Account'].forEach(k=>{if(req.body[k]!==undefined)u[k]=req.body[k]});if(req.body.days)u.expiredAt=addDays(req.body.days);if(req.body.eaEnabled!==undefined)u.eaEnabled=!!req.body.eaEnabled;saveDb(d);res.json({user:safe(u)})});

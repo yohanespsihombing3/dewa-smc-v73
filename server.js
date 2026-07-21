@@ -324,14 +324,37 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
 
     const latest=all[0]||null;
 
-    res.json({
+    if(!latest){
+      return res.json({
+        ok:true,
+        authenticatedBy:'email+mt5',
+        symbol,
+        tf,
+        maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
+        priority:'SMC > SNIPER A/A+ | HYBRID ignored',
+        signal:null
+      });
+    }
+
+    // Penting: field signal dibuat top-level agar sesuai parser EA V8.
+    return res.json({
       ok:true,
       authenticatedBy:'email+mt5',
       symbol,
       tf,
       maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
       priority:'SMC > SNIPER A/A+ | HYBRID ignored',
-      signal:latest
+      id:latest.id||'',
+      key:latest.key||'',
+      signal:String(latest.signal||'').toUpperCase(),
+      engine:String(latest.engine||''),
+      grade:String(latest.grade||''),
+      entry:Number(latest.entry||0),
+      tp1:Number(latest.tp1||0),
+      tp2:Number(latest.tp2||0),
+      tp3:Number(latest.tp3||0),
+      sl:Number(latest.sl||0),
+      createdAt:latest.createdAt||latest.updatedAt||null
     });
   }catch(e){
     res.status(500).json({error:e.message});

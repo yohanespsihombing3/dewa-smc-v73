@@ -325,6 +325,53 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
     const latest=all[0]||null;
 
     if(!latest){
+      const rawSignal = String(latest.signal || '')
+  .trim()
+  .toUpperCase();
+
+let status = 'UNKNOWN';
+let direction = null;
+
+if (rawSignal === 'OPEN LONG') {
+  status = 'OPEN_LONG';
+  direction = 'LONG';
+} else if (rawSignal === 'OPEN SHORT') {
+  status = 'OPEN_SHORT';
+  direction = 'SHORT';
+} else if (rawSignal === 'WAIT LONG' || rawSignal === 'PREPARE LONG') {
+  status = 'PREPARE_LONG';
+  direction = 'LONG';
+} else if (rawSignal === 'WAIT SHORT' || rawSignal === 'PREPARE SHORT') {
+  status = 'PREPARE_SHORT';
+  direction = 'SHORT';
+} else if (rawSignal === 'REVERSE LONG') {
+  status = 'REVERSE_LONG';
+  direction = 'LONG';
+} else if (rawSignal === 'REVERSE SHORT') {
+  status = 'REVERSE_SHORT';
+  direction = 'SHORT';
+} else if (rawSignal === 'TP1' || rawSignal === 'TP1 HIT') {
+  status = 'TP1_HIT';
+} else if (rawSignal === 'TP2' || rawSignal === 'TP2 HIT') {
+  status = 'TP2_HIT';
+} else if (rawSignal === 'TP3' || rawSignal === 'TP3 HIT') {
+  status = 'TP3_HIT';
+} else if (
+  rawSignal === 'SL' ||
+  rawSignal === 'STOP LOSS' ||
+  rawSignal === 'STOP_LOSS'
+) {
+  status = 'STOP_LOSS';
+} else if (rawSignal === 'CANCELLED') {
+  status = 'CANCELLED';
+} else if (rawSignal === 'CLOSED') {
+  status = 'CLOSED';
+} else if (
+  rawSignal === 'NO TRADE' ||
+  rawSignal === 'NO_TRADE'
+) {
+  status = 'NO_TRADE';
+}
       return res.json({
         ok:true,
         authenticatedBy:'email+mt5',
@@ -334,6 +381,11 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
         priority:'SMC > SNIPER A/A+ | HYBRID ignored',
         signalId: null,
         signal:null
+
+        id: null,
+        signalId: null,
+        status: 'NO_SIGNAL',
+        direction: null,
       });
     }
 

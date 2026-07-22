@@ -615,7 +615,8 @@ function getSymbolSpec(pair){
     contractSize: 1,
     minLot: 0.01,
     lotStep: 0.01
-  };
+   };
+  }
 function pl(pair, signal, lot, entry, target){
   const spec = getSymbolSpec(pair);
 

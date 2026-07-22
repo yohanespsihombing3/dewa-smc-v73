@@ -616,7 +616,95 @@ function getSymbolSpec(pair){
     minLot: 0.01,
     lotStep: 0.01
   };
-}function pl(pair,signal,lot,entry,target){let move=signal==="OPEN LONG"?target-entry:entry-target;return move*lot*contractSize(pair)}function calcLot(){if(!selected||!selected.entry){$("calcResult").innerHTML="Pilih signal aktif yang memiliki entry.";return}let lot=Number($("lotInput").value||0),r=selected;$("calcResult").innerHTML=`<div class="row"><span>Pair</span><b>${r.symbol}</b></div><div class="row"><span>Lot</span><b>${lot}</b></div><div class="row"><span>TP1 Estimasi</span><b class="green">$${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp1))}</b></div><div class="row"><span>TP2 Estimasi</span><b class="green">$${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp2))}</b></div><div class="row"><span>TP3 Estimasi</span><b class="green">$${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp3))}</b></div><div class="row"><span>SL Estimasi</span><b class="red">$${fmt(pl(r.symbol,r.signal,lot,r.entry,r.sl))}</b></div>`}
+function pl(pair, signal, lot, entry, target){
+  const spec = getSymbolSpec(pair);
+
+  const numericLot = Number(lot);
+  const numericEntry = Number(entry);
+  const numericTarget = Number(target);
+
+  const isLong =
+    String(signal || "").toUpperCase().includes("LONG");
+
+  const move = isLong
+    ? numericTarget - numericEntry
+    : numericEntry - numericTarget;
+
+  return move * numericLot * spec.contractSize;
+}
+function calcLot(){
+  if(!selected || !selected.entry){
+    $("calcResult").innerHTML =
+      "Pilih signal aktif yang memiliki entry.";
+    return;
+  }
+
+  const lot = Number($("lotInput").value || 0);
+  const r = selected;
+  const spec = getSymbolSpec(r.symbol);
+
+  if(!Number.isFinite(lot) || lot <= 0){
+    $("calcResult").innerHTML =
+      "Lot harus berupa angka yang valid.";
+    return;
+  }
+
+  if(lot < spec.minLot){
+    $("calcResult").innerHTML =
+      `<div class="row">
+        <span>Lot tidak valid</span>
+        <b class="red">
+          Minimum lot ${r.symbol} adalah ${spec.minLot}
+        </b>
+      </div>`;
+    return;
+  }
+
+  $("calcResult").innerHTML = `
+    <div class="row">
+      <span>Pair</span>
+      <b>${r.symbol}</b>
+    </div>
+
+    <div class="row">
+      <span>Lot</span>
+      <b>${lot}</b>
+    </div>
+
+    <div class="row">
+      <span>Contract Size</span>
+      <b>${spec.contractSize}</b>
+    </div>
+
+    <div class="row">
+      <span>TP1 Estimasi</span>
+      <b class="green">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp1))}
+      </b>
+    </div>
+
+    <div class="row">
+      <span>TP2 Estimasi</span>
+      <b class="green">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp2))}
+      </b>
+    </div>
+
+    <div class="row">
+      <span>TP3 Estimasi</span>
+      <b class="green">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp3))}
+      </b>
+    </div>
+
+    <div class="row">
+      <span>SL Estimasi</span>
+      <b class="red">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.sl))}
+      </b>
+    </div>
+  `;
+}
 async function loadAnalytics(){try{let d=await api("/api/signals/analytics");$("analyticsBox").innerHTML=`<div class="analytics"><div class="stat"><small>TODAY</small><b>${d.today.winrate}%</b><div class="sub">Signal ${d.today.total}</div></div><div class="stat"><small>ALL TIME</small><b>${d.allTime.winrate}%</b><div class="sub">Signal ${d.allTime.total}</div></div></div>`}catch(e){log(e.message)}}async function loadUsers(){try{let d=await api("/api/admin/users");$("adminUsers").innerHTML=d.users.map(u=>`<div class="usercard"><div class="row"><span><b>${u.email}</b><br><span class="muted">${u.plan} • ${String(u.expiredAt||"-").slice(0,10)}</span><br><span class="muted">EA: ${u.eaEnabled?"ON":"OFF"} • MT5: ${u.mt5Account||"-"}</span><br><span class="muted" style="word-break:break-all">KEY: ${u.eaApiKey||"-"}</span></span><span class="badge">${u.status||"-"} ${u.active?"✅":"❌"}</span></div>${u.status==="PENDING"?`<div class="mini"><select id="plan_${u.id}"><option>FREE</option><option>PRO</option><option>VIP</option></select><input id="days_${u.id}" type="number" value="30"><input id="pass_${u.id}" value="DEWA123456"></div><input id="mt5_${u.id}" placeholder="MT5 Account optional"><button class="btnok" onclick="approveUser('${u.id}')">APPROVE</button>`:`<div class="mini"><select id="status_${u.id}"><option ${u.status==="ACTIVE"?"selected":""}>ACTIVE</option><option ${u.status==="BLOCKED"?"selected":""}>BLOCKED</option></select><input id="mt5_${u.id}" value="${u.mt5Account||""}"><select id="ea_${u.id}"><option value="true" ${u.eaEnabled?"selected":""}>EA ON</option><option value="false" ${!u.eaEnabled?"selected":""}>EA OFF</option></select></div><button class="btn2" onclick="updateUser('${u.id}')">UPDATE</button> <button class="btn2" onclick="regenEaKey('${u.id}')">NEW EA KEY</button>`} <button class="btnred" onclick="deleteUser('${u.id}')">DELETE</button></div>`).join("")}catch(e){log(e.message)}}async function approveUser(id){let d=await api("/api/admin/approve-user",{method:"POST",body:JSON.stringify({userId:id,plan:$("plan_"+id).value,days:Number($("days_"+id).value||30),password:$("pass_"+id).value,mt5Account:$("mt5_"+id).value,eaEnabled:true})});log("Approved: "+d.user.email+" | EA Key: "+d.user.eaApiKey);loadUsers()}async function updateUser(id){await api("/api/admin/update-user",{method:"POST",body:JSON.stringify({userId:id,status:$("status_"+id).value,mt5Account:$("mt5_"+id).value,eaEnabled:$("ea_"+id).value==="true"})});loadUsers()}async function regenEaKey(id){await api("/api/admin/regenerate-ea-key",{method:"POST",body:JSON.stringify({userId:id})});loadUsers()}async function deleteUser(id){if(!confirm("Hapus member/request ini?"))return;let r=await fetch("/api/admin/delete-user/"+id,{method:"DELETE",headers:headers()}),d=await r.json();if(!r.ok||d.error)alert(d.error||"Delete gagal");loadUsers()}
 function draw(r){let c=r.candles,cv=$("chart"),ctx=cv.getContext("2d");ctx.clearRect(0,0,cv.width,cv.height);ctx.fillStyle="#020617";ctx.fillRect(0,0,cv.width,cv.height);if(!c||c.length<2)return;let max=Math.max(...c.map(x=>x.high)),min=Math.min(...c.map(x=>x.low)),y=v=>cv.height-25-((v-min)/(max-min||1))*(cv.height-55),x=i=>30+i*((cv.width-55)/(c.length-1));c.forEach((k,i)=>{let xx=x(i),yo=y(k.open),yc=y(k.close),yh=y(k.high),yl=y(k.low);ctx.strokeStyle=k.close>=k.open?"#22c55e":"#ef4444";ctx.beginPath();ctx.moveTo(xx,yh);ctx.lineTo(xx,yl);ctx.stroke();ctx.fillStyle=ctx.strokeStyle;ctx.fillRect(xx-2,Math.min(yo,yc),4,Math.max(2,Math.abs(yc-yo)))})}function showPage(page){document.querySelectorAll('.nav div').forEach(x=>x.classList.remove('on'));if(page==="scanner"){$("navScanner").classList.add("on");$("scannerPanel").scrollIntoView({behavior:"smooth"})}if(page==="analytics"){$("navAnalytics").classList.add("on");$("analyticsPanel").scrollIntoView({behavior:"smooth"});loadAnalytics()}if(page==="member"){$("navMember").classList.add("on");document.querySelector(".userbox").scrollIntoView({behavior:"smooth"})}if(page==="admin"){$("navAdmin").classList.add("on");$("adminPanel").scrollIntoView({behavior:"smooth"});loadUsers()}}
 function urlBase64ToUint8Array(b){const p="=".repeat((4-b.length%4)%4),base64=(b+p).replace(/-/g,"+").replace(/_/g,"/"),raw=atob(base64),out=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)out[i]=raw.charCodeAt(i);return out}async function enablePush(){let perm=await Notification.requestPermission();if(perm!=="granted")return alert("Izin notifikasi ditolak");let reg=await navigator.serviceWorker.ready,k=await api("/api/push/public-key"),sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:urlBase64ToUint8Array(k.publicKey)});await api("/api/push/subscribe",{method:"POST",body:JSON.stringify({subscription:sub})});new Notification("⚡ DEWA SMC SIGNAL",{body:"Notifikasi aktif.",icon:"/icon-192.png"})}async function broadcastSignal(sym,r){try{await api("/api/push/broadcast",{method:"POST",body:JSON.stringify({pair:sym,signal:r.signal,entry:priceFmt(sym,r.entry),tp1:priceFmt(sym,r.tp1),tp2:priceFmt(sym,r.tp2),tp3:priceFmt(sym,r.tp3),sl:priceFmt(sym,r.sl)})})}catch(e){}}

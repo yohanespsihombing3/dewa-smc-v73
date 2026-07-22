@@ -404,7 +404,9 @@ if (rawSignal === 'OPEN LONG') {
   signalId: Number(latest.id),  // field baru
 
   key: latest.key || '',
-  signal: String(latest.signal || '').toUpperCase(),
+  signal: rawSignal,
+  status,
+  direction,
   engine: String(latest.engine || ''),
   grade: String(latest.grade || ''),
 

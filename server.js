@@ -419,7 +419,39 @@ if (rawSignal === 'OPEN LONG') {
   createdAt: latest.createdAt || latest.updatedAt || null
 });
 
-app.post('/api/signals/upsert',auth,(req,res)=>{let s=req.body||{};if(!s.pair||!s.signal||!s.entry)return res.status(400).json({error:'Data signal kurang'});let d=sigdb(),key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`,old=d.signals.find(x=>x.key===key);let item={id:old?old.id:uuid(),key,...s,createdAt:s.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),result:String(s.status||'').includes('SL HIT')?'LOSS':String(s.status||'').includes('TP')?'WIN':'RUNNING'};if(old)Object.assign(old,item);else d.signals.push(item);saveSig(d);if((String(s.engine||'').toUpperCase().includes('SMC')||String(s.engine||'').toUpperCase().includes('SNIPER'))&&!String(s.engine||'').toUpperCase().includes('HYBRID')&&['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(s.signal)&&isGradeAPlus(s.grade)){let ed=eadb(),eo=ed.signals.find(x=>x.key===key),ei={id:eo?eo.id:uuid(),key,pair:s.pair,tf:s.tf,signal:s.signal,engine:s.engine,grade:s.grade,entry:s.entry,tp1:s.tp1,tp2:s.tp2,tp3:s.tp3,sl:s.sl,createdAt:s.createdAt||new Date().toISOString()};if(eo)Object.assign(eo,ei);else ed.signals.push(ei);saveEa(ed)}res.json({success:true})});
+app.post('/api/signals/upsert',auth,(req,res)=>{let s=req.body||{};if(!s.pair||!s.signal||!s.entry)return res.status(400).json({error:'Data signal kurang'});let d=sigdb(),key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`,old=d.signals.find(x=>x.key===key);let item={id:old?old.id:uuid(),key,...s,createdAt:s.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),result:String(s.status||'').includes('SL HIT')?'LOSS':String(s.status||'').includes('TP')?'WIN':'RUNNING'};if(old)Object.assign(old,item);else d.signals.push(item);saveSig(d);if((String(s.engine||'').toUpperCase().includes('SMC')||String(s.engine||'').toUpperCase().includes('SNIPER'))&&!String(s.engine||'').toUpperCase().includes('HYBRID')&&['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(s.signal)&&isGradeAPlus(s.grade)){let ed=eadb(),eo=ed.signals.find(x=>x.key===key),ei={
+  id:eo?eo.id:uuid(),
+  key,
+  pair:s.pair,
+  tf:s.tf,
+  signal:s.signal,
+  status:s.status||null,
+  direction:s.direction||(
+    String(s.signal||'').includes('LONG')?'LONG':
+    String(s.signal||'').includes('SHORT')?'SHORT':null
+  ),
+  engine:s.engine,
+  grade:s.grade,
+  entry:s.entry,
+  tp1:s.tp1,
+  tp2:s.tp2,
+  tp3:s.tp3,
+  sl:s.sl,
+  createdAt:s.createdAt||new Date().toISOString(),
+  updatedAt:new Date().toISOString(),
+
+  execution:eo?.execution||{
+    status:'NEW',
+    ticket:null,
+    volume:null,
+    fillPrice:null,
+    executedAt:null,
+    closePrice:null,
+    closedAt:null,
+    profit:null,
+    updatedAt:new Date().toISOString()
+  }
+};if(eo)Object.assign(eo,ei);else ed.signals.push(ei);saveEa(ed)}res.json({success:true})});
 app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
 
 app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});

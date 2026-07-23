@@ -419,6 +419,121 @@ if (rawSignal === 'OPEN LONG') {
   createdAt: latest.createdAt || latest.updatedAt || null
 });
 
+app.post('/api/ea/update-execution',eaAuth,(req,res)=>{
+  try{
+    const body=req.body||{};
+    const signalId=String(body.signalId||'').trim();
+    const nextStatus=String(
+      body.execution_status||
+      body.executionStatus||
+      body.status||
+      ''
+    ).trim().toUpperCase();
+
+    if(!signalId){
+      return res.status(400).json({
+        ok:false,
+        error:'signalId wajib diisi'
+      });
+    }
+
+    const allowedStatuses=[
+      'NEW',
+      'EXECUTED',
+      'TP1',
+      'TP2',
+      'TP3',
+      'BREAKEVEN',
+      'PARTIAL_CLOSE',
+      'STOP_LOSS',
+      'CLOSED',
+      'CANCELLED',
+      'ERROR'
+    ];
+
+    if(!allowedStatuses.includes(nextStatus)){
+      return res.status(400).json({
+        ok:false,
+        error:'execution status tidak valid'
+      });
+    }
+
+    const ed=eadb();
+
+    const item=ed.signals.find(
+      x=>String(x.id)===signalId
+    );
+
+    if(!item){
+      return res.status(404).json({
+        ok:false,
+        error:'Signal tidak ditemukan'
+      });
+    }
+
+    const now=new Date().toISOString();
+
+    item.execution={
+      ...(item.execution||{}),
+      status:nextStatus,
+      updatedAt:now
+    };
+
+    if(body.ticket!==undefined)
+      item.execution.ticket=body.ticket;
+
+    if(body.volume!==undefined)
+      item.execution.volume=Number(body.volume);
+
+    if(body.fill_price!==undefined)
+      item.execution.fillPrice=Number(body.fill_price);
+
+    if(body.fillPrice!==undefined)
+      item.execution.fillPrice=Number(body.fillPrice);
+
+    if(body.close_price!==undefined)
+      item.execution.closePrice=Number(body.close_price);
+
+    if(body.closePrice!==undefined)
+      item.execution.closePrice=Number(body.closePrice);
+
+    if(body.profit!==undefined)
+      item.execution.profit=Number(body.profit);
+
+    if(nextStatus==='EXECUTED'){
+      item.execution.executedAt=
+        item.execution.executedAt||now;
+    }
+
+    if([
+      'TP3',
+      'STOP_LOSS',
+      'CLOSED',
+      'CANCELLED'
+    ].includes(nextStatus)){
+      item.execution.closedAt=now;
+    }
+
+    item.updatedAt=now;
+
+    saveEa(ed);
+
+    return res.json({
+      ok:true,
+      signalId:item.id,
+      execution:item.execution
+    });
+
+  }catch(err){
+    console.error('Update execution error:',err);
+
+    return res.status(500).json({
+      ok:false,
+      error:err.message||'Gagal update execution'
+    });
+  }
+});  
+  
 app.post('/api/signals/upsert',auth,(req,res)=>{let s=req.body||{};if(!s.pair||!s.signal||!s.entry)return res.status(400).json({error:'Data signal kurang'});let d=sigdb(),key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`,old=d.signals.find(x=>x.key===key);let item={id:old?old.id:uuid(),key,...s,createdAt:s.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),result:String(s.status||'').includes('SL HIT')?'LOSS':String(s.status||'').includes('TP')?'WIN':'RUNNING'};if(old)Object.assign(old,item);else d.signals.push(item);saveSig(d);if((String(s.engine||'').toUpperCase().includes('SMC')||String(s.engine||'').toUpperCase().includes('SNIPER'))&&!String(s.engine||'').toUpperCase().includes('HYBRID')&&['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(s.signal)&&isGradeAPlus(s.grade)){let ed=eadb(),eo=ed.signals.find(x=>x.key===key),ei={
   id:eo?eo.id:uuid(),
   key,

@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
 const { createClient } = require('@supabase/supabase-js');
+const { createEaV9Store } = require('./lib/ea-v9-store');
 const app=express(),PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET||'change-me',CACHE_MS=Number(process.env.CACHE_SECONDS||120)*1000;
 const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
 const EA_SIGNAL_MAX_AGE_MINUTES = Math.max(
@@ -17,6 +18,7 @@ const supabase = USE_SUPABASE
   : null;
 const KEYS=[process.env.TWELVE_DATA_API_KEY_1,process.env.TWELVE_DATA_API_KEY_2,process.env.TWELVE_DATA_API_KEY_3].filter(Boolean);
 let keyIndex=0;const cache=new Map(),DATA=path.join(__dirname,'data'),UF=path.join(DATA,'users.json'),SF=path.join(DATA,'signals.json'),EF=path.join(DATA,'ea-signals.json'),PF=path.join(DATA,'push-subscriptions.json'),KF=path.join(DATA,'push-keys.json');
+const eaV9Store=createEaV9Store({dataDir:DATA,retentionDays:Number(process.env.EA_QUEUE_RETENTION_DAYS||14),maxEvents:Number(process.env.EA_QUEUE_MAX_EVENTS||10000)});
 app.use(cors());app.use(express.json({limit:'3mb'}));app.use(express.static(path.join(__dirname,'public')));
 function ensure(){if(!fs.existsSync(DATA))fs.mkdirSync(DATA,{recursive:true});for(const [f,d] of [[UF,'{"users":[]}'],[SF,'{"signals":[]}'],[EF,'{"signals":[]}'],[PF,'{"subscriptions":[]}']])if(!fs.existsSync(f))fs.writeFileSync(f,d);if(!fs.existsSync(KF))fs.writeFileSync(KF,JSON.stringify(webpush.generateVAPIDKeys(),null,2))}
 function read(f,x){ensure();try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return x}}function write(f,d){ensure();fs.writeFileSync(f,JSON.stringify(d,null,2))}
@@ -271,26 +273,20 @@ app.get('/api/ea/verify',eaAuth,(req,res)=>{
   });
 });
 
+
 app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
   try{
     const symbol=normalizeEaSymbol(req.query.symbol);
     const tf=normalizeEaTimeframe(req.query.tf);
 
     if(!symbol){
-      return res.status(400).json({
-        error:'Symbol broker tidak didukung',
-        received:String(req.query.symbol||'')
-      });
+      return res.status(400).json({error:'Symbol broker tidak didukung',received:String(req.query.symbol||'')});
     }
-
     if(!tf){
-      return res.status(400).json({
-        error:'Timeframe EA hanya boleh 5m atau 15m',
-        received:String(req.query.tf||'')
-      });
+      return res.status(400).json({error:'Timeframe EA hanya boleh 5m atau 15m',received:String(req.query.tf||'')});
     }
 
-    let all=eadb().signals.filter(s=>{
+    const all=eadb().signals.filter(s=>{
       const engine=String(s.engine||'').toUpperCase();
       const signalName=String(s.signal||'').toUpperCase();
       const pair=normalizeEaSymbol(s.pair);
@@ -298,15 +294,7 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
       const isEntry=['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(signalName);
       const isSmc=engine.includes('SMC')&&!engine.includes('HYBRID');
       const isSniper=engine.includes('SNIPER')&&!engine.includes('HYBRID');
-
-      return (
-        isEntry &&
-        isGradeAPlus(s.grade) &&
-        (isSmc||isSniper) &&
-        pair===symbol &&
-        signalTf===tf &&
-        isFreshEaSignal(s)
-      );
+      return isEntry&&isGradeAPlus(s.grade)&&(isSmc||isSniper)&&pair===symbol&&signalTf===tf&&isFreshEaSignal(s);
     });
 
     const rank=s=>{
@@ -319,59 +307,11 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
     all.sort((a,b)=>{
       const pa=rank(a),pb=rank(b);
       if(pa!==pb)return pa-pb;
-      return new Date(b.createdAt||0)-new Date(a.createdAt||0);
+      return new Date(b.createdAt||b.updatedAt||0)-new Date(a.createdAt||a.updatedAt||0);
     });
 
     const latest=all[0]||null;
-
     if(!latest){
-      const rawSignal = String(latest.signal || '')
-  .trim()
-  .toUpperCase();
-
-let status = 'UNKNOWN';
-let direction = null;
-
-if (rawSignal === 'OPEN LONG') {
-  status = 'OPEN_LONG';
-  direction = 'LONG';
-} else if (rawSignal === 'OPEN SHORT') {
-  status = 'OPEN_SHORT';
-  direction = 'SHORT';
-} else if (rawSignal === 'WAIT LONG' || rawSignal === 'PREPARE LONG') {
-  status = 'PREPARE_LONG';
-  direction = 'LONG';
-} else if (rawSignal === 'WAIT SHORT' || rawSignal === 'PREPARE SHORT') {
-  status = 'PREPARE_SHORT';
-  direction = 'SHORT';
-} else if (rawSignal === 'REVERSE LONG') {
-  status = 'REVERSE_LONG';
-  direction = 'LONG';
-} else if (rawSignal === 'REVERSE SHORT') {
-  status = 'REVERSE_SHORT';
-  direction = 'SHORT';
-} else if (rawSignal === 'TP1' || rawSignal === 'TP1 HIT') {
-  status = 'TP1_HIT';
-} else if (rawSignal === 'TP2' || rawSignal === 'TP2 HIT') {
-  status = 'TP2_HIT';
-} else if (rawSignal === 'TP3' || rawSignal === 'TP3 HIT') {
-  status = 'TP3_HIT';
-} else if (
-  rawSignal === 'SL' ||
-  rawSignal === 'STOP LOSS' ||
-  rawSignal === 'STOP_LOSS'
-) {
-  status = 'STOP_LOSS';
-} else if (rawSignal === 'CANCELLED') {
-  status = 'CANCELLED';
-} else if (rawSignal === 'CLOSED') {
-  status = 'CLOSED';
-} else if (
-  rawSignal === 'NO TRADE' ||
-  rawSignal === 'NO_TRADE'
-) {
-  status = 'NO_TRADE';
-}
       return res.json({
         ok:true,
         authenticatedBy:'email+mt5',
@@ -379,44 +319,94 @@ if (rawSignal === 'OPEN LONG') {
         tf,
         maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
         priority:'SMC > SNIPER A/A+ | HYBRID ignored',
-        signalId: null,
-        signal:null
-
-        id: null,
-        signalId: null,
-        status: 'NO_SIGNAL',
-        direction: null,
+        id:null,
+        signalId:null,
+        signal:null,
+        status:'NO_SIGNAL',
+        direction:null
       });
     }
 
-    // Penting: field signal dibuat top-level agar sesuai parser EA V8.
+    const rawSignal=String(latest.signal||'').trim().toUpperCase();
+    const map={
+      'OPEN LONG':['OPEN_LONG','LONG'],
+      'OPEN SHORT':['OPEN_SHORT','SHORT'],
+      'REVERSE LONG':['REVERSE_LONG','LONG'],
+      'REVERSE SHORT':['REVERSE_SHORT','SHORT'],
+      'WAIT LONG':['PREPARE_LONG','LONG'],
+      'PREPARE LONG':['PREPARE_LONG','LONG'],
+      'WAIT SHORT':['PREPARE_SHORT','SHORT'],
+      'PREPARE SHORT':['PREPARE_SHORT','SHORT'],
+      'TP1':['TP1_HIT',null],
+      'TP1 HIT':['TP1_HIT',null],
+      'TP2':['TP2_HIT',null],
+      'TP2 HIT':['TP2_HIT',null],
+      'TP3':['TP3_HIT',null],
+      'TP3 HIT':['TP3_HIT',null],
+      'SL':['STOP_LOSS',null],
+      'STOP LOSS':['STOP_LOSS',null],
+      'STOP_LOSS':['STOP_LOSS',null],
+      'CANCELLED':['CANCELLED',null],
+      'CLOSED':['CLOSED',null],
+      'NO TRADE':['NO_TRADE',null],
+      'NO_TRADE':['NO_TRADE',null]
+    };
+    const [status,direction]=map[rawSignal]||['UNKNOWN',latest.direction||null];
+
     return res.json({
-  ok: true,
-  authenticatedBy: 'email+mt5',
+      ok:true,
+      authenticatedBy:'email+mt5',
+      symbol,
+      tf,
+      maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
+      priority:'SMC > SNIPER A/A+ | HYBRID ignored',
+      id:String(latest.id||''),
+      signalId:String(latest.id||''),
+      key:latest.key||'',
+      signal:rawSignal,
+      status,
+      direction,
+      engine:String(latest.engine||''),
+      grade:String(latest.grade||''),
+      entry:Number(latest.entry||0),
+      tp1:Number(latest.tp1||0),
+      tp2:Number(latest.tp2||0),
+      tp3:Number(latest.tp3||0),
+      sl:Number(latest.sl||0),
+      createdAt:latest.createdAt||latest.updatedAt||null
+    });
+  }catch(err){
+    console.error('latest-signal error:',err);
+    return res.status(500).json({ok:false,error:err.message||'Gagal mengambil signal'});
+  }
+});
 
-  symbol,
-  tf,
+app.get('/api/ea/signals',eaAuth,(req,res)=>{
+  try{
+    const afterSequence=Math.max(0,Number(req.query.afterSequence||0));
+    const limit=Math.min(200,Math.max(1,Number(req.query.limit||50)));
+    const result=eaV9Store.getEvents(afterSequence,limit);
+    return res.json({
+      ok:true,
+      authenticatedBy:'email+mt5',
+      account:req.eaMt5,
+      afterSequence,
+      lastSequence:result.lastSequence,
+      events:result.events
+    });
+  }catch(err){
+    console.error('ea signals queue error:',err);
+    return res.status(500).json({ok:false,error:err.message||'Gagal mengambil queue'});
+  }
+});
 
-  maxSignalAgeMinutes: EA_SIGNAL_MAX_AGE_MINUTES,
-  priority: 'SMC > SNIPER A/A+ | HYBRID ignored',
-
-  id: latest.id || '',          // kompatibilitas
-  signalId: Number(latest.id),  // field baru
-
-  key: latest.key || '',
-  signal: rawSignal,
-  status,
-  direction,
-  engine: String(latest.engine || ''),
-  grade: String(latest.grade || ''),
-
-  entry: Number(latest.entry || 0),
-  tp1: Number(latest.tp1 || 0),
-  tp2: Number(latest.tp2 || 0),
-  tp3: Number(latest.tp3 || 0),
-  sl: Number(latest.sl || 0),
-
-  createdAt: latest.createdAt || latest.updatedAt || null
+app.post('/api/ea/signal-ack',eaAuth,(req,res)=>{
+  try{
+    const ack=eaV9Store.upsertAck(req.eaMt5,req.body||{});
+    return res.json({ok:true,ack});
+  }catch(err){
+    return res.status(err.statusCode||500).json({ok:false,error:err.message||'Gagal menyimpan ACK'});
+  }
 });
 
 app.post('/api/ea/update-execution',eaAuth,(req,res)=>{
@@ -534,39 +524,78 @@ app.post('/api/ea/update-execution',eaAuth,(req,res)=>{
   }
 });  
   
-app.post('/api/signals/upsert',auth,(req,res)=>{let s=req.body||{};if(!s.pair||!s.signal||!s.entry)return res.status(400).json({error:'Data signal kurang'});let d=sigdb(),key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`,old=d.signals.find(x=>x.key===key);let item={id:old?old.id:uuid(),key,...s,createdAt:s.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),result:String(s.status||'').includes('SL HIT')?'LOSS':String(s.status||'').includes('TP')?'WIN':'RUNNING'};if(old)Object.assign(old,item);else d.signals.push(item);saveSig(d);if((String(s.engine||'').toUpperCase().includes('SMC')||String(s.engine||'').toUpperCase().includes('SNIPER'))&&!String(s.engine||'').toUpperCase().includes('HYBRID')&&['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(s.signal)&&isGradeAPlus(s.grade)){let ed=eadb(),eo=ed.signals.find(x=>x.key===key),ei={
-  id:eo?eo.id:uuid(),
-  key,
-  pair:s.pair,
-  tf:s.tf,
-  signal:s.signal,
-  status:s.status||null,
-  direction:s.direction||(
-    String(s.signal||'').includes('LONG')?'LONG':
-    String(s.signal||'').includes('SHORT')?'SHORT':null
-  ),
-  engine:s.engine,
-  grade:s.grade,
-  entry:s.entry,
-  tp1:s.tp1,
-  tp2:s.tp2,
-  tp3:s.tp3,
-  sl:s.sl,
-  createdAt:s.createdAt||new Date().toISOString(),
-  updatedAt:new Date().toISOString(),
 
-  execution:eo?.execution||{
-    status:'NEW',
-    ticket:null,
-    volume:null,
-    fillPrice:null,
-    executedAt:null,
-    closePrice:null,
-    closedAt:null,
-    profit:null,
-    updatedAt:new Date().toISOString()
+app.post('/api/signals/upsert',auth,(req,res)=>{
+  try{
+    const s=req.body||{};
+    if(!s.pair||!s.signal||!s.entry){
+      return res.status(400).json({error:'Data signal kurang'});
+    }
+
+    const d=sigdb();
+    const key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`;
+    const old=d.signals.find(x=>x.key===key);
+    const now=new Date().toISOString();
+    const item={
+      id:old?old.id:uuid(),
+      key,
+      ...s,
+      createdAt:s.createdAt||(old&&old.createdAt)||now,
+      updatedAt:now,
+      result:String(s.status||'').includes('SL HIT')?'LOSS':
+        String(s.status||'').includes('TP')?'WIN':'RUNNING'
+    };
+
+    if(old)Object.assign(old,item);else d.signals.push(item);
+    saveSig(d);
+
+    const engine=String(s.engine||'').toUpperCase();
+    const signalName=String(s.signal||'').toUpperCase();
+    const eligibleEngine=(engine.includes('SMC')||engine.includes('SNIPER'))&&!engine.includes('HYBRID');
+    const eligibleSignal=['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(signalName);
+
+    let queueEvent=null;
+    if(eligibleEngine&&eligibleSignal&&isGradeAPlus(s.grade)){
+      const ed=eadb();
+      const eo=ed.signals.find(x=>x.key===key);
+      const ei={
+        id:eo?eo.id:item.id,
+        key,
+        pair:s.pair,
+        tf:s.tf,
+        signal:signalName,
+        status:s.status||null,
+        direction:s.direction||(signalName.includes('LONG')?'LONG':'SHORT'),
+        engine:s.engine,
+        grade:s.grade,
+        entry:Number(s.entry||0),
+        tp1:Number(s.tp1||0),
+        tp2:Number(s.tp2||0),
+        tp3:Number(s.tp3||0),
+        sl:Number(s.sl||0),
+        createdAt:s.createdAt||(eo&&eo.createdAt)||now,
+        updatedAt:now,
+        execution:(eo&&eo.execution)||{
+          status:'NEW',ticket:null,volume:null,fillPrice:null,
+          executedAt:null,closePrice:null,closedAt:null,profit:null,updatedAt:now
+        }
+      };
+      if(eo)Object.assign(eo,ei);else ed.signals.push(ei);
+      saveEa(ed);
+
+      const shouldQueue=!eo||String(eo.signal||'').toUpperCase()!==signalName||
+        String(eo.updatedAt||'')!==String(ei.updatedAt||'');
+      if(shouldQueue){
+        queueEvent=eaV9Store.pushEvent(ei);
+      }
+    }
+
+    return res.json({success:true,signalId:item.id,queued:!!queueEvent,queueEvent});
+  }catch(err){
+    console.error('signals upsert error:',err);
+    return res.status(500).json({error:err.message||'Gagal menyimpan signal'});
   }
-};if(eo)Object.assign(eo,ei);else ed.signals.push(ei);saveEa(ed)}res.json({success:true})});
+});
 app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
 
 app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});
@@ -610,7 +639,7 @@ app.get('/api/twelvedata/candles',auth,async(req,res)=>{if(!KEYS.length)return r
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
-    version: 'V8 EMAIL+MT5 AUTH | M5/M15 | SYMBOL NORMALIZATION',
+    version: 'V9 QUEUE+ACK | V8 COMPATIBLE | EMAIL+MT5 AUTH',
     time: new Date().toISOString()
   });
 });
@@ -686,7 +715,7 @@ ensureAdmin().then(async()=>{
   PUSH_CACHE = await loadPushFromSupabase();
 
   app.listen(PORT,'0.0.0.0',()=>{
-    console.log('DEWA SMC V8 EMAIL+MT5 AUTH running at http://0.0.0.0:'+PORT);
+    console.log('DEWA SMC V9 QUEUE+ACK running at http://0.0.0.0:'+PORT);
     console.log('Push subscriptions loaded:', PUSH_CACHE.subscriptions.length);
     console.log('Supabase:', USE_SUPABASE ? 'ON' : 'OFF');
   });

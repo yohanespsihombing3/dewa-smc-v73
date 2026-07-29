@@ -583,11 +583,17 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
       if(eo)Object.assign(eo,ei);else ed.signals.push(ei);
       saveEa(ed);
 
-      const shouldQueue=!eo||String(eo.signal||'').toUpperCase()!==signalName||
-        String(eo.updatedAt||'')!==String(ei.updatedAt||'');
-      if(shouldQueue){
-        queueEvent=eaV9Store.pushEvent(ei);
-      }
+      const previousSignal = eo ? String(eo.signal || ’‘).toUpperCase() :
+      null; const previousUpdatedAt = eo ? String(eo.updatedAt ||’’) : null;
+
+      if(eo) Object.assign(eo,ei); else ed.signals.push(ei);
+
+      saveEa(ed);
+
+      const shouldQueue = !eo || previousSignal !== signalName ||
+      previousUpdatedAt !== String(ei.updatedAt || ’’);
+
+      if(shouldQueue){ queueEvent = eaV9Store.pushEvent(ei); }
     }
 
     return res.json({success:true,signalId:item.id,queued:!!queueEvent,queueEvent});

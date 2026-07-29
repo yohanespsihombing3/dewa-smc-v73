@@ -554,60 +554,77 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
     const eligibleEngine=(engine.includes('SMC')||engine.includes('SNIPER'))&&!engine.includes('HYBRID');
     const eligibleSignal=['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(signalName);
 
-    let queueEvent=null;
-    if(eligibleEngine&&eligibleSignal&&isGradeAPlus(s.grade)){
-      const ed=eadb();
-      const eo=ed.signals.find(x=>x.key===key);
-      const ei={
-        id:eo?eo.id:item.id,
-        key,
-        pair:s.pair,
-        tf:s.tf,
-        signal:signalName,
-        status:s.status||null,
-        direction:s.direction||(signalName.includes('LONG')?'LONG':'SHORT'),
-        engine:s.engine,
-        grade:s.grade,
-        entry:Number(s.entry||0),
-        tp1:Number(s.tp1||0),
-        tp2:Number(s.tp2||0),
-        tp3:Number(s.tp3||0),
-        sl:Number(s.sl||0),
-        createdAt:s.createdAt||(eo&&eo.createdAt)||now,
-        updatedAt:now,
-        execution:(eo&&eo.execution)||{
-          status:'NEW',ticket:null,volume:null,fillPrice:null,
-          executedAt:null,closePrice:null,closedAt:null,profit:null,updatedAt:now
-        }
-      };
-      if(eo)Object.assign(eo,ei);else ed.signals.push(ei);
-      saveEa(ed);
+    let queueEvent = null;
 
-      const previousSignal = eo ? String(eo.signal || '').toUpperCase() : null;
-      const previousUpdatedAt = eo ? String(eo.updatedAt || '') : null;
+if (eligibleEngine && eligibleSignal && isGradeAPlus(s.grade)) {
+  const ed = eadb();
+  const eo = ed.signals.find(x => x.key === key);
 
-      if(eo)
-      Object.assign(eo,ei);
-      else
-      ed.signals.push(ei);
+  const previousSignal = eo
+    ? String(eo.signal || '').toUpperCase()
+    : null;
 
-      saveEa(ed);
+  const previousUpdatedAt = eo
+    ? String(eo.updatedAt || '')
+    : null;
 
-      const shouldQueue =
-      !eo ||
-     previousSignal !== signalName ||
-     previousUpdatedAt !== String(ei.updatedAt || '');
+  const ei = {
+    id: eo ? eo.id : item.id,
+    key,
+    pair: s.pair,
+    tf: s.tf,
+    signal: signalName,
+    status: s.status || null,
+    direction:
+      s.direction ||
+      (signalName.includes('LONG') ? 'LONG' : 'SHORT'),
+    engine: s.engine,
+    grade: s.grade,
+    entry: Number(s.entry || 0),
+    tp1: Number(s.tp1 || 0),
+    tp2: Number(s.tp2 || 0),
+    tp3: Number(s.tp3 || 0),
+    sl: Number(s.sl || 0),
+    createdAt: s.createdAt || (eo && eo.createdAt) || now,
+    updatedAt: now,
+    execution: (eo && eo.execution) || {
+      status: 'NEW',
+      ticket: null,
+      volume: null,
+      fillPrice: null,
+      executedAt: null,
+      closePrice: null,
+      closedAt: null,
+      profit: null,
+      updatedAt: now
+    }
+  };
 
-     if(shouldQueue){
-     queueEvent = eaV9Store.pushEvent(ei);
-     }
-    return res.json({success:true,signalId:item.id,queued:!!queueEvent,queueEvent});
-  }catch(err){
-    console.error('signals upsert error:',err);
-    return res.status(500).json({error:err.message||'Gagal menyimpan signal'});
+  const shouldQueue =
+    !eo ||
+    previousSignal !== signalName ||
+    previousUpdatedAt !== String(ei.updatedAt || '');
+
+  if (eo) {
+    Object.assign(eo, ei);
+  } else {
+    ed.signals.push(ei);
   }
+
+  saveEa(ed);
+
+  if (shouldQueue) {
+    queueEvent = eaV9Store.pushEvent(ei);
+  }
+}
+
+return res.json({
+  success: true,
+  signalId: item.id,
+  queued: !!queueEvent,
+  queueEvent
 });
-app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
+    app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
 
 app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});
 app.post('/api/push/subscribe',auth,(req,res)=>{let sub=req.body.subscription;if(!sub||!sub.endpoint)return res.status(400).json({error:'Invalid'});let d=pushdb(),old=d.subscriptions.find(x=>x.endpoint===sub.endpoint);if(old)old.subscription=sub;else d.subscriptions.push({id:uuid(),userId:req.user.id,email:req.user.email,endpoint:sub.endpoint,subscription:sub});savePush(d);res.json({success:true})});

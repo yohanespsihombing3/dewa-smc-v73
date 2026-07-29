@@ -158,45 +158,93 @@ function fmtPrice(x) {
   return Number(x).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
 }
 
-function ema(values, period) {
-  if (!values.length) return NaN;
-  const k = 2 / (period + 1);
-  let result = values[0];
+function emaSeries(values, period) {
+  if (!Array.isArray(values) || values.length === 0 || period <= 0) return [];
+
+  const alpha = 2 / (period + 1);
+  const output = [];
+  let value = Number(values[0]);
+
+  output.push(value);
+
   for (let i = 1; i < values.length; i++) {
-    result = values[i] * k + result * (1 - k);
+    const source = Number(values[i]);
+    value = alpha * source + (1 - alpha) * value;
+    output.push(value);
   }
-  return result;
+
+  return output;
+}
+
+function ema(values, period) {
+  const series = emaSeries(values, period);
+  return series.length ? series[series.length - 1] : NaN;
 }
 
 function sma(values, period) {
+  if (!Array.isArray(values) || values.length < period || period <= 0) {
+    return NaN;
+  }
+
   const slice = values.slice(-period);
-  if (!slice.length) return NaN;
-  return slice.reduce((a, b) => a + b, 0) / slice.length;
+  return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-function atr(candles, period = 14) {
-  const tr = [];
-  for (let i = 1; i < candles.length; i++) {
-    tr.push(
+function trueRangeSeries(candles) {
+  if (!Array.isArray(candles) || candles.length === 0) return [];
+
+  const output = [];
+
+  for (let i = 0; i < candles.length; i++) {
+    const current = candles[i];
+
+    if (i === 0) {
+      output.push(current.high - current.low);
+      continue;
+    }
+
+    const previousClose = candles[i - 1].close;
+
+    output.push(
       Math.max(
-        candles[i].high - candles[i].low,
-        Math.abs(candles[i].high - candles[i - 1].close),
-        Math.abs(candles[i].low - candles[i - 1].close)
+        current.high - current.low,
+        Math.abs(current.high - previousClose),
+        Math.abs(current.low - previousClose)
       )
     );
   }
-  const slice = tr.slice(-period);
-  return slice.length
-    ? slice.reduce((a, b) => a + b, 0) / slice.length
-    : 0;
+
+  return output;
 }
 
-function atrSeries(candles, period = 14) {
-  const values = [];
-  for (let i = period + 1; i <= candles.length; i++) {
-    values.push(atr(candles.slice(0, i), period));
+// TradingView ta.rma(): seed memakai SMA(period), lalu Wilder smoothing.
+function rmaSeries(values, period) {
+  if (!Array.isArray(values) || values.length < period || period <= 0) {
+    return [];
   }
-  return values.filter(Number.isFinite);
+
+  const output = new Array(values.length).fill(NaN);
+  let value =
+    values.slice(0, period).reduce((sum, item) => sum + item, 0) / period;
+
+  output[period - 1] = value;
+
+  for (let i = period; i < values.length; i++) {
+    value = (value * (period - 1) + values[i]) / period;
+    output[i] = value;
+  }
+
+  return output;
+}
+
+// TradingView ta.atr(period) = ta.rma(true range, period).
+function atrSeries(candles, period = 14) {
+  return rmaSeries(trueRangeSeries(candles), period);
+}
+
+function atr(candles, period = 14) {
+  const values = atrSeries(candles, period).filter(Number.isFinite);
+  return values.length ? values[values.length - 1] : NaN;
 }
 
 function getGrade(score) {
@@ -321,10 +369,11 @@ function analyzeSmc(pair, tf, candles) {
   }
 
   const last = closed[closed.length - 1];
-  const e9 = ema(closes.slice(-120), 9);
-  const e20 = ema(closes.slice(-140), 20);
-  const atr14 = atr(closed, 14);
-  const atrValues = atrSeries(closed, 14);
+  // Hitung dari seluruh histori yang tersedia agar seed mendekati TradingView.
+  const e9 = ema(closes, 9);
+  const e20 = ema(closes, 20);
+  const atrValues = atrSeries(closed, 14).filter(Number.isFinite);
+  const atr14 = atrValues.length ? atrValues[atrValues.length - 1] : NaN;
   const atrSma20 = sma(atrValues, 20);
   const volatilityOk =
     Number.isFinite(atrSma20) && atr14 > atrSma20;
@@ -425,6 +474,11 @@ function analyzeSmc(pair, tf, candles) {
     tp3,
     sl,
     atr: atr14,
+    atrSma20,
+    targetRange,
+    ema9: e9,
+    ema20: e20,
+    volatilityOk,
     mainSignal: freshEvent.type,
     candleTime: freshEvent.candleTime,
     direction: freshEvent.direction,

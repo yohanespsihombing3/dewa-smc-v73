@@ -1,4 +1,4 @@
-const CACHE_NAME = "dewa-smc-v75-cache-v10";
+const CACHE_NAME = "dewa-smc-v10-membership-cache-v1";
 
 self.addEventListener("install", event => {
   self.skipWaiting();

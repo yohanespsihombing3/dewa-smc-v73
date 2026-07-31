@@ -41,7 +41,7 @@ const ENABLED = String(process.env.WORKER_ENABLED || "true").toLowerCase() === "
 const SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SCAN_SECONDS || 120));
 const OUTPUT_SIZE = Math.max(80, Math.min(500, Number(process.env.WORKER_OUTPUTSIZE || 180)));
 
-const PAIRS = String(
+const DEFAULT_PAIRS = String(
   process.env.WORKER_PAIRS ||
   "XAU/USD,BTC/USD,ETH/USD,EUR/USD,GBP/USD"
 )
@@ -49,10 +49,43 @@ const PAIRS = String(
   .map(x => x.trim().toUpperCase())
   .filter(Boolean);
 
-const TFS = String(process.env.WORKER_TFS || "5,15")
+const DEFAULT_TFS = String(process.env.WORKER_TFS || "5,15")
   .split(",")
   .map(x => x.trim())
   .filter(x => x === "5" || x === "15");
+
+
+let ACTIVE_PAIRS = [...DEFAULT_PAIRS];
+let ACTIVE_TFS = [...DEFAULT_TFS];
+
+async function refreshWorkerConfig() {
+  try {
+    const config = await authorizedApi("/api/worker/config");
+
+    if (Array.isArray(config.pairs) && config.pairs.length) {
+      ACTIVE_PAIRS = config.pairs
+        .map(x => String(x || "").trim().toUpperCase())
+        .filter(Boolean);
+    }
+
+    if (Array.isArray(config.timeframes) && config.timeframes.length) {
+      ACTIVE_TFS = config.timeframes
+        .map(String)
+        .filter(x => x === "5" || x === "15");
+    }
+
+    console.log(
+      "[WORKER CONFIG]",
+      "pairs=" + ACTIVE_PAIRS.join(","),
+      "tfs=" + ACTIVE_TFS.join(",")
+    );
+  } catch (error) {
+    console.warn(
+      "[WORKER CONFIG] Gagal membaca menu Pair Management, memakai ENV fallback:",
+      error.message
+    );
+  }
+}
 
 const API_KEYS = Object.keys(process.env)
   .filter(k => k.startsWith("TWELVE_DATA_API_KEY_"))
@@ -739,13 +772,13 @@ async function runAutoScanner() {
   console.log(
     "\n[WORKER] Scan mulai",
     new Date().toISOString(),
-    "pairs=" + PAIRS.join(","),
+    "pairs=" + ACTIVE_PAIRS.join(","),
     "tfs=" + TFS.join(",")
   );
 
   try {
-    for (const tf of TFS) {
-      for (const pair of PAIRS) {
+    for (const tf of ACTIVE_TFS) {
+      for (const pair of ACTIVE_PAIRS) {
         try {
           await processPairTf(pair, tf);
         } catch (error) {
@@ -775,8 +808,8 @@ async function main() {
   console.log("==============================================");
   console.log("DEWA SMC SERVER SCANNER WORKER");
   console.log("APP:", APP_BASE_URL);
-  console.log("PAIR:", PAIRS.join(", "));
-  console.log("TF:", TFS.join(", "));
+  console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
+  console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));
   console.log("INTERVAL:", SCAN_SECONDS, "detik");
   console.log("==============================================");
 
@@ -790,12 +823,15 @@ async function main() {
   }
 
   await login();
+  await refreshWorkerConfig();
   await runAutoScanner();
 
   setInterval(() => {
-    runAutoScanner().catch(error => {
+    refreshWorkerConfig()
+      .then(() => runAutoScanner())
+      .catch(error => {
       console.error("[WORKER FATAL LOOP]", error);
-    });
+      });
   }, SCAN_SECONDS * 1000);
 }
 

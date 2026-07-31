@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V1
+  DEWA SMC SERVER-SIDE SCANNER WORKER V10.2
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -55,35 +55,156 @@ const DEFAULT_TFS = String(process.env.WORKER_TFS || "5,15")
   .filter(x => x === "5" || x === "15");
 
 
-let ACTIVE_PAIRS = [...DEFAULT_PAIRS];
-let ACTIVE_TFS = [...DEFAULT_TFS];
+const DEFAULT_PAIR_SETTINGS = DEFAULT_PAIRS.map((symbol, index) => ({
+  symbol,
+  dataSymbol: symbol,
+  timeframes: [...DEFAULT_TFS],
+  enabled: true,
+  priority: "NORMAL",
+  structurePeriod: 20,
+  prepareDistancePct: 0.25,
+  volatilityEnabled: true,
+  minRrr: 1.5,
+  scanOrder: index
+}));
+
+let ACTIVE_PAIR_SETTINGS = [...DEFAULT_PAIR_SETTINGS];
+let LAST_CONFIG_REFRESH_AT = null;
+
+function normalizePriority(value) {
+  const priority = String(value || "NORMAL").trim().toUpperCase();
+  return ["HIGH", "NORMAL", "LOW"].includes(priority) ? priority : "NORMAL";
+}
+
+function priorityWeight(value) {
+  return { HIGH: 0, NORMAL: 1, LOW: 2 }[normalizePriority(value)];
+}
+
+function normalizeWorkerPair(raw, index = 0) {
+  const symbol = String(
+    raw?.symbol || raw?.displaySymbol || raw?.dataSymbol || raw?.data_symbol || ""
+  ).trim().toUpperCase();
+
+  const dataSymbol = String(
+    raw?.dataSymbol || raw?.data_symbol || symbol
+  ).trim().toUpperCase();
+
+  const rawTfs = Array.isArray(raw?.timeframes)
+    ? raw.timeframes
+    : DEFAULT_TFS;
+
+  const timeframes = [...new Set(
+    rawTfs.map(String).filter(tf => tf === "5" || tf === "15")
+  )];
+
+  return {
+    symbol,
+    dataSymbol,
+    timeframes: timeframes.length ? timeframes : [...DEFAULT_TFS],
+    enabled: raw?.enabled !== false,
+    priority: normalizePriority(raw?.priority),
+    structurePeriod: Math.min(
+      60,
+      Math.max(2, Number(raw?.structurePeriod ?? raw?.structure_period ?? 20))
+    ),
+    prepareDistancePct: Math.min(
+      5,
+      Math.max(
+        0.00001,
+        Number(raw?.prepareDistancePct ?? raw?.prepare_distance_pct ?? 0.25)
+      )
+    ),
+    volatilityEnabled:
+      (raw?.volatilityEnabled ?? raw?.volatility_enabled) !== false,
+    minRrr: Math.max(
+      0.01,
+      Number(raw?.minRrr ?? raw?.min_rrr ?? 1.5)
+    ),
+    scanOrder: Number(raw?.scanOrder ?? raw?.scan_order ?? index)
+  };
+}
+
+function sortPairSettings(settings) {
+  return [...settings].sort((a, b) => {
+    const priorityDiff = priorityWeight(a.priority) - priorityWeight(b.priority);
+    if (priorityDiff !== 0) return priorityDiff;
+
+    const orderDiff = Number(a.scanOrder || 0) - Number(b.scanOrder || 0);
+    if (orderDiff !== 0) return orderDiff;
+
+    return a.symbol.localeCompare(b.symbol);
+  });
+}
 
 async function refreshWorkerConfig() {
   try {
     const config = await authorizedApi("/api/worker/config");
 
-    if (Array.isArray(config.pairs) && config.pairs.length) {
-      ACTIVE_PAIRS = config.pairs
-        .map(x => String(x || "").trim().toUpperCase())
-        .filter(Boolean);
+    let nextSettings = [];
+
+    if (Array.isArray(config.pairSettings) && config.pairSettings.length) {
+      nextSettings = config.pairSettings
+        .map(normalizeWorkerPair)
+        .filter(item => item.enabled && item.symbol && item.dataSymbol);
+    } else if (Array.isArray(config.pairs) && config.pairs.length) {
+      const globalTfs = Array.isArray(config.timeframes)
+        ? config.timeframes.map(String).filter(tf => tf === "5" || tf === "15")
+        : DEFAULT_TFS;
+
+      nextSettings = config.pairs
+        .map((pair, index) =>
+          normalizeWorkerPair(
+            {
+              symbol: pair,
+              dataSymbol: pair,
+              timeframes: globalTfs,
+              enabled: true,
+              scanOrder: index
+            },
+            index
+          )
+        )
+        .filter(item => item.symbol && item.dataSymbol);
     }
 
-    if (Array.isArray(config.timeframes) && config.timeframes.length) {
-      ACTIVE_TFS = config.timeframes
-        .map(String)
-        .filter(x => x === "5" || x === "15");
+    if (!nextSettings.length) {
+      throw new Error("Konfigurasi pair aktif kosong");
     }
+
+    ACTIVE_PAIR_SETTINGS = sortPairSettings(nextSettings);
+    LAST_CONFIG_REFRESH_AT = new Date().toISOString();
 
     console.log(
       "[WORKER CONFIG]",
-      "pairs=" + ACTIVE_PAIRS.join(","),
-      "tfs=" + ACTIVE_TFS.join(",")
+      "source=SUPABASE",
+      "pairs=" + ACTIVE_PAIR_SETTINGS.length,
+      "refreshedAt=" + LAST_CONFIG_REFRESH_AT
     );
+
+    for (const item of ACTIVE_PAIR_SETTINGS) {
+      console.log(
+        "[PAIR CONFIG]",
+        item.symbol,
+        "data=" + item.dataSymbol,
+        "tf=" + item.timeframes.join(","),
+        "priority=" + item.priority,
+        "structure=" + item.structurePeriod,
+        "prepare=" + item.prepareDistancePct + "%",
+        "volatility=" + (item.volatilityEnabled ? "ON" : "OFF"),
+        "minRRR=" + item.minRrr,
+        "order=" + item.scanOrder
+      );
+    }
   } catch (error) {
     console.warn(
-      "[WORKER CONFIG] Gagal membaca menu Pair Management, memakai ENV fallback:",
+      "[WORKER CONFIG] Gagal membaca konfigurasi Supabase. " +
+      "Memakai cache terakhir/ENV fallback:",
       error.message
     );
+
+    if (!ACTIVE_PAIR_SETTINGS.length) {
+      ACTIVE_PAIR_SETTINGS = [...DEFAULT_PAIR_SETTINGS];
+    }
   }
 }
 
@@ -305,14 +426,14 @@ function pivotLowAt(candles, index, left, right) {
   return value;
 }
 
-function analyzeSmc(pair, tf, candles) {
+function analyzeSmc(pair, tf, candles, pairConfig = {}) {
   // Candle terakhir dari Twelve Data bisa masih berjalan.
   const closed = candles.slice(0, -1);
   if (closed.length < 70) {
     return { valid: false, reason: "DATA LOW" };
   }
 
-  const structurePeriod = 20;
+  const structurePeriod = Math.min(60, Math.max(2, Number(pairConfig.structurePeriod || 20)));
   let lastHigh = NaN;
   let lastLow = NaN;
   let highBreakPending = false;
@@ -408,8 +529,10 @@ function analyzeSmc(pair, tf, candles) {
   const atrValues = atrSeries(closed, 14).filter(Number.isFinite);
   const atr14 = atrValues.length ? atrValues[atrValues.length - 1] : NaN;
   const atrSma20 = sma(atrValues, 20);
+  const volatilityEnabled = pairConfig.volatilityEnabled !== false;
   const volatilityOk =
-    Number.isFinite(atrSma20) && atr14 > atrSma20;
+    !volatilityEnabled ||
+    (Number.isFinite(atrSma20) && atr14 > atrSma20);
 
   const emaLong = e9 > e20 && last.close > e9;
   const emaShort = e9 < e20 && last.close < e9;
@@ -443,6 +566,23 @@ function analyzeSmc(pair, tf, candles) {
       score,
       emaOk,
       volatilityOk
+    };
+  }
+
+  // Berdasarkan rumus tetap: TP1=0.67R, TP2=1.33R, TP3=2.33R.
+  const rrr = {
+    tp1: 0.8 / 1.2,
+    tp2: 1.6 / 1.2,
+    tp3: 2.8 / 1.2
+  };
+  const minRrr = Math.max(0.01, Number(pairConfig.minRrr || 1.5));
+
+  if (rrr.tp3 < minRrr) {
+    return {
+      valid: false,
+      reason: "RRR BELOW MINIMUM",
+      minRrr,
+      maxRrr: rrr.tp3
     };
   }
 
@@ -512,6 +652,14 @@ function analyzeSmc(pair, tf, candles) {
     ema9: e9,
     ema20: e20,
     volatilityOk,
+    volatilityEnabled,
+    structurePeriod,
+    prepareDistancePct: Number(pairConfig.prepareDistancePct || 0.25),
+    minRrr,
+    rrr,
+    priority: pairConfig.priority || "NORMAL",
+    scanOrder: Number(pairConfig.scanOrder || 0),
+    dataSymbol: pairConfig.dataSymbol || pair,
     mainSignal: freshEvent.type,
     candleTime: freshEvent.candleTime,
     direction: freshEvent.direction,
@@ -719,9 +867,10 @@ async function sendNotification(signal) {
   });
 }
 
-async function processPairTf(pair, tf) {
-  const candles = await fetchCandles(pair, tf);
-  const signal = analyzeSmc(pair, tf, candles);
+async function processPairTf(pairConfig, tf) {
+  const pair = pairConfig.symbol;
+  const candles = await fetchCandles(pairConfig.dataSymbol, tf);
+  const signal = analyzeSmc(pair, tf, candles, pairConfig);
 
   if (!signal.valid) {
     console.log(
@@ -768,31 +917,41 @@ async function runAutoScanner() {
 
   running = true;
   const started = Date.now();
+  const scanPlan = [];
+
+  for (const pairConfig of ACTIVE_PAIR_SETTINGS) {
+    for (const tf of pairConfig.timeframes) {
+      if (tf === "5" || tf === "15") {
+        scanPlan.push({ pairConfig, tf });
+      }
+    }
+  }
 
   console.log(
     "\n[WORKER] Scan mulai",
     new Date().toISOString(),
-    "pairs=" + ACTIVE_PAIRS.join(","),
-    "tfs=" + TFS.join(",")
+    "jobs=" + scanPlan.length,
+    "pairs=" + ACTIVE_PAIR_SETTINGS.length,
+    "configRefreshedAt=" + (LAST_CONFIG_REFRESH_AT || "ENV")
   );
 
   try {
-    for (const tf of ACTIVE_TFS) {
-      for (const pair of ACTIVE_PAIRS) {
-        try {
-          await processPairTf(pair, tf);
-        } catch (error) {
-          console.error(
-            "[SCAN ERROR]",
-            pair,
-            tfLabel(tf),
-            error.message
-          );
-        }
+    for (const job of scanPlan) {
+      const { pairConfig, tf } = job;
 
-        // Mengurangi risiko rate limit Twelve Data.
-        await sleep(1500);
+      try {
+        await processPairTf(pairConfig, tf);
+      } catch (error) {
+        console.error(
+          "[SCAN ERROR]",
+          pairConfig.symbol,
+          tfLabel(tf),
+          error.message
+        );
       }
+
+      // Mengurangi risiko rate limit Twelve Data.
+      await sleep(1500);
     }
   } finally {
     running = false;
@@ -806,7 +965,7 @@ async function runAutoScanner() {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER");
+  console.log("DEWA SMC SERVER SCANNER WORKER V10.2");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

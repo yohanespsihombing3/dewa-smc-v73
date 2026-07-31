@@ -2,6 +2,7 @@ require('dotenv').config();
 const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
 const { createClient } = require('@supabase/supabase-js');
 const { createEaV9Store } = require('./lib/ea-v9-store');
+const { registerV10Admin } = require('./lib/v10-admin');
 const app=express(),PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET||'change-me',CACHE_MS=Number(process.env.CACHE_SECONDS||120)*1000;
 const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
 const EA_SIGNAL_MAX_AGE_MINUTES = Math.max(
@@ -256,6 +257,20 @@ app.delete('/api/member/mt5-account',auth,(req,res)=>{
   }
 });
 
+
+
+registerV10Admin({
+  app,
+  auth,
+  dataDir: DATA,
+  db,
+  saveDb,
+  safe,
+  addDays,
+  newKey,
+  bcrypt,
+  uuid
+});
 
 app.get('/api/admin/users',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});res.json({users:db().users.map(safe)})});
 app.post('/api/admin/approve-user',auth,async(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);if(!u)return res.status(404).json({error:'User tidak ditemukan'});let tmp=req.body.password||'DEWA123456';u.passwordHash=await bcrypt.hash(tmp,10);u.status='ACTIVE';u.plan=req.body.plan||'FREE';u.expiredAt=addDays(req.body.days||30);u.mustChangePassword=true;u.eaApiKey=u.eaApiKey||newKey();u.eaEnabled=req.body.eaEnabled!==false;u.mt5Account=String(req.body.mt5Account||'');saveDb(d);res.json({success:true,tempPassword:tmp,user:safe(u)})});

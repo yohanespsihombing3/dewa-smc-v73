@@ -1970,10 +1970,14 @@ function simpleFilterMembers(){
   const q = String(($("simpleMemberSearch") && $("simpleMemberSearch").value) || "")
     .trim().toLowerCase();
   const tokens = q.split(/\s+/).filter(Boolean);
-  SIMPLE_MEMBER_FILTERED = !tokens.length ? null : SIMPLE_MEMBER_CACHE.filter(m => {
-    const text = simpleMemberSearchText(m);
-    return tokens.every(t => text.includes(t));
-  });
+
+  SIMPLE_MEMBER_FILTERED = !tokens.length
+    ? null
+    : SIMPLE_MEMBER_CACHE.filter(m => {
+        const text = simpleMemberSearchText(m);
+        return tokens.every(t => text.includes(t));
+      });
+
   simpleRenderMemberSearch();
 }
 
@@ -1988,12 +1992,15 @@ function simpleClearMemberSearch(){
 function simpleRenderMemberSearch(){
   const rows = SIMPLE_MEMBER_FILTERED || SIMPLE_MEMBER_CACHE;
   const info = $("simpleMemberSearchInfo");
-  if(info) info.textContent = SIMPLE_MEMBER_FILTERED
-    ? `${rows.length} dari ${SIMPLE_MEMBER_CACHE.length} member`
-    : `${SIMPLE_MEMBER_CACHE.length} member`;
+  if(info){
+    info.textContent = SIMPLE_MEMBER_FILTERED
+      ? `${rows.length} dari ${SIMPLE_MEMBER_CACHE.length} member`
+      : `${SIMPLE_MEMBER_CACHE.length} member`;
+  }
 
   const box = $("simpleMembers");
   if(!box) return;
+
   if(!rows.length){
     box.innerHTML = '<div class="sub">Member tidak ditemukan.</div>';
     return;
@@ -2009,14 +2016,17 @@ function simpleRenderMemberSearch(){
         </span>
         <span class="badge">${m.status} • ${m.remainingDays ?? 0} hari</span>
       </div>
+
       <div class="mini">
         <input id="days-${m.id}" type="number" min="1" value="30" placeholder="Hari">
         <button class="btn2" onclick="simpleExtendMember('${m.id}')">TAMBAH HARI</button>
         <button class="btn2" onclick="simpleSetMemberDays('${m.id}')">SET DARI HARI INI</button>
       </div>
+
       <button class="btn2" onclick="simpleToggleMember('${m.id}','${m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE"}')">
         ${m.status === "ACTIVE" ? "SUSPEND" : "AKTIFKAN"}
       </button>
+
       <button class="btnred" onclick="simpleDeleteMember('${m.id}')">HAPUS</button>
     </div>
   `).join("");
@@ -2055,13 +2065,53 @@ async function simpleAddMember() {
   }
 }
 
+
+function simpleFindMember(id){
+  return SIMPLE_MEMBER_CACHE.find(m => String(m.id) === String(id)) || null;
+}
+
+function simpleMemberLabel(member){
+  if(!member) return "member ini";
+  const name = member.name || member.memberName || member.email || "Member";
+  const mt5 = member.mt5Account ? ` • MT5 ${member.mt5Account}` : "";
+  return `${name}${mt5}`;
+}
+
+function simpleConfirmLayered(title, detail, finalWarning){
+  const first = confirm(
+    `${title}\n\n${detail}\n\nLanjutkan ke konfirmasi kedua?`
+  );
+  if(!first) return false;
+
+  return confirm(
+    `KONFIRMASI TERAKHIR\n\n${finalWarning}\n\nTekan OK hanya jika Anda benar-benar yakin.`
+  );
+}
+
 async function simpleExtendMember(id) {
   try {
+    const member = simpleFindMember(id);
     const days = Number($("days-" + id).value || 30);
+
+    if(!Number.isFinite(days) || days < 1){
+      alert("Jumlah hari tidak valid.");
+      return;
+    }
+
+    const ok = simpleConfirmLayered(
+      "Tambah masa aktif?",
+      `${simpleMemberLabel(member)}
+Tambah ${days} hari dari masa aktif yang sekarang.`,
+      `Masa aktif ${simpleMemberLabel(member)} akan DITAMBAH ${days} hari.`
+    );
+    if(!ok) return;
+
     await api("/api/admin/v10/members/" + id + "/extend", {
       method: "POST",
       body: JSON.stringify({ days })
     });
+
+    alert(`Berhasil menambah ${days} hari.`);
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
@@ -2070,11 +2120,33 @@ async function simpleExtendMember(id) {
 
 async function simpleSetMemberDays(id) {
   try {
+    const member = simpleFindMember(id);
     const days = Number($("days-" + id).value || 30);
+
+    if(!Number.isFinite(days) || days < 1){
+      alert("Jumlah hari tidak valid.");
+      return;
+    }
+
+    const currentExpiry = member && member.expiresAt
+      ? new Date(member.expiresAt).toLocaleString("id-ID")
+      : "-";
+
+    const ok = simpleConfirmLayered(
+      "Set ulang masa aktif dari hari ini?",
+      `${simpleMemberLabel(member)}
+Expired saat ini: ${currentExpiry}
+Akan diubah menjadi ${days} hari dihitung dari hari ini.`,
+      `PERHATIAN: tanggal expired lama akan diganti. Masa aktif baru = ${days} hari dari hari ini.`
+    );
+    if(!ok) return;
+
     await api("/api/admin/v10/members/" + id + "/set-days", {
       method: "POST",
       body: JSON.stringify({ days })
     });
+
+    alert(`Masa aktif berhasil diset ${days} hari dari hari ini.`);
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
@@ -2083,13 +2155,27 @@ async function simpleSetMemberDays(id) {
 
 async function simpleToggleMember(id, status) {
   try {
+    const member = simpleFindMember(id);
+    const isActive = status === "ACTIVE";
+    const action = isActive ? "AKTIFKAN" : "SUSPEND";
+
+    const ok = simpleConfirmLayered(
+      `${action} member?`,
+      `${simpleMemberLabel(member)}
+Status akan diubah menjadi ${status}.`,
+      `${action} ${simpleMemberLabel(member)} sekarang?`
+    );
+    if(!ok) return;
+
     await api("/api/admin/v10/members/" + id, {
       method: "PUT",
       body: JSON.stringify({
         status,
-        eaEnabled: status === "ACTIVE"
+        eaEnabled: isActive
       })
     });
+
+    alert(`Status member berhasil diubah menjadi ${status}.`);
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
@@ -2097,9 +2183,21 @@ async function simpleToggleMember(id, status) {
 }
 
 async function simpleDeleteMember(id) {
-  if (!confirm("Hapus member ini?")) return;
+  const member = simpleFindMember(id);
+  const label = simpleMemberLabel(member);
+
+  const ok = simpleConfirmLayered(
+    "Hapus member?",
+    `${label}
+Data member akan dihapus dari sistem membership.`,
+    `HAPUS PERMANEN ${label}?
+Tindakan ini tidak dapat dibatalkan dari tombol Undo.`
+  );
+  if(!ok) return;
+
   try {
     await api("/api/admin/v10/members/" + id, { method: "DELETE" });
+    alert("Member berhasil dihapus.");
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);

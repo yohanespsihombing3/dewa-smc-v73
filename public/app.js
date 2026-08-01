@@ -707,7 +707,7 @@ function calcLot(){
   `;
 }
 async function loadAnalytics(){try{let d=await api("/api/signals/analytics");$("analyticsBox").innerHTML=`<div class="analytics"><div class="stat"><small>TODAY</small><b>${d.today.winrate}%</b><div class="sub">Signal ${d.today.total}</div></div><div class="stat"><small>ALL TIME</small><b>${d.allTime.winrate}%</b><div class="sub">Signal ${d.allTime.total}</div></div></div>`}catch(e){log(e.message)}}async function loadUsers(){try{let d=await api("/api/admin/users");$("adminUsers").innerHTML=d.users.map(u=>`<div class="usercard"><div class="row"><span><b>${u.email}</b><br><span class="muted">${u.plan} • ${String(u.expiredAt||"-").slice(0,10)}</span><br><span class="muted">EA: ${u.eaEnabled?"ON":"OFF"} • MT5: ${u.mt5Account||"-"}</span><br><span class="muted" style="word-break:break-all">KEY: ${u.eaApiKey||"-"}</span></span><span class="badge">${u.status||"-"} ${u.active?"✅":"❌"}</span></div>${u.status==="PENDING"?`<div class="mini"><select id="plan_${u.id}"><option>FREE</option><option>PRO</option><option>VIP</option></select><input id="days_${u.id}" type="number" value="30"><input id="pass_${u.id}" value="DEWA123456"></div><input id="mt5_${u.id}" placeholder="MT5 Account optional"><button class="btnok" onclick="approveUser('${u.id}')">APPROVE</button>`:`<div class="mini"><select id="status_${u.id}"><option ${u.status==="ACTIVE"?"selected":""}>ACTIVE</option><option ${u.status==="BLOCKED"?"selected":""}>BLOCKED</option></select><input id="mt5_${u.id}" value="${u.mt5Account||""}"><select id="ea_${u.id}"><option value="true" ${u.eaEnabled?"selected":""}>EA ON</option><option value="false" ${!u.eaEnabled?"selected":""}>EA OFF</option></select></div><button class="btn2" onclick="updateUser('${u.id}')">UPDATE</button> <button class="btn2" onclick="regenEaKey('${u.id}')">NEW EA KEY</button>`} <button class="btnred" onclick="deleteUser('${u.id}')">DELETE</button></div>`).join("")}catch(e){log(e.message)}}async function approveUser(id){let d=await api("/api/admin/approve-user",{method:"POST",body:JSON.stringify({userId:id,plan:$("plan_"+id).value,days:Number($("days_"+id).value||30),password:$("pass_"+id).value,mt5Account:$("mt5_"+id).value,eaEnabled:true})});log("Approved: "+d.user.email+" | EA Key: "+d.user.eaApiKey);loadUsers()}async function updateUser(id){await api("/api/admin/update-user",{method:"POST",body:JSON.stringify({userId:id,status:$("status_"+id).value,mt5Account:$("mt5_"+id).value,eaEnabled:$("ea_"+id).value==="true"})});loadUsers()}async function regenEaKey(id){await api("/api/admin/regenerate-ea-key",{method:"POST",body:JSON.stringify({userId:id})});loadUsers()}async function deleteUser(id){if(!confirm("Hapus member/request ini?"))return;let r=await fetch("/api/admin/delete-user/"+id,{method:"DELETE",headers:headers()}),d=await r.json();if(!r.ok||d.error)alert(d.error||"Delete gagal");loadUsers()}
-function draw(r){let c=r.candles,cv=$("chart"),ctx=cv.getContext("2d");ctx.clearRect(0,0,cv.width,cv.height);ctx.fillStyle="#020617";ctx.fillRect(0,0,cv.width,cv.height);if(!c||c.length<2)return;let max=Math.max(...c.map(x=>x.high)),min=Math.min(...c.map(x=>x.low)),y=v=>cv.height-25-((v-min)/(max-min||1))*(cv.height-55),x=i=>30+i*((cv.width-55)/(c.length-1));c.forEach((k,i)=>{let xx=x(i),yo=y(k.open),yc=y(k.close),yh=y(k.high),yl=y(k.low);ctx.strokeStyle=k.close>=k.open?"#22c55e":"#ef4444";ctx.beginPath();ctx.moveTo(xx,yh);ctx.lineTo(xx,yl);ctx.stroke();ctx.fillStyle=ctx.strokeStyle;ctx.fillRect(xx-2,Math.min(yo,yc),4,Math.max(2,Math.abs(yc-yo)))})}function showPage(page){document.querySelectorAll('.nav div').forEach(x=>x.classList.remove('on'));if(page==="scanner"){$("navScanner").classList.add("on");$("scannerPanel").scrollIntoView({behavior:"smooth"})}if(page==="analytics"){$("navAnalytics").classList.add("on");$("analyticsPanel").scrollIntoView({behavior:"smooth"});loadAnalytics()}if(page==="member"){$("navMember").classList.add("on");document.querySelector(".userbox").scrollIntoView({behavior:"smooth"})}if(page==="admin"){$("navAdmin").classList.add("on");$("adminPanel").scrollIntoView({behavior:"smooth"});loadUsers();v10LoadAdmin()}}
+function draw(r){let c=r.candles,cv=$("chart"),ctx=cv.getContext("2d");ctx.clearRect(0,0,cv.width,cv.height);ctx.fillStyle="#020617";ctx.fillRect(0,0,cv.width,cv.height);if(!c||c.length<2)return;let max=Math.max(...c.map(x=>x.high)),min=Math.min(...c.map(x=>x.low)),y=v=>cv.height-25-((v-min)/(max-min||1))*(cv.height-55),x=i=>30+i*((cv.width-55)/(c.length-1));c.forEach((k,i)=>{let xx=x(i),yo=y(k.open),yc=y(k.close),yh=y(k.high),yl=y(k.low);ctx.strokeStyle=k.close>=k.open?"#22c55e":"#ef4444";ctx.beginPath();ctx.moveTo(xx,yh);ctx.lineTo(xx,yl);ctx.stroke();ctx.fillStyle=ctx.strokeStyle;ctx.fillRect(xx-2,Math.min(yo,yc),4,Math.max(2,Math.abs(yc-yo)))})}function showPage(page){document.querySelectorAll('.nav div').forEach(x=>x.classList.remove('on'));if(page==="scanner"){$("navScanner").classList.add("on");$("scannerPanel").scrollIntoView({behavior:"smooth"})}if(page==="analytics"){$("navAnalytics").classList.add("on");$("analyticsPanel").scrollIntoView({behavior:"smooth"});loadAnalytics()}if(page==="member"){$("navMember").classList.add("on");document.querySelector(".userbox").scrollIntoView({behavior:"smooth"})}if(page==="admin"){$("navAdmin").classList.add("on");$("adminPanel").scrollIntoView({behavior:"smooth"});simpleLoadAdmin()}}
 function urlBase64ToUint8Array(b){const p="=".repeat((4-b.length%4)%4),base64=(b+p).replace(/-/g,"+").replace(/_/g,"/"),raw=atob(base64),out=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)out[i]=raw.charCodeAt(i);return out}async function enablePush(){let perm=await Notification.requestPermission();if(perm!=="granted")return alert("Izin notifikasi ditolak");let reg=await navigator.serviceWorker.ready,k=await api("/api/push/public-key"),sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:urlBase64ToUint8Array(k.publicKey)});await api("/api/push/subscribe",{method:"POST",body:JSON.stringify({subscription:sub})});new Notification("⚡ DEWA SMC SIGNAL",{body:"Notifikasi aktif.",icon:"/icon-192.png"})}async function broadcastSignal(sym,r){try{await api("/api/push/broadcast",{method:"POST",body:JSON.stringify({pair:sym,signal:r.signal,entry:priceFmt(sym,r.entry),tp1:priceFmt(sym,r.tp1),tp2:priceFmt(sym,r.tp2),tp3:priceFmt(sym,r.tp3),sl:priceFmt(sym,r.sl)})})}catch(e){}}
 
 
@@ -1952,106 +1952,146 @@ window.enablePush = enablePush;
 
 
 
-async function v10LoadAdmin() {
+async function simpleLoadMembers() {
   try {
-    const [packagesData, pairsData] = await Promise.all([
-      api("/api/admin/v10/packages"),
-      api("/api/admin/v10/pairs")
-    ]);
+    const data = await api("/api/admin/v10/members");
+    const rows = data.members || [];
+    const box = $("simpleMembers");
+    if (!box) return;
 
-    const packageSelect = $("v10MemberPackage");
-    if (packageSelect) {
-      packageSelect.innerHTML = packagesData.packages
-        .filter(x => x.enabled)
-        .map(x => `<option value="${x.id}" data-days="${x.days}">${x.name} — ${x.days} hari</option>`)
-        .join("");
-      packageSelect.onchange = () => {
-        const option = packageSelect.options[packageSelect.selectedIndex];
-        if (option) $("v10MemberDays").value = option.dataset.days || 30;
-      };
+    if (!rows.length) {
+      box.innerHTML = '<div class="sub">Belum ada member EA.</div>';
+      return;
     }
 
-    if ($("v10Packages")) {
-      $("v10Packages").innerHTML = packagesData.packages.map(x => `
-        <div class="usercard">
-          <div class="row">
-            <span><b>${x.name}</b><br><span class="muted">${x.days} hari • max ${x.maxAccounts} akun</span></span>
-            <span class="badge">${x.enabled ? "ACTIVE" : "OFF"}</span>
-          </div>
-          <button class="btn2" onclick="v10TogglePackage('${x.id}', ${!x.enabled})">${x.enabled ? "NONAKTIFKAN" : "AKTIFKAN"}</button>
-          <button class="btnred" onclick="v10DeletePackage('${x.id}')">HAPUS</button>
-        </div>`).join("");
-    }
-
-    if ($("v10Pairs")) {
-      $("v10Pairs").innerHTML = pairsData.pairs.map(x => `
-        <div class="usercard">
-          <div class="row">
-            <span><b>${x.symbol}</b><br><span class="muted">TF ${(x.timeframes || []).map(t => "M" + t).join(", ")} • ${x.priority}</span></span>
-            <span class="badge">${x.enabled ? "SCAN ON" : "OFF"}</span>
-          </div>
-          <button class="btn2" onclick="v10TogglePair('${x.id}', ${!x.enabled})">${x.enabled ? "NONAKTIFKAN" : "AKTIFKAN"}</button>
-          <button class="btnred" onclick="v10DeletePair('${x.id}')">HAPUS</button>
-        </div>`).join("");
-    }
+    box.innerHTML = rows.map(m => `
+      <div class="usercard">
+        <div class="row">
+          <span>
+            <b>${m.name || m.email}</b><br>
+            <span class="muted">${m.email} • MT5 ${m.mt5Account}</span><br>
+            <span class="muted">${m.broker || "-"} • berakhir ${m.expiresAt ? new Date(m.expiresAt).toLocaleString("id-ID") : "-"}</span>
+          </span>
+          <span class="badge">${m.status} • ${m.remainingDays ?? 0} hari</span>
+        </div>
+        <div class="mini">
+          <input id="days-${m.id}" type="number" min="1" value="30" placeholder="Hari">
+          <button class="btn2" onclick="simpleExtendMember('${m.id}')">TAMBAH HARI</button>
+          <button class="btn2" onclick="simpleSetMemberDays('${m.id}')">SET DARI HARI INI</button>
+        </div>
+        <button class="btn2" onclick="simpleToggleMember('${m.id}','${m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE"}')">
+          ${m.status === "ACTIVE" ? "SUSPEND" : "AKTIFKAN"}
+        </button>
+        <button class="btnred" onclick="simpleDeleteMember('${m.id}')">HAPUS</button>
+      </div>
+    `).join("");
   } catch (error) {
-    log("V10 Admin: " + error.message);
+    log("Membership: " + error.message);
   }
 }
 
-async function v10AddMember() {
+async function simpleAddMember() {
   try {
-    const data = await api("/api/admin/v10/members", {
+    await api("/api/admin/v10/members", {
       method: "POST",
       body: JSON.stringify({
-        name: $("v10MemberName").value,
-        email: $("v10MemberEmail").value,
-        mt5Account: $("v10MemberMt5").value,
-        broker: $("v10MemberBroker").value,
-        packageId: $("v10MemberPackage").value,
-        days: Number($("v10MemberDays").value || 30)
+        name: $("simpleMemberName").value,
+        email: $("simpleMemberEmail").value,
+        mt5Account: $("simpleMemberMt5").value,
+        broker: $("simpleMemberBroker").value,
+        days: Number($("simpleMemberDays").value || 30)
       })
     });
-    alert("Member aktif. Password sementara: " + data.tempPassword);
-    ["v10MemberName","v10MemberEmail","v10MemberMt5","v10MemberBroker"].forEach(id => $(id).value = "");
-    await loadUsers();
+
+    ["simpleMemberName","simpleMemberEmail","simpleMemberMt5","simpleMemberBroker"]
+      .forEach(id => { if ($(id)) $(id).value = ""; });
+
+    alert("Member EA berhasil diaktifkan.");
+    await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
   }
 }
 
-async function v10AddPackage() {
+async function simpleExtendMember(id) {
   try {
-    await api("/api/admin/v10/packages", {
+    const days = Number($("days-" + id).value || 30);
+    await api("/api/admin/v10/members/" + id + "/extend", {
       method: "POST",
-      body: JSON.stringify({
-        name: $("v10PackageName").value,
-        days: Number($("v10PackageDays").value || 30),
-        maxAccounts: Number($("v10PackageAccounts").value || 1)
-      })
+      body: JSON.stringify({ days })
     });
-    $("v10PackageName").value = "";
-    await v10LoadAdmin();
+    await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
   }
 }
 
-async function v10TogglePackage(id, enabled) {
-  await api("/api/admin/v10/packages/" + id, {
-    method: "PUT",
-    body: JSON.stringify({ enabled })
-  });
-  await v10LoadAdmin();
+async function simpleSetMemberDays(id) {
+  try {
+    const days = Number($("days-" + id).value || 30);
+    await api("/api/admin/v10/members/" + id + "/set-days", {
+      method: "POST",
+      body: JSON.stringify({ days })
+    });
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
-async function v10DeletePackage(id) {
-  if (!confirm("Hapus paket ini?")) return;
-  await api("/api/admin/v10/packages/" + id, { method: "DELETE" });
-  await v10LoadAdmin();
+async function simpleToggleMember(id, status) {
+  try {
+    await api("/api/admin/v10/members/" + id, {
+      method: "PUT",
+      body: JSON.stringify({
+        status,
+        eaEnabled: status === "ACTIVE"
+      })
+    });
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
-async function v10AddPair() {
+async function simpleDeleteMember(id) {
+  if (!confirm("Hapus member ini?")) return;
+  try {
+    await api("/api/admin/v10/members/" + id, { method: "DELETE" });
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleLoadPairs() {
+  try {
+    const data = await api("/api/admin/v10/pairs");
+    const rows = data.pairs || [];
+    const box = $("simplePairs");
+    if (!box) return;
+
+    box.innerHTML = rows.map(p => `
+      <div class="usercard">
+        <div class="row">
+          <span>
+            <b>${p.symbol}</b><br>
+            <span class="muted">TF ${(p.timeframes || []).map(x => "M" + x).join(", ")} • ${p.priority}</span>
+          </span>
+          <span class="badge">${p.enabled ? "SCAN ON" : "OFF"}</span>
+        </div>
+        <button class="btn2" onclick="simpleTogglePair('${p.id}',${!p.enabled})">
+          ${p.enabled ? "NONAKTIFKAN" : "AKTIFKAN"}
+        </button>
+        <button class="btnred" onclick="simpleDeletePair('${p.id}')">HAPUS</button>
+      </div>
+    `).join("");
+  } catch (error) {
+    log("Pair Management: " + error.message);
+  }
+}
+
+async function simpleAddPair() {
   try {
     await api("/api/admin/v10/pairs", {
       method: "POST",
@@ -2063,22 +2103,34 @@ async function v10AddPair() {
       })
     });
     $("v10PairSymbol").value = "";
-    await v10LoadAdmin();
+    await simpleLoadPairs();
   } catch (error) {
     alert(error.message);
   }
 }
 
-async function v10TogglePair(id, enabled) {
-  await api("/api/admin/v10/pairs/" + id, {
-    method: "PUT",
-    body: JSON.stringify({ enabled })
-  });
-  await v10LoadAdmin();
+async function simpleTogglePair(id, enabled) {
+  try {
+    await api("/api/admin/v10/pairs/" + id, {
+      method: "PUT",
+      body: JSON.stringify({ enabled })
+    });
+    await simpleLoadPairs();
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
-async function v10DeletePair(id) {
+async function simpleDeletePair(id) {
   if (!confirm("Hapus pair ini?")) return;
-  await api("/api/admin/v10/pairs/" + id, { method: "DELETE" });
-  await v10LoadAdmin();
+  try {
+    await api("/api/admin/v10/pairs/" + id, { method: "DELETE" });
+    await simpleLoadPairs();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleLoadAdmin() {
+  await Promise.allSettled([simpleLoadMembers(), simpleLoadPairs()]);
 }

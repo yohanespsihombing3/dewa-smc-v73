@@ -46,6 +46,13 @@
   <h4 style="margin:0">Daftar Member</h4>
   <button class="btn2" onclick="simpleLoadMembers()">REFRESH</button>
 </div>
+<div class="mini" style="margin-top:10px">
+  <input id="simpleMemberSearch" type="search"
+    placeholder="Cari nama / Gmail / nomor MT5..."
+    autocomplete="off" oninput="simpleFilterMembers()">
+  <button class="btn2" onclick="simpleClearMemberSearch()">RESET</button>
+</div>
+<div id="simpleMemberSearchInfo" class="sub" style="margin-top:6px"></div>
 <div id="simpleMembers" style="font-size:12px;margin-top:10px"></div>
 
 <h4 style="margin-top:20px">Pair Management</h4>

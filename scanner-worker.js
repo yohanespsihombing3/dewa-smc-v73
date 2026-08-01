@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V10.2
+  DEWA SMC SERVER-SIDE SCANNER WORKER V10.5 TRADINGVIEW MATCH
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -13,7 +13,12 @@ const fetch = require("node-fetch");
   - SMC BOS/CHoCH + EMA 9/20 + ATR volatility.
   - Mengirim signal Grade A/A+ ke server utama.
   - Mengirim push notification melalui endpoint server.
-  - Mendukung OPEN dan REVERSE.
+  - Mendukung PREPARE, OPEN, dan REVERSE.
+  - Market structure mengikuti Pine: ta.pivothigh/ta.pivotlow 20/20.
+  - BOS/CHoCH memakai candle body close.
+  - PREPARE memakai jarak structure 0.25% + EMA 9/20.
+  - ATR memakai Wilder/RMA seperti TradingView ta.atr(14).
+  - Volatility memakai ATR14 > SMA(ATR14,20).
 
   Environment wajib:
   APP_BASE_URL=https://dewa-smc-ai.onrender.com
@@ -408,63 +413,89 @@ function getGrade(score) {
   return "C";
 }
 
+// -----------------------------------------------------------------------------
+// TradingView/Pine compatibility helpers
+// Pine reference:
+//   ta.pivothigh(high, structurePeriod, structurePeriod)
+//   ta.pivotlow(low, structurePeriod, structurePeriod)
+// -----------------------------------------------------------------------------
 function pivotHighAt(candles, index, left, right) {
   if (index - left < 0 || index + right >= candles.length) return null;
+
   const value = candles[index].high;
+
   for (let i = index - left; i <= index + right; i++) {
-    if (i !== index && candles[i].high >= value) return null;
+    if (i === index) continue;
+    if (candles[i].high >= value) return null;
   }
+
   return value;
 }
 
 function pivotLowAt(candles, index, left, right) {
   if (index - left < 0 || index + right >= candles.length) return null;
+
   const value = candles[index].low;
+
   for (let i = index - left; i <= index + right; i++) {
-    if (i !== index && candles[i].low <= value) return null;
+    if (i === index) continue;
+    if (candles[i].low <= value) return null;
   }
+
   return value;
 }
 
-function analyzeSmc(pair, tf, candles, pairConfig = {}) {
-  // Candle terakhir dari Twelve Data bisa masih berjalan.
-  const closed = candles.slice(0, -1);
-  if (closed.length < 70) {
-    return { valid: false, reason: "DATA LOW" };
-  }
-
-  const structurePeriod = Math.min(60, Math.max(2, Number(pairConfig.structurePeriod || 20)));
+function buildTvStructure(candles, structurePeriod) {
   let lastHigh = NaN;
   let lastLow = NaN;
+  let lastHighIndex = -1;
+  let lastLowIndex = -1;
+
   let highBreakPending = false;
   let lowBreakPending = false;
   let trendDirection = 0;
-  let freshEvent = null;
 
-  const closes = closed.map(x => x.close);
+  let lastBreak = null;
 
-  for (let i = 0; i < closed.length; i++) {
+  for (let i = 0; i < candles.length; i++) {
+    // Pine confirms a pivot only after `structurePeriod` right-hand bars.
     const pivotIndex = i - structurePeriod;
 
     if (pivotIndex >= 0) {
-      const ph = pivotHighAt(closed, pivotIndex, structurePeriod, structurePeriod);
-      const pl = pivotLowAt(closed, pivotIndex, structurePeriod, structurePeriod);
+      const ph = pivotHighAt(
+        candles,
+        pivotIndex,
+        structurePeriod,
+        structurePeriod
+      );
+
+      const pl = pivotLowAt(
+        candles,
+        pivotIndex,
+        structurePeriod,
+        structurePeriod
+      );
 
       if (ph !== null) {
         lastHigh = ph;
+        lastHighIndex = pivotIndex;
         highBreakPending = true;
       }
 
       if (pl !== null) {
         lastLow = pl;
+        lastLowIndex = pivotIndex;
         lowBreakPending = true;
       }
     }
 
+    const candle = candles[i];
     let highBroken = false;
     let lowBroken = false;
-    const candle = closed[i];
 
+    // Pine confirmationType = "Body":
+    // bullish break only if close > structure high,
+    // bearish break only if close < structure low.
     if (
       highBreakPending &&
       Number.isFinite(lastHigh) &&
@@ -485,97 +516,392 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
 
     const previousTrend = trendDirection;
 
-    if (highBroken) trendDirection = 1;
-    else if (lowBroken) trendDirection = -1;
+    // Pine uses if/else-if, therefore bullish gets priority
+    // only in the practically impossible case both are true.
+    if (highBroken) {
+      trendDirection = 1;
+    } else if (lowBroken) {
+      trendDirection = -1;
+    }
 
     const choch =
       (previousTrend === -1 && trendDirection === 1) ||
       (previousTrend === 1 && trendDirection === -1);
 
     if (highBroken) {
-      freshEvent = {
+      lastBreak = {
         index: i,
         direction: "LONG",
         type: choch ? "CHoCH BULLISH" : "BOS BULLISH",
         structure: lastHigh,
+        structureIndex: lastHighIndex,
         candleTime: candle.time
       };
-    }
-
-    if (lowBroken) {
-      freshEvent = {
+    } else if (lowBroken) {
+      lastBreak = {
         index: i,
         direction: "SHORT",
         type: choch ? "CHoCH BEARISH" : "BOS BEARISH",
         structure: lastLow,
+        structureIndex: lastLowIndex,
         candleTime: candle.time
       };
     }
   }
 
-  if (!freshEvent || freshEvent.index !== closed.length - 1) {
+  return {
+    lastHigh,
+    lastLow,
+    lastHighIndex,
+    lastLowIndex,
+    highBreakPending,
+    lowBreakPending,
+    trendDirection,
+    lastBreak
+  };
+}
+
+function targetLevels(direction, entry, atr14) {
+  const targetRange = atr14 * 2.0;
+
+  if (direction === "LONG") {
     return {
-      valid: false,
-      reason: "NO FRESH BOS/CHoCH",
-      structureHigh: lastHigh,
-      structureLow: lastLow
+      targetRange,
+      tp1: entry + targetRange * 0.8,
+      tp2: entry + targetRange * 1.6,
+      tp3: entry + targetRange * 2.8,
+      sl: entry - targetRange * 1.2
     };
   }
 
-  const last = closed[closed.length - 1];
-  // Hitung dari seluruh histori yang tersedia agar seed mendekati TradingView.
-  const e9 = ema(closes, 9);
-  const e20 = ema(closes, 20);
-  const atrValues = atrSeries(closed, 14).filter(Number.isFinite);
-  const atr14 = atrValues.length ? atrValues[atrValues.length - 1] : NaN;
-  const atrSma20 = sma(atrValues, 20);
+  return {
+    targetRange,
+    tp1: entry - targetRange * 0.8,
+    tp2: entry - targetRange * 1.6,
+    tp3: entry - targetRange * 2.8,
+    sl: entry + targetRange * 1.2
+  };
+}
+
+function analyzeSmc(pair, tf, candles, pairConfig = {}) {
+  /*
+    Twelve Data normally includes the currently-forming candle as the final item.
+
+    TradingView behavior we reproduce:
+    - BOS/CHoCH: only confirmed from a CLOSED candle.
+    - PREPARE: may use the latest/current price before the breakout,
+      which is what allows EA to place the pending order early.
+  */
+  if (!Array.isArray(candles) || candles.length < 90) {
+    return { valid: false, reason: "DATA LOW" };
+  }
+
+  const structurePeriod = Math.min(
+    50,
+    Math.max(5, Number(pairConfig.structurePeriod || 20))
+  );
+
+  const prepareDistancePct = Math.min(
+    5,
+    Math.max(
+      0.00001,
+      Number(pairConfig.prepareDistancePct || 0.25)
+    )
+  );
+
+  const current = candles[candles.length - 1];
+  const closed = candles.slice(0, -1);
+
+  if (closed.length < structurePeriod * 2 + 30) {
+    return { valid: false, reason: "DATA LOW FOR PIVOT" };
+  }
+
+  // Build structure using CLOSED candles only.
+  const structure = buildTvStructure(closed, structurePeriod);
+
+  // Indicator calculations.
+  // For confirmed ENTRY use closed-bar values.
+  const closedCloses = closed.map(c => c.close);
+  const closedEma9 = ema(closedCloses, 9);
+  const closedEma20 = ema(closedCloses, 20);
+
+  const closedAtrFull = atrSeries(closed, 14);
+  const closedAtrFinite = closedAtrFull.filter(Number.isFinite);
+  const closedAtr14 = closedAtrFinite.length
+    ? closedAtrFinite[closedAtrFinite.length - 1]
+    : NaN;
+  const closedAtrSma20 = sma(closedAtrFinite, 20);
+
+  // For PREPARE TradingView recalculates on the live candle.
+  const liveCloses = candles.map(c => c.close);
+  const liveEma9 = ema(liveCloses, 9);
+  const liveEma20 = ema(liveCloses, 20);
+
+  const liveAtrFull = atrSeries(candles, 14);
+  const liveAtrFinite = liveAtrFull.filter(Number.isFinite);
+  const liveAtr14 = liveAtrFinite.length
+    ? liveAtrFinite[liveAtrFinite.length - 1]
+    : NaN;
+  const liveAtrSma20 = sma(liveAtrFinite, 20);
+
   const volatilityEnabled = pairConfig.volatilityEnabled !== false;
-  const volatilityOk =
+
+  const closedVolatilityOk =
     !volatilityEnabled ||
-    (Number.isFinite(atrSma20) && atr14 > atrSma20);
+    (
+      Number.isFinite(closedAtr14) &&
+      Number.isFinite(closedAtrSma20) &&
+      closedAtr14 > closedAtrSma20
+    );
 
-  const emaLong = e9 > e20 && last.close > e9;
-  const emaShort = e9 < e20 && last.close < e9;
+  const liveVolatilityOk =
+    !volatilityEnabled ||
+    (
+      Number.isFinite(liveAtr14) &&
+      Number.isFinite(liveAtrSma20) &&
+      liveAtr14 > liveAtrSma20
+    );
 
-  let score = 0;
-  score += 2; // BOS/CHoCH valid.
-  if (freshEvent.type.startsWith("CHoCH")) score += 1;
-  if (
-    (freshEvent.direction === "LONG" && emaLong) ||
-    (freshEvent.direction === "SHORT" && emaShort)
-  ) score += 1.5;
-  if (volatilityOk) score += 1;
-  if (
-    (freshEvent.direction === "LONG" && e9 > e20) ||
-    (freshEvent.direction === "SHORT" && e9 < e20)
-  ) score += 1.5;
-  if (
-    (freshEvent.direction === "LONG" && last.close > e20) ||
-    (freshEvent.direction === "SHORT" && last.close < e20)
-  ) score += 1;
+  const lastClosed = closed[closed.length - 1];
 
-  const grade = getGrade(score);
-  const emaOk =
-    freshEvent.direction === "LONG" ? emaLong : emaShort;
+  const closedEmaLong =
+    closedEma9 > closedEma20 &&
+    lastClosed.close > closedEma9;
 
-  if (!emaOk || !volatilityOk || !["A", "A+"].includes(grade)) {
-    return {
-      valid: false,
-      reason: "FILTER FAILED",
-      grade,
-      score,
-      emaOk,
-      volatilityOk
-    };
-  }
+  const closedEmaShort =
+    closedEma9 < closedEma20 &&
+    lastClosed.close < closedEma9;
 
-  // Berdasarkan rumus tetap: TP1=0.67R, TP2=1.33R, TP3=2.33R.
+  const liveEmaLong =
+    liveEma9 > liveEma20 &&
+    current.close > liveEma9;
+
+  const liveEmaShort =
+    liveEma9 < liveEma20 &&
+    current.close < liveEma9;
+
   const rrr = {
     tp1: 0.8 / 1.2,
     tp2: 1.6 / 1.2,
     tp3: 2.8 / 1.2
   };
-  const minRrr = Math.max(0.01, Number(pairConfig.minRrr || 1.5));
+
+  const minRrr = Math.max(
+    0.01,
+    Number(pairConfig.minRrr || 1.5)
+  );
+
+  // ===========================================================================
+  // 1) CONFIRMED BOS / CHoCH
+  // ===========================================================================
+  const freshBreak =
+    structure.lastBreak &&
+    structure.lastBreak.index === closed.length - 1
+      ? structure.lastBreak
+      : null;
+
+  if (freshBreak) {
+    const emaOk =
+      freshBreak.direction === "LONG"
+        ? closedEmaLong
+        : closedEmaShort;
+
+    // DEWA execution rule: confirmed OPEN must pass EMA + volatility.
+    if (!emaOk) {
+      return {
+        valid: false,
+        reason: "ENTRY EMA NOT CONFIRMED",
+        direction: freshBreak.direction,
+        mainSignal: freshBreak.type,
+        emaOk: false,
+        volatilityOk: closedVolatilityOk
+      };
+    }
+
+    if (!closedVolatilityOk) {
+      return {
+        valid: false,
+        reason: "ENTRY VOLATILITY LOW",
+        direction: freshBreak.direction,
+        mainSignal: freshBreak.type,
+        emaOk: true,
+        volatilityOk: false
+      };
+    }
+
+    if (rrr.tp3 < minRrr) {
+      return {
+        valid: false,
+        reason: "RRR BELOW MINIMUM",
+        minRrr,
+        maxRrr: rrr.tp3
+      };
+    }
+
+    const entry = freshBreak.structure;
+    const levels = targetLevels(
+      freshBreak.direction,
+      entry,
+      closedAtr14
+    );
+
+    const stateKey = pair + "|" + tf;
+    const previousDirection =
+      state.lastDirectionByPairTf[stateKey];
+
+    let finalSignal =
+      freshBreak.direction === "LONG"
+        ? "OPEN LONG"
+        : "OPEN SHORT";
+
+    if (
+      previousDirection &&
+      previousDirection !== freshBreak.direction
+    ) {
+      finalSignal =
+        freshBreak.direction === "LONG"
+          ? "REVERSE LONG"
+          : "REVERSE SHORT";
+    }
+
+    const score =
+      2 +
+      (freshBreak.type.startsWith("CHoCH") ? 1 : 0) +
+      1.5 + // EMA confirmed
+      1 +   // volatility
+      1.5 + // EMA direction
+      1;    // close side
+
+    const grade = getGrade(score);
+
+    const eventKey = [
+      "ENTRY",
+      pair,
+      tfLabel(tf),
+      finalSignal,
+      freshBreak.candleTime,
+      fmtPrice(entry)
+    ].join("|");
+
+    return {
+      valid: true,
+      key: eventKey,
+      pair,
+      tf: tfLabel(tf),
+      signal: finalSignal,
+      status: finalSignal,
+      engine: "SMC",
+      grade,
+      score,
+      entry,
+      tp1: levels.tp1,
+      tp2: levels.tp2,
+      tp3: levels.tp3,
+      sl: levels.sl,
+      atr: closedAtr14,
+      atrSma20: closedAtrSma20,
+      targetRange: levels.targetRange,
+      ema9: closedEma9,
+      ema20: closedEma20,
+      emaConfirm: "YES",
+      volatilityOk: closedVolatilityOk,
+      volatilityEnabled,
+      structurePeriod,
+      prepareDistancePct,
+      minRrr,
+      rrr,
+      priority: pairConfig.priority || "NORMAL",
+      scanOrder: Number(pairConfig.scanOrder || 0),
+      dataSymbol: pairConfig.dataSymbol || pair,
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      mainSignal: freshBreak.type,
+      candleTime: freshBreak.candleTime,
+      direction: freshBreak.direction,
+      sourceMode: "TV_MATCH_ENTRY",
+      createdAt: new Date().toISOString()
+    };
+  }
+
+  // ===========================================================================
+  // 2) PREPARE BEFORE BREAKOUT
+  //
+  // Pine:
+  // prepLongRaw  = abs(close-structHigh) <= structHigh*0.25% && close<structHigh
+  // prepShortRaw = abs(close-structLow)  <= structLow *0.25% && close>structLow
+  // PREPARE also requires EMA alignment.
+  //
+  // Extension for EA:
+  // Pine only visualizes PREPARE and does not emit target JSON for it.
+  // We derive TP/SL from the SAME ATR×2 formulas so EA can place pending order.
+  // ===========================================================================
+  const longThreshold =
+    Number.isFinite(structure.lastHigh)
+      ? Math.abs(structure.lastHigh) * (prepareDistancePct / 100)
+      : NaN;
+
+  const shortThreshold =
+    Number.isFinite(structure.lastLow)
+      ? Math.abs(structure.lastLow) * (prepareDistancePct / 100)
+      : NaN;
+
+  const prepLongRaw =
+    structure.highBreakPending &&
+    Number.isFinite(structure.lastHigh) &&
+    current.close < structure.lastHigh &&
+    Math.abs(current.close - structure.lastHigh) <= longThreshold;
+
+  const prepShortRaw =
+    structure.lowBreakPending &&
+    Number.isFinite(structure.lastLow) &&
+    current.close > structure.lastLow &&
+    Math.abs(current.close - structure.lastLow) <= shortThreshold;
+
+  const prepLong = prepLongRaw && liveEmaLong;
+  const prepShort = prepShortRaw && liveEmaShort;
+
+  let prepareDirection = null;
+
+  if (prepLong && prepShort) {
+    // Rare case: choose the structure level nearest to current price.
+    const distLong =
+      Math.abs(current.close - structure.lastHigh);
+    const distShort =
+      Math.abs(current.close - structure.lastLow);
+
+    prepareDirection =
+      distLong <= distShort ? "LONG" : "SHORT";
+  } else if (prepLong) {
+    prepareDirection = "LONG";
+  } else if (prepShort) {
+    prepareDirection = "SHORT";
+  }
+
+  if (!prepareDirection) {
+    return {
+      valid: false,
+      reason: "NO FRESH BOS/CHoCH OR PREPARE",
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      liveClose: current.close,
+      ema9: liveEma9,
+      ema20: liveEma20,
+      volatilityOk: liveVolatilityOk
+    };
+  }
+
+  // Do not arm an executable pending setup while volatility is low.
+  if (!liveVolatilityOk) {
+    return {
+      valid: false,
+      reason: "PREPARE VOLATILITY LOW",
+      direction: prepareDirection,
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      emaOk: true,
+      volatilityOk: false
+    };
+  }
 
   if (rrr.tp3 < minRrr) {
     return {
@@ -586,83 +912,85 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
     };
   }
 
-  const targetRange = atr14 * 2;
-  const entry = freshEvent.structure;
+  const prepareEntry =
+    prepareDirection === "LONG"
+      ? structure.lastHigh
+      : structure.lastLow;
 
-  let signal;
-  let tp1;
-  let tp2;
-  let tp3;
-  let sl;
+  const prepareLevels = targetLevels(
+    prepareDirection,
+    prepareEntry,
+    liveAtr14
+  );
 
-  if (freshEvent.direction === "LONG") {
-    signal = "OPEN LONG";
-    tp1 = entry + targetRange * 0.8;
-    tp2 = entry + targetRange * 1.6;
-    tp3 = entry + targetRange * 2.8;
-    sl = entry - targetRange * 1.2;
-  } else {
-    signal = "OPEN SHORT";
-    tp1 = entry - targetRange * 0.8;
-    tp2 = entry - targetRange * 1.6;
-    tp3 = entry - targetRange * 2.8;
-    sl = entry + targetRange * 1.2;
-  }
+  const prepareSignal =
+    prepareDirection === "LONG"
+      ? "PREPARE LONG"
+      : "PREPARE SHORT";
 
-  const stateKey = pair + "|" + tf;
-  const previousDirection = state.lastDirectionByPairTf[stateKey];
-  let finalSignal = signal;
-
-  if (
-    previousDirection &&
-    previousDirection !== freshEvent.direction
-  ) {
-    finalSignal =
-      freshEvent.direction === "LONG"
-        ? "REVERSE LONG"
-        : "REVERSE SHORT";
-  }
-
+  /*
+    Pine anti-spam compares structure price with lastAlertPrice.
+    For PREPARE we make the key structure-based (NOT candle-time based),
+    so the same structure does not create another pending order every scan.
+  */
   const eventKey = [
+    "PREPARE",
     pair,
     tfLabel(tf),
-    finalSignal,
-    freshEvent.candleTime,
-    fmtPrice(entry)
+    prepareSignal,
+    fmtPrice(prepareEntry)
   ].join("|");
+
+  const prepareScore =
+    2 +   // valid structure
+    1.5 + // EMA confirmed
+    1 +   // volatility
+    1.5 + // EMA direction
+    1;    // price close side
+
+  const prepareGrade = getGrade(prepareScore);
 
   return {
     valid: true,
     key: eventKey,
     pair,
     tf: tfLabel(tf),
-    signal: finalSignal,
-    status: finalSignal,
-    engine: "SMC SERVER WORKER",
-    grade,
-    score,
-    entry,
-    tp1,
-    tp2,
-    tp3,
-    sl,
-    atr: atr14,
-    atrSma20,
-    targetRange,
-    ema9: e9,
-    ema20: e20,
-    volatilityOk,
+    signal: prepareSignal,
+    status: prepareSignal,
+    engine: "SMC",
+    grade: prepareGrade,
+    score: prepareScore,
+    entry: prepareEntry,
+    tp1: prepareLevels.tp1,
+    tp2: prepareLevels.tp2,
+    tp3: prepareLevels.tp3,
+    sl: prepareLevels.sl,
+    atr: liveAtr14,
+    atrSma20: liveAtrSma20,
+    targetRange: prepareLevels.targetRange,
+    ema9: liveEma9,
+    ema20: liveEma20,
+    emaConfirm: "YES",
+    volatilityOk: liveVolatilityOk,
     volatilityEnabled,
     structurePeriod,
-    prepareDistancePct: Number(pairConfig.prepareDistancePct || 0.25),
+    prepareDistancePct,
     minRrr,
     rrr,
     priority: pairConfig.priority || "NORMAL",
     scanOrder: Number(pairConfig.scanOrder || 0),
     dataSymbol: pairConfig.dataSymbol || pair,
-    mainSignal: freshEvent.type,
-    candleTime: freshEvent.candleTime,
-    direction: freshEvent.direction,
+    structureHigh: structure.lastHigh,
+    structureLow: structure.lastLow,
+    mainSignal: "PREPARE",
+    candleTime: current.time,
+    direction: prepareDirection,
+    currentPrice: current.close,
+    distanceToEntryPct:
+      Math.abs(current.close - prepareEntry) /
+      Math.abs(prepareEntry) *
+      100,
+    sourceMode: "TV_MATCH_PREPARE",
     createdAt: new Date().toISOString()
   };
 }
@@ -862,7 +1190,11 @@ async function sendNotification(signal) {
       tp1: fmtPrice(signal.tp1),
       tp2: fmtPrice(signal.tp2),
       tp3: fmtPrice(signal.tp3),
-      sl: fmtPrice(signal.sl)
+      sl: fmtPrice(signal.sl),
+      emaConfirm: signal.emaConfirm,
+      volatility: signal.volatilityOk ? "OK" : "LOW",
+      mainSignal: signal.mainSignal,
+      sourceMode: signal.sourceMode
     })
   });
 }
@@ -905,7 +1237,16 @@ async function processPairTf(pairConfig, tf) {
     signal.signal,
     signal.grade,
     "Entry",
-    fmtPrice(signal.entry)
+    fmtPrice(signal.entry),
+    "SL",
+    fmtPrice(signal.sl),
+    "TP1",
+    fmtPrice(signal.tp1),
+    "EMA",
+    signal.emaConfirm || "-",
+    "VOL",
+    signal.volatilityOk ? "OK" : "LOW",
+    signal.sourceMode || ""
   );
 }
 
@@ -965,7 +1306,7 @@ async function runAutoScanner() {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V10.2");
+  console.log("DEWA SMC SERVER SCANNER WORKER V10.5 TRADINGVIEW MATCH");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

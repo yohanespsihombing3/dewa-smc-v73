@@ -1952,39 +1952,81 @@ window.enablePush = enablePush;
 
 
 
+
+let SIMPLE_MEMBER_CACHE = [];
+let SIMPLE_MEMBER_FILTERED = null;
+
+function simpleMemberSearchText(m){
+  return [
+    m && (m.name || m.memberName),
+    m && m.email,
+    m && m.mt5Account,
+    m && m.broker,
+    m && m.status
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function simpleFilterMembers(){
+  const q = String(($("simpleMemberSearch") && $("simpleMemberSearch").value) || "")
+    .trim().toLowerCase();
+  const tokens = q.split(/\s+/).filter(Boolean);
+  SIMPLE_MEMBER_FILTERED = !tokens.length ? null : SIMPLE_MEMBER_CACHE.filter(m => {
+    const text = simpleMemberSearchText(m);
+    return tokens.every(t => text.includes(t));
+  });
+  simpleRenderMemberSearch();
+}
+
+function simpleClearMemberSearch(){
+  const el = $("simpleMemberSearch");
+  if(el) el.value = "";
+  SIMPLE_MEMBER_FILTERED = null;
+  simpleRenderMemberSearch();
+  if(el) el.focus();
+}
+
+function simpleRenderMemberSearch(){
+  const rows = SIMPLE_MEMBER_FILTERED || SIMPLE_MEMBER_CACHE;
+  const info = $("simpleMemberSearchInfo");
+  if(info) info.textContent = SIMPLE_MEMBER_FILTERED
+    ? `${rows.length} dari ${SIMPLE_MEMBER_CACHE.length} member`
+    : `${SIMPLE_MEMBER_CACHE.length} member`;
+
+  const box = $("simpleMembers");
+  if(!box) return;
+  if(!rows.length){
+    box.innerHTML = '<div class="sub">Member tidak ditemukan.</div>';
+    return;
+  }
+
+  box.innerHTML = rows.map(m => `
+    <div class="usercard">
+      <div class="row">
+        <span>
+          <b>${m.name || m.email}</b><br>
+          <span class="muted">${m.email} • MT5 ${m.mt5Account}</span><br>
+          <span class="muted">${m.broker || "-"} • berakhir ${m.expiresAt ? new Date(m.expiresAt).toLocaleString("id-ID") : "-"}</span>
+        </span>
+        <span class="badge">${m.status} • ${m.remainingDays ?? 0} hari</span>
+      </div>
+      <div class="mini">
+        <input id="days-${m.id}" type="number" min="1" value="30" placeholder="Hari">
+        <button class="btn2" onclick="simpleExtendMember('${m.id}')">TAMBAH HARI</button>
+        <button class="btn2" onclick="simpleSetMemberDays('${m.id}')">SET DARI HARI INI</button>
+      </div>
+      <button class="btn2" onclick="simpleToggleMember('${m.id}','${m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE"}')">
+        ${m.status === "ACTIVE" ? "SUSPEND" : "AKTIFKAN"}
+      </button>
+      <button class="btnred" onclick="simpleDeleteMember('${m.id}')">HAPUS</button>
+    </div>
+  `).join("");
+}
+
 async function simpleLoadMembers() {
   try {
     const data = await api("/api/admin/v10/members");
-    const rows = data.members || [];
-    const box = $("simpleMembers");
-    if (!box) return;
-
-    if (!rows.length) {
-      box.innerHTML = '<div class="sub">Belum ada member EA.</div>';
-      return;
-    }
-
-    box.innerHTML = rows.map(m => `
-      <div class="usercard">
-        <div class="row">
-          <span>
-            <b>${m.name || m.email}</b><br>
-            <span class="muted">${m.email} • MT5 ${m.mt5Account}</span><br>
-            <span class="muted">${m.broker || "-"} • berakhir ${m.expiresAt ? new Date(m.expiresAt).toLocaleString("id-ID") : "-"}</span>
-          </span>
-          <span class="badge">${m.status} • ${m.remainingDays ?? 0} hari</span>
-        </div>
-        <div class="mini">
-          <input id="days-${m.id}" type="number" min="1" value="30" placeholder="Hari">
-          <button class="btn2" onclick="simpleExtendMember('${m.id}')">TAMBAH HARI</button>
-          <button class="btn2" onclick="simpleSetMemberDays('${m.id}')">SET DARI HARI INI</button>
-        </div>
-        <button class="btn2" onclick="simpleToggleMember('${m.id}','${m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE"}')">
-          ${m.status === "ACTIVE" ? "SUSPEND" : "AKTIFKAN"}
-        </button>
-        <button class="btnred" onclick="simpleDeleteMember('${m.id}')">HAPUS</button>
-      </div>
-    `).join("");
+    SIMPLE_MEMBER_CACHE = Array.isArray(data.members) ? data.members : [];
+    simpleFilterMembers();
   } catch (error) {
     log("Membership: " + error.message);
   }

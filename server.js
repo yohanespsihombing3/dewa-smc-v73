@@ -127,7 +127,7 @@ function safe(u){return{id:u.id,email:u.email,role:u.role,plan:u.plan,status:u.s
 function makeToken(u){return jwt.sign({id:u.id,email:u.email,role:u.role},SECRET,{expiresIn:'7d'})}
 function auth(req,res,next){try{let t=(req.headers.authorization||'').replace('Bearer ','');if(!t)throw Error('Unauthorized');let p=jwt.verify(t,SECRET),u=db().users.find(x=>x.id===p.id);if(!u)throw Error('User tidak ditemukan');if(!active(u))return res.status(403).json({error:'Akun expired / belum aktif'});req.user=u;next()}catch(e){res.status(401).json({error:e.message})}}
 
-function eaAuth(req,res,next){
+async function eaAuth(req,res,next){
   try{
     const email=normalizeEmail(req.query.email);
     const mt5=normalizeMt5Account(req.query.mt5);
@@ -135,31 +135,87 @@ function eaAuth(req,res,next){
     if(!email||!email.includes('@')){
       return res.status(400).json({error:'Email EA tidak valid'});
     }
-
     if(!mt5){
       return res.status(400).json({error:'Nomor akun MT5 wajib dikirim'});
     }
 
-    const u=db().users.find(x=>normalizeEmail(x.email)===email);
+    // V10.3+: EA Membership di Supabase menjadi sumber utama.
+    if(supabase){
+      const {data:member,error}=await supabase
+        .from('ea_members')
+        .select('*')
+        .eq('email',email)
+        .eq('mt5_account',mt5)
+        .maybeSingle();
 
-    if(!u){
-      return res.status(401).json({error:'Email tidak terdaftar'});
+      if(error){
+        console.error('[EA AUTH SUPABASE]',error);
+        return res.status(503).json({error:'Validasi EA Membership gagal'});
+      }
+
+      if(member){
+        const status=String(member.status||'ACTIVE').toUpperCase();
+        const enabled=member.ea_enabled!==false;
+        const expiresAt=member.expires_at ? new Date(member.expires_at) : null;
+        const expired=expiresAt && !Number.isNaN(expiresAt.getTime()) && expiresAt.getTime()<=Date.now();
+
+        if(status!=='ACTIVE'){
+          return res.status(403).json({error:'Member EA tidak aktif'});
+        }
+        if(!enabled){
+          return res.status(403).json({error:'EA disabled'});
+        }
+        if(expired){
+          return res.status(403).json({error:'Membership EA expired'});
+        }
+
+        req.eaUser={
+          id:member.id,
+          email:member.email,
+          mt5Account:String(member.mt5_account||''),
+          eaEnabled:enabled,
+          status,
+          expiredAt:member.expires_at||null,
+          source:'SUPABASE_EA_MEMBERS'
+        };
+        req.eaMember=member;
+        req.eaMt5=mt5;
+        return next();
+      }
+
+      // Jika email ada tetapi MT5 berbeda, beri pesan yang lebih tepat.
+      const {data:emailMember,error:emailError}=await supabase
+        .from('ea_members')
+        .select('id,email,mt5_account,status,ea_enabled,expires_at')
+        .eq('email',email)
+        .limit(1)
+        .maybeSingle();
+
+      if(emailError){
+        console.error('[EA AUTH SUPABASE EMAIL]',emailError);
+        return res.status(503).json({error:'Validasi EA Membership gagal'});
+      }
+      if(emailMember){
+        return res.status(401).json({error:'Nomor akun MT5 tidak sesuai dengan EA Membership'});
+      }
     }
 
+    // Compatibility sementara: registrasi MT5 lama tetap dapat digunakan.
+    const u=db().users.find(x=>normalizeEmail(x.email)===email);
+    if(!u){
+      return res.status(401).json({error:'Email tidak terdaftar di EA Membership'});
+    }
     if(!active(u)){
       return res.status(403).json({error:'Member tidak aktif / expired'});
     }
-
     if(u.eaEnabled===false){
       return res.status(403).json({error:'EA disabled'});
     }
 
     const registeredMt5=normalizeMt5Account(u.mt5Account);
-
     if(!registeredMt5){
       return res.status(403).json({error:'Nomor akun MT5 belum didaftarkan'});
     }
-
     if(registeredMt5!==mt5){
       return res.status(401).json({error:'Nomor akun MT5 tidak sesuai'});
     }
@@ -168,6 +224,7 @@ function eaAuth(req,res,next){
     req.eaMt5=mt5;
     next();
   }catch(e){
+    console.error('[EA AUTH]',e);
     res.status(500).json({error:e.message});
   }
 }
@@ -313,14 +370,20 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
       const signalName=String(s.signal||'').toUpperCase();
       const pair=normalizeEaSymbol(s.pair);
       const signalTf=normalizeEaTimeframe(s.tf);
-      const isEntry=['OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(signalName);
+      const isEntry=['PREPARE LONG','PREPARE SHORT','OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(signalName);
+      const requestedEngine=String(req.query.engine||'SMC').toUpperCase();
       const isSmc=engine.includes('SMC')&&!engine.includes('HYBRID');
       const isSniper=engine.includes('SNIPER')&&!engine.includes('HYBRID');
+      const isHybrid=engine.includes('HYBRID');
+      const engineMatch=
+        (requestedEngine==='SMC' && isSmc) ||
+        (requestedEngine==='SNIPER' && isSniper) ||
+        (requestedEngine==='HYBRID' && isHybrid);
 
       return (
         isEntry &&
         isGradeAPlus(s.grade) &&
-        (isSmc||isSniper) &&
+        engineMatch &&
         pair===symbol &&
         signalTf===tf &&
         isFreshEaSignal(s)

@@ -370,7 +370,7 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
       const signalName=String(s.signal||'').toUpperCase();
       const pair=normalizeEaSymbol(s.pair);
       const signalTf=normalizeEaTimeframe(s.tf);
-      const isEntry=['PREPARE LONG','PREPARE SHORT','OPEN LONG','OPEN SHORT','REVERSE LONG','REVERSE SHORT'].includes(signalName);
+      const isEntry=['PREPARE LONG','PREPARE SHORT'].includes(signalName);
       const requestedEngine=String(req.query.engine||'SMC').toUpperCase();
       const isSmc=engine.includes('SMC')&&!engine.includes('HYBRID');
       const isSniper=engine.includes('SNIPER')&&!engine.includes('HYBRID');
@@ -382,7 +382,6 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
 
       return (
         isEntry &&
-        isGradeAPlus(s.grade) &&
         engineMatch &&
         pair===symbol &&
         signalTf===tf &&
@@ -412,7 +411,7 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
         symbol,
         tf,
         maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
-        priority:'SMC > SNIPER A/A+ | HYBRID ignored',
+        priority:'ACTIONABLE PREPARE + EMA YES',
         id:null,
         signalId:null,
         signal:null,
@@ -453,7 +452,7 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
       symbol,
       tf,
       maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
-      priority:'SMC > SNIPER A/A+ | HYBRID ignored',
+      priority:'ACTIONABLE PREPARE + EMA YES',
       id:String(latest.id||''),
       signalId:String(latest.id||''),
       key:latest.key||'',
@@ -462,6 +461,7 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
       direction,
       engine:String(latest.engine||''),
       grade:String(latest.grade||''),
+      emaConfirm:String(latest.emaConfirm||''),
       entry:Number(latest.entry||0),
       tp1:Number(latest.tp1||0),
       tp2:Number(latest.tp2||0),
@@ -665,18 +665,17 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
     const engine=String(s.engine||'').toUpperCase();
     const signalName=String(s.signal||'').toUpperCase();
     const eligibleEngine=
-      (engine.includes('SMC')||engine.includes('SNIPER')) &&
-      !engine.includes('HYBRID');
+      engine.includes('SMC') ||
+      engine.includes('SNIPER') ||
+      engine.includes('HYBRID');
     const eligibleSignal=[
-      'OPEN LONG',
-      'OPEN SHORT',
-      'REVERSE LONG',
-      'REVERSE SHORT'
+      'PREPARE LONG',
+      'PREPARE SHORT'
     ].includes(signalName);
 
     let queueEvent=null;
 
-    if(eligibleEngine&&eligibleSignal&&isGradeAPlus(s.grade)){
+    if(eligibleEngine&&eligibleSignal&&String(s.emaConfirm||'').toUpperCase()==='YES'){
       const ed=eadb();
       const eo=ed.signals.find(x=>x.key===key);
 
@@ -700,6 +699,7 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
           (signalName.includes('LONG')?'LONG':'SHORT'),
         engine:s.engine,
         grade:s.grade,
+        emaConfirm:String(s.emaConfirm||''),
         entry:Number(s.entry||0),
         tp1:Number(s.tp1||0),
         tp2:Number(s.tp2||0),

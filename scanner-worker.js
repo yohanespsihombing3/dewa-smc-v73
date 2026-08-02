@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V10.6 TV + EMA ACTIONABLE
+  DEWA SMC SERVER-SIDE SCANNER WORKER V10.7 TV DIAGNOSTIC MATCH
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -706,10 +706,6 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
         ? closedEmaLong
         : closedEmaShort;
 
-    // V10.6 rule:
-    // BOS/CHoCH remains part of TradingView market-structure logic,
-    // but it is NOT sent as a second actionable notification/order.
-    // The actionable setup must already have been emitted from PREPARE + EMA YES.
     return {
       valid: false,
       reason: emaOk
@@ -720,7 +716,46 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       emaOk,
       volatilityOk: closedVolatilityOk,
       structureHigh: structure.lastHigh,
-      structureLow: structure.lastLow
+      structureLow: structure.lastLow,
+      diagnostic: {
+        mode: "BREAKOUT",
+        feedSymbol: pairConfig.dataSymbol || pair,
+        pair,
+        tf: tfLabel(tf),
+        currentTime: current.time,
+        currentOHLC: {
+          open: current.open,
+          high: current.high,
+          low: current.low,
+          close: current.close
+        },
+        lastClosedTime: lastClosed.time,
+        lastClosedOHLC: {
+          open: lastClosed.open,
+          high: lastClosed.high,
+          low: lastClosed.low,
+          close: lastClosed.close
+        },
+        structurePeriod,
+        structureHigh: structure.lastHigh,
+        structureLow: structure.lastLow,
+        structureHighPivotTime:
+          structure.lastHighIndex >= 0
+            ? closed[structure.lastHighIndex]?.time || null
+            : null,
+        structureLowPivotTime:
+          structure.lastLowIndex >= 0
+            ? closed[structure.lastLowIndex]?.time || null
+            : null,
+        ema9: closedEma9,
+        ema20: closedEma20,
+        emaLong: closedEmaLong,
+        emaShort: closedEmaShort,
+        atr14: closedAtr14,
+        atrSma20: closedAtrSma20,
+        volatilityOk: closedVolatilityOk,
+        breakout: freshBreak
+      }
     };
   }
 
@@ -779,15 +814,74 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
   }
 
   if (!prepareDirection) {
+    const distanceToHighPct =
+      Number.isFinite(structure.lastHigh)
+        ? Math.abs(current.close - structure.lastHigh) /
+          Math.abs(structure.lastHigh) * 100
+        : null;
+
+    const distanceToLowPct =
+      Number.isFinite(structure.lastLow)
+        ? Math.abs(current.close - structure.lastLow) /
+          Math.abs(structure.lastLow) * 100
+        : null;
+
     return {
       valid: false,
-      reason: "NO FRESH BOS/CHoCH OR PREPARE",
+      reason: "NO ACTIONABLE PREPARE",
       structureHigh: structure.lastHigh,
       structureLow: structure.lastLow,
       liveClose: current.close,
       ema9: liveEma9,
       ema20: liveEma20,
-      volatilityOk: liveVolatilityOk
+      volatilityOk: liveVolatilityOk,
+      diagnostic: {
+        mode: "SCAN",
+        feedSymbol: pairConfig.dataSymbol || pair,
+        pair,
+        tf: tfLabel(tf),
+        currentTime: current.time,
+        currentOHLC: {
+          open: current.open,
+          high: current.high,
+          low: current.low,
+          close: current.close
+        },
+        lastClosedTime: lastClosed.time,
+        lastClosedOHLC: {
+          open: lastClosed.open,
+          high: lastClosed.high,
+          low: lastClosed.low,
+          close: lastClosed.close
+        },
+        structurePeriod,
+        structureHigh: structure.lastHigh,
+        structureLow: structure.lastLow,
+        structureHighPivotTime:
+          structure.lastHighIndex >= 0
+            ? closed[structure.lastHighIndex]?.time || null
+            : null,
+        structureLowPivotTime:
+          structure.lastLowIndex >= 0
+            ? closed[structure.lastLowIndex]?.time || null
+            : null,
+        highBreakPending: structure.highBreakPending,
+        lowBreakPending: structure.lowBreakPending,
+        prepareDistancePct,
+        distanceToHighPct,
+        distanceToLowPct,
+        prepLongRaw,
+        prepShortRaw,
+        prepLong,
+        prepShort,
+        ema9: liveEma9,
+        ema20: liveEma20,
+        emaLong: liveEmaLong,
+        emaShort: liveEmaShort,
+        atr14: liveAtr14,
+        atrSma20: liveAtrSma20,
+        volatilityOk: liveVolatilityOk
+      }
     };
   }
 
@@ -869,6 +963,55 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       Math.abs(current.close - prepareEntry) /
       Math.abs(prepareEntry) *
       100,
+    diagnostic: {
+      mode: "ACTIONABLE_PREPARE",
+      feedSymbol: pairConfig.dataSymbol || pair,
+      pair,
+      tf: tfLabel(tf),
+      currentTime: current.time,
+      currentOHLC: {
+        open: current.open,
+        high: current.high,
+        low: current.low,
+        close: current.close
+      },
+      lastClosedTime: lastClosed.time,
+      lastClosedOHLC: {
+        open: lastClosed.open,
+        high: lastClosed.high,
+        low: lastClosed.low,
+        close: lastClosed.close
+      },
+      structurePeriod,
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      structureHighPivotTime:
+        structure.lastHighIndex >= 0
+          ? closed[structure.lastHighIndex]?.time || null
+          : null,
+      structureLowPivotTime:
+        structure.lastLowIndex >= 0
+          ? closed[structure.lastLowIndex]?.time || null
+          : null,
+      highBreakPending: structure.highBreakPending,
+      lowBreakPending: structure.lowBreakPending,
+      prepareDistancePct,
+      distanceToEntryPct:
+        Math.abs(current.close - prepareEntry) /
+        Math.abs(prepareEntry) * 100,
+      ema9: liveEma9,
+      ema20: liveEma20,
+      emaLong: liveEmaLong,
+      emaShort: liveEmaShort,
+      atr14: liveAtr14,
+      atrSma20: liveAtrSma20,
+      volatilityOk: liveVolatilityOk,
+      entry: prepareEntry,
+      tp1: prepareLevels.tp1,
+      tp2: prepareLevels.tp2,
+      tp3: prepareLevels.tp3,
+      sl: prepareLevels.sl
+    },
     sourceMode: "TV_EMA_ACTIONABLE_PREPARE",
     createdAt: new Date().toISOString()
   };
@@ -1078,10 +1221,58 @@ async function sendNotification(signal) {
   });
 }
 
+function printTvDiagnostic(signal, pair, tf) {
+  const d = signal?.diagnostic;
+  if (!d) return;
+
+  const compact = {
+    mode: d.mode,
+    feed: d.feedSymbol,
+    pair,
+    tf: tfLabel(tf),
+    currentTime: d.currentTime,
+    currentOHLC: d.currentOHLC,
+    lastClosedTime: d.lastClosedTime,
+    lastClosedOHLC: d.lastClosedOHLC,
+    structurePeriod: d.structurePeriod,
+    structureHigh: d.structureHigh,
+    structureLow: d.structureLow,
+    structureHighPivotTime: d.structureHighPivotTime,
+    structureLowPivotTime: d.structureLowPivotTime,
+    highBreakPending: d.highBreakPending,
+    lowBreakPending: d.lowBreakPending,
+    prepareDistancePct: d.prepareDistancePct,
+    distanceToHighPct: d.distanceToHighPct,
+    distanceToLowPct: d.distanceToLowPct,
+    distanceToEntryPct: d.distanceToEntryPct,
+    prepLongRaw: d.prepLongRaw,
+    prepShortRaw: d.prepShortRaw,
+    prepLong: d.prepLong,
+    prepShort: d.prepShort,
+    ema9: d.ema9,
+    ema20: d.ema20,
+    emaLong: d.emaLong,
+    emaShort: d.emaShort,
+    atr14: d.atr14,
+    atrSma20: d.atrSma20,
+    volatilityOk: d.volatilityOk,
+    entry: d.entry,
+    tp1: d.tp1,
+    tp2: d.tp2,
+    tp3: d.tp3,
+    sl: d.sl,
+    breakout: d.breakout
+  };
+
+  console.log("[TV-DIAG]", JSON.stringify(compact));
+}
+
 async function processPairTf(pairConfig, tf) {
   const pair = pairConfig.symbol;
   const candles = await fetchCandles(pairConfig.dataSymbol, tf);
   const signal = analyzeSmc(pair, tf, candles, pairConfig);
+
+  printTvDiagnostic(signal, pair, tf);
 
   if (!signal.valid) {
     console.log(
@@ -1185,7 +1376,7 @@ async function runAutoScanner() {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V10.6 TV + EMA ACTIONABLE");
+  console.log("DEWA SMC SERVER SCANNER WORKER V10.7 TV DIAGNOSTIC MATCH");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

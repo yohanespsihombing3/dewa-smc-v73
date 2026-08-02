@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V10.5 TRADINGVIEW MATCH
+  DEWA SMC SERVER-SIDE SCANNER WORKER V10.6 TV + EMA ACTIONABLE
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -706,120 +706,21 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
         ? closedEmaLong
         : closedEmaShort;
 
-    // DEWA execution rule: confirmed OPEN must pass EMA + volatility.
-    if (!emaOk) {
-      return {
-        valid: false,
-        reason: "ENTRY EMA NOT CONFIRMED",
-        direction: freshBreak.direction,
-        mainSignal: freshBreak.type,
-        emaOk: false,
-        volatilityOk: closedVolatilityOk
-      };
-    }
-
-    if (!closedVolatilityOk) {
-      return {
-        valid: false,
-        reason: "ENTRY VOLATILITY LOW",
-        direction: freshBreak.direction,
-        mainSignal: freshBreak.type,
-        emaOk: true,
-        volatilityOk: false
-      };
-    }
-
-    if (rrr.tp3 < minRrr) {
-      return {
-        valid: false,
-        reason: "RRR BELOW MINIMUM",
-        minRrr,
-        maxRrr: rrr.tp3
-      };
-    }
-
-    const entry = freshBreak.structure;
-    const levels = targetLevels(
-      freshBreak.direction,
-      entry,
-      closedAtr14
-    );
-
-    const stateKey = pair + "|" + tf;
-    const previousDirection =
-      state.lastDirectionByPairTf[stateKey];
-
-    let finalSignal =
-      freshBreak.direction === "LONG"
-        ? "OPEN LONG"
-        : "OPEN SHORT";
-
-    if (
-      previousDirection &&
-      previousDirection !== freshBreak.direction
-    ) {
-      finalSignal =
-        freshBreak.direction === "LONG"
-          ? "REVERSE LONG"
-          : "REVERSE SHORT";
-    }
-
-    const score =
-      2 +
-      (freshBreak.type.startsWith("CHoCH") ? 1 : 0) +
-      1.5 + // EMA confirmed
-      1 +   // volatility
-      1.5 + // EMA direction
-      1;    // close side
-
-    const grade = getGrade(score);
-
-    const eventKey = [
-      "ENTRY",
-      pair,
-      tfLabel(tf),
-      finalSignal,
-      freshBreak.candleTime,
-      fmtPrice(entry)
-    ].join("|");
-
+    // V10.6 rule:
+    // BOS/CHoCH remains part of TradingView market-structure logic,
+    // but it is NOT sent as a second actionable notification/order.
+    // The actionable setup must already have been emitted from PREPARE + EMA YES.
     return {
-      valid: true,
-      key: eventKey,
-      pair,
-      tf: tfLabel(tf),
-      signal: finalSignal,
-      status: finalSignal,
-      engine: "SMC",
-      grade,
-      score,
-      entry,
-      tp1: levels.tp1,
-      tp2: levels.tp2,
-      tp3: levels.tp3,
-      sl: levels.sl,
-      atr: closedAtr14,
-      atrSma20: closedAtrSma20,
-      targetRange: levels.targetRange,
-      ema9: closedEma9,
-      ema20: closedEma20,
-      emaConfirm: "YES",
-      volatilityOk: closedVolatilityOk,
-      volatilityEnabled,
-      structurePeriod,
-      prepareDistancePct,
-      minRrr,
-      rrr,
-      priority: pairConfig.priority || "NORMAL",
-      scanOrder: Number(pairConfig.scanOrder || 0),
-      dataSymbol: pairConfig.dataSymbol || pair,
-      structureHigh: structure.lastHigh,
-      structureLow: structure.lastLow,
-      mainSignal: freshBreak.type,
-      candleTime: freshBreak.candleTime,
+      valid: false,
+      reason: emaOk
+        ? "BREAKOUT CONFIRMED - NO SECOND ORDER"
+        : "BREAKOUT CONFIRMED - EMA NO",
       direction: freshBreak.direction,
-      sourceMode: "TV_MATCH_ENTRY",
-      createdAt: new Date().toISOString()
+      mainSignal: freshBreak.type,
+      emaOk,
+      volatilityOk: closedVolatilityOk,
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow
     };
   }
 
@@ -887,28 +788,6 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       ema9: liveEma9,
       ema20: liveEma20,
       volatilityOk: liveVolatilityOk
-    };
-  }
-
-  // Do not arm an executable pending setup while volatility is low.
-  if (!liveVolatilityOk) {
-    return {
-      valid: false,
-      reason: "PREPARE VOLATILITY LOW",
-      direction: prepareDirection,
-      structureHigh: structure.lastHigh,
-      structureLow: structure.lastLow,
-      emaOk: true,
-      volatilityOk: false
-    };
-  }
-
-  if (rrr.tp3 < minRrr) {
-    return {
-      valid: false,
-      reason: "RRR BELOW MINIMUM",
-      minRrr,
-      maxRrr: rrr.tp3
     };
   }
 
@@ -990,7 +869,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       Math.abs(current.close - prepareEntry) /
       Math.abs(prepareEntry) *
       100,
-    sourceMode: "TV_MATCH_PREPARE",
+    sourceMode: "TV_EMA_ACTIONABLE_PREPARE",
     createdAt: new Date().toISOString()
   };
 }
@@ -1235,7 +1114,7 @@ async function processPairTf(pairConfig, tf) {
     signal.pair,
     signal.tf,
     signal.signal,
-    signal.grade,
+    "EMA_ACTIONABLE",
     "Entry",
     fmtPrice(signal.entry),
     "SL",
@@ -1306,7 +1185,7 @@ async function runAutoScanner() {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V10.5 TRADINGVIEW MATCH");
+  console.log("DEWA SMC SERVER SCANNER WORKER V10.6 TV + EMA ACTIONABLE");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

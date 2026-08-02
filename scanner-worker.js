@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V10.8 FAST PREPARE + PIVOT HISTORY
+  DEWA SMC SERVER-SIDE SCANNER WORKER V10.9 PINE-STATE MATCH
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -423,27 +423,32 @@ function getGrade(score) {
 // -----------------------------------------------------------------------------
 function pivotHighAt(candles, index, left, right) {
   if (index - left < 0 || index + right >= candles.length) return null;
-
   const value = candles[index].high;
+  if (!Number.isFinite(value)) return null;
 
-  for (let i = index - left; i <= index + right; i++) {
-    if (i === index) continue;
+  // Closer to TradingView ta.pivothigh(): equal highs on the left are allowed,
+  // while an equal/larger high on the right makes the later extreme win.
+  for (let i = index - left; i < index; i++) {
+    if (candles[i].high > value) return null;
+  }
+  for (let i = index + 1; i <= index + right; i++) {
     if (candles[i].high >= value) return null;
   }
-
   return value;
 }
 
 function pivotLowAt(candles, index, left, right) {
   if (index - left < 0 || index + right >= candles.length) return null;
-
   const value = candles[index].low;
+  if (!Number.isFinite(value)) return null;
 
-  for (let i = index - left; i <= index + right; i++) {
-    if (i === index) continue;
+  // Closer to TradingView ta.pivotlow().
+  for (let i = index - left; i < index; i++) {
+    if (candles[i].low < value) return null;
+  }
+  for (let i = index + 1; i <= index + right; i++) {
     if (candles[i].low <= value) return null;
   }
-
   return value;
 }
 
@@ -573,7 +578,16 @@ function buildTvStructure(candles, structurePeriod) {
     trendDirection,
     lastBreak,
     pivotHighHistory: pivotHighHistory.slice(-5),
-    pivotLowHistory: pivotLowHistory.slice(-5)
+    pivotLowHistory: pivotLowHistory.slice(-5),
+    pineState: {
+      lastHigh,
+      lastLow,
+      lastHighIndex,
+      lastLowIndex,
+      highBreakPending,
+      lowBreakPending,
+      trendDirection
+    }
   };
 }
 
@@ -765,6 +779,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
             : null,
         pivotHighHistory: structure.pivotHighHistory,
         pivotLowHistory: structure.pivotLowHistory,
+        pineState: structure.pineState,
         ema9: closedEma9,
         ema20: closedEma20,
         emaLong: closedEmaLong,
@@ -885,6 +900,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
             : null,
         pivotHighHistory: structure.pivotHighHistory,
         pivotLowHistory: structure.pivotLowHistory,
+        pineState: structure.pineState,
         highBreakPending: structure.highBreakPending,
         lowBreakPending: structure.lowBreakPending,
         prepareDistancePct,
@@ -1015,6 +1031,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
           : null,
       pivotHighHistory: structure.pivotHighHistory,
       pivotLowHistory: structure.pivotLowHistory,
+      pineState: structure.pineState,
       highBreakPending: structure.highBreakPending,
       lowBreakPending: structure.lowBreakPending,
       prepareDistancePct,
@@ -1034,7 +1051,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       tp3: prepareLevels.tp3,
       sl: prepareLevels.sl
     },
-    sourceMode: "TV_EMA_ACTIONABLE_PREPARE",
+    sourceMode: "PINE_STATE_EMA_ACTIONABLE_PREPARE",
     createdAt: new Date().toISOString()
   };
 }
@@ -1263,6 +1280,7 @@ function printTvDiagnostic(signal, pair, tf) {
     structureLowPivotTime: d.structureLowPivotTime,
     pivotHighHistory: d.pivotHighHistory,
     pivotLowHistory: d.pivotLowHistory,
+    pineState: d.pineState,
     highBreakPending: d.highBreakPending,
     lowBreakPending: d.lowBreakPending,
     prepareDistancePct: d.prepareDistancePct,
@@ -1458,7 +1476,7 @@ async function runScannerForTf(tf, mode) {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V10.8 FAST PREPARE + PIVOT HISTORY");
+  console.log("DEWA SMC SERVER SCANNER WORKER V10.9 PINE-STATE MATCH");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

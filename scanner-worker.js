@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V10.7 TV DIAGNOSTIC MATCH
+  DEWA SMC SERVER-SIDE SCANNER WORKER V10.8 FAST PREPARE + PIVOT HISTORY
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -43,7 +43,9 @@ const APP_BASE_URL = String(
 const ADMIN_EMAIL = String(process.env.WORKER_ADMIN_EMAIL || "").trim();
 const ADMIN_PASSWORD = String(process.env.WORKER_ADMIN_PASSWORD || "");
 const ENABLED = String(process.env.WORKER_ENABLED || "true").toLowerCase() === "true";
-const SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SCAN_SECONDS || 120));
+const SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SCAN_SECONDS || 300));
+const FAST_SCAN_SECONDS = Math.max(30, Number(process.env.WORKER_FAST_SCAN_SECONDS || 60));
+const SLOW_SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SLOW_SCAN_SECONDS || 300));
 const OUTPUT_SIZE = Math.max(80, Math.min(500, Number(process.env.WORKER_OUTPUTSIZE || 180)));
 
 const DEFAULT_PAIRS = String(
@@ -456,6 +458,8 @@ function buildTvStructure(candles, structurePeriod) {
   let trendDirection = 0;
 
   let lastBreak = null;
+  const pivotHighHistory = [];
+  const pivotLowHistory = [];
 
   for (let i = 0; i < candles.length; i++) {
     // Pine confirms a pivot only after `structurePeriod` right-hand bars.
@@ -480,12 +484,22 @@ function buildTvStructure(candles, structurePeriod) {
         lastHigh = ph;
         lastHighIndex = pivotIndex;
         highBreakPending = true;
+        pivotHighHistory.push({
+          price: ph,
+          index: pivotIndex,
+          time: candles[pivotIndex]?.time || null
+        });
       }
 
       if (pl !== null) {
         lastLow = pl;
         lastLowIndex = pivotIndex;
         lowBreakPending = true;
+        pivotLowHistory.push({
+          price: pl,
+          index: pivotIndex,
+          time: candles[pivotIndex]?.time || null
+        });
       }
     }
 
@@ -557,7 +571,9 @@ function buildTvStructure(candles, structurePeriod) {
     highBreakPending,
     lowBreakPending,
     trendDirection,
-    lastBreak
+    lastBreak,
+    pivotHighHistory: pivotHighHistory.slice(-5),
+    pivotLowHistory: pivotLowHistory.slice(-5)
   };
 }
 
@@ -747,6 +763,8 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
           structure.lastLowIndex >= 0
             ? closed[structure.lastLowIndex]?.time || null
             : null,
+        pivotHighHistory: structure.pivotHighHistory,
+        pivotLowHistory: structure.pivotLowHistory,
         ema9: closedEma9,
         ema20: closedEma20,
         emaLong: closedEmaLong,
@@ -865,6 +883,8 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
           structure.lastLowIndex >= 0
             ? closed[structure.lastLowIndex]?.time || null
             : null,
+        pivotHighHistory: structure.pivotHighHistory,
+        pivotLowHistory: structure.pivotLowHistory,
         highBreakPending: structure.highBreakPending,
         lowBreakPending: structure.lowBreakPending,
         prepareDistancePct,
@@ -993,6 +1013,8 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
         structure.lastLowIndex >= 0
           ? closed[structure.lastLowIndex]?.time || null
           : null,
+      pivotHighHistory: structure.pivotHighHistory,
+      pivotLowHistory: structure.pivotLowHistory,
       highBreakPending: structure.highBreakPending,
       lowBreakPending: structure.lowBreakPending,
       prepareDistancePct,
@@ -1239,6 +1261,8 @@ function printTvDiagnostic(signal, pair, tf) {
     structureLow: d.structureLow,
     structureHighPivotTime: d.structureHighPivotTime,
     structureLowPivotTime: d.structureLowPivotTime,
+    pivotHighHistory: d.pivotHighHistory,
+    pivotLowHistory: d.pivotLowHistory,
     highBreakPending: d.highBreakPending,
     lowBreakPending: d.lowBreakPending,
     prepareDistancePct: d.prepareDistancePct,
@@ -1282,7 +1306,7 @@ async function processPairTf(pairConfig, tf) {
       signal.reason,
       signal.grade || ""
     );
-    return;
+    return signal;
   }
 
   const stateKey = pair + "|" + tf;
@@ -1290,7 +1314,7 @@ async function processPairTf(pairConfig, tf) {
 
   if (lastKey === signal.key) {
     console.log("[SCAN]", pair, tfLabel(tf), "signal sudah pernah dikirim");
-    return;
+    return signal;
   }
 
   await saveSignal(signal);
@@ -1318,40 +1342,94 @@ async function processPairTf(pairConfig, tf) {
     signal.volatilityOk ? "OK" : "LOW",
     signal.sourceMode || ""
   );
+
+  return signal;
 }
 
-async function runAutoScanner() {
-  if (running) {
-    console.log("[WORKER] Scan sebelumnya masih berjalan, skip.");
+const runningByTf = { "5": false, "15": false };
+const LAST_DISTANCE_BY_KEY = {};
+
+function diagnosticDistance(signal) {
+  const d = signal?.diagnostic;
+  if (!d) return Number.POSITIVE_INFINITY;
+
+  const candidates = [
+    d.distanceToEntryPct,
+    d.distanceToHighPct,
+    d.distanceToLowPct
+  ]
+    .map(Number)
+    .filter(Number.isFinite);
+
+  return candidates.length
+    ? Math.min(...candidates)
+    : Number.POSITIVE_INFINITY;
+}
+
+function buildScanPlanForTf(tf) {
+  const jobs = ACTIVE_PAIR_SETTINGS
+    .filter(pairConfig =>
+      Array.isArray(pairConfig.timeframes) &&
+      pairConfig.timeframes.includes(String(tf))
+    )
+    .map(pairConfig => ({
+      pairConfig,
+      tf: String(tf),
+      distance:
+        LAST_DISTANCE_BY_KEY[pairConfig.symbol + "|" + tf] ??
+        Number.POSITIVE_INFINITY
+    }));
+
+  // Priority first, then pair nearest to structure, then scan_order.
+  jobs.sort((a, b) => {
+    const p =
+      priorityWeight(a.pairConfig.priority) -
+      priorityWeight(b.pairConfig.priority);
+    if (p !== 0) return p;
+
+    if (a.distance !== b.distance) {
+      return a.distance - b.distance;
+    }
+
+    return (
+      Number(a.pairConfig.scanOrder || 0) -
+      Number(b.pairConfig.scanOrder || 0)
+    );
+  });
+
+  return jobs;
+}
+
+async function runScannerForTf(tf, mode) {
+  tf = String(tf);
+
+  if (runningByTf[tf]) {
+    console.log("[WORKER]", tfLabel(tf), "scan sebelumnya masih berjalan, skip.");
     return;
   }
 
-  running = true;
+  runningByTf[tf] = true;
   const started = Date.now();
-  const scanPlan = [];
-
-  for (const pairConfig of ACTIVE_PAIR_SETTINGS) {
-    for (const tf of pairConfig.timeframes) {
-      if (tf === "5" || tf === "15") {
-        scanPlan.push({ pairConfig, tf });
-      }
-    }
-  }
+  const scanPlan = buildScanPlanForTf(tf);
 
   console.log(
-    "\n[WORKER] Scan mulai",
+    "\n[WORKER]",
+    mode,
+    "scan mulai",
+    tfLabel(tf),
     new Date().toISOString(),
     "jobs=" + scanPlan.length,
-    "pairs=" + ACTIVE_PAIR_SETTINGS.length,
     "configRefreshedAt=" + (LAST_CONFIG_REFRESH_AT || "ENV")
   );
 
   try {
     for (const job of scanPlan) {
-      const { pairConfig, tf } = job;
+      const { pairConfig } = job;
+      const stateKey = pairConfig.symbol + "|" + tf;
 
       try {
-        await processPairTf(pairConfig, tf);
+        const signal = await processPairTf(pairConfig, tf);
+        LAST_DISTANCE_BY_KEY[stateKey] = diagnosticDistance(signal);
       } catch (error) {
         console.error(
           "[SCAN ERROR]",
@@ -1361,13 +1439,17 @@ async function runAutoScanner() {
         );
       }
 
-      // Mengurangi risiko rate limit Twelve Data.
+      // Keep a buffer between Twelve Data requests.
       await sleep(1500);
     }
   } finally {
-    running = false;
+    runningByTf[tf] = false;
+
     console.log(
-      "[WORKER] Scan selesai dalam",
+      "[WORKER]",
+      mode,
+      tfLabel(tf),
+      "scan selesai dalam",
       Math.round((Date.now() - started) / 1000),
       "detik"
     );
@@ -1376,11 +1458,13 @@ async function runAutoScanner() {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V10.7 TV DIAGNOSTIC MATCH");
+  console.log("DEWA SMC SERVER SCANNER WORKER V10.8 FAST PREPARE + PIVOT HISTORY");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));
-  console.log("INTERVAL:", SCAN_SECONDS, "detik");
+  console.log("FAST M5:", FAST_SCAN_SECONDS, "detik");
+  console.log("SLOW M15:", SLOW_SCAN_SECONDS, "detik");
+  console.log("CONFIG REFRESH:", SCAN_SECONDS, "detik");
   console.log("==============================================");
 
   if (!ENABLED) {
@@ -1394,14 +1478,30 @@ async function main() {
 
   await login();
   await refreshWorkerConfig();
-  await runAutoScanner();
 
+  // Initial scan.
+  await runScannerForTf("5", "FAST");
+  await runScannerForTf("15", "SLOW");
+
+  // Fast M5 loop: catches PREPARE before breakout.
   setInterval(() => {
-    refreshWorkerConfig()
-      .then(() => runAutoScanner())
-      .catch(error => {
-      console.error("[WORKER FATAL LOOP]", error);
-      });
+    runScannerForTf("5", "FAST").catch(error => {
+      console.error("[WORKER FAST LOOP]", error);
+    });
+  }, FAST_SCAN_SECONDS * 1000);
+
+  // Slower M15 loop.
+  setInterval(() => {
+    runScannerForTf("15", "SLOW").catch(error => {
+      console.error("[WORKER SLOW LOOP]", error);
+    });
+  }, SLOW_SCAN_SECONDS * 1000);
+
+  // Configuration refresh is independent from market scans.
+  setInterval(() => {
+    refreshWorkerConfig().catch(error => {
+      console.error("[WORKER CONFIG LOOP]", error);
+    });
   }, SCAN_SECONDS * 1000);
 }
 

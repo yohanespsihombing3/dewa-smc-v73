@@ -382,9 +382,12 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
 
       return (
         isEntry &&
+        String(s.emaConfirm||'').toUpperCase()==='YES' &&
         engineMatch &&
         pair===symbol &&
         signalTf===tf &&
+        String(s.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED' &&
+        String((s.execution&&s.execution.status)||'NEW').toUpperCase()!=='SUPERSEDED' &&
         isFreshEaSignal(s)
       );
     });
@@ -411,7 +414,7 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
         symbol,
         tf,
         maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
-        priority:'ACTIONABLE PREPARE + EMA YES',
+        priority:'LATEST ACTIONABLE PREPARE + EMA YES',
         id:null,
         signalId:null,
         signal:null,
@@ -452,7 +455,7 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
       symbol,
       tf,
       maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
-      priority:'ACTIONABLE PREPARE + EMA YES',
+      priority:'LATEST ACTIONABLE PREPARE + EMA YES',
       id:String(latest.id||''),
       signalId:String(latest.id||''),
       key:latest.key||'',
@@ -462,6 +465,8 @@ app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
       engine:String(latest.engine||''),
       grade:String(latest.grade||''),
       emaConfirm:String(latest.emaConfirm||''),
+      lifecycleStatus:String(latest.lifecycleStatus||'ACTIVE'),
+      supersedesSignalId:String(latest.supersedesSignalId||''),
       entry:Number(latest.entry||0),
       tp1:Number(latest.tp1||0),
       tp2:Number(latest.tp2||0),
@@ -542,6 +547,7 @@ app.post('/api/ea/update-execution',eaAuth,(req,res)=>{
       'STOP_LOSS',
       'CLOSED',
       'CANCELLED',
+      'SUPERSEDED',
       'ERROR'
     ];
 
@@ -603,7 +609,8 @@ app.post('/api/ea/update-execution',eaAuth,(req,res)=>{
       'TP3',
       'STOP_LOSS',
       'CLOSED',
-      'CANCELLED'
+      'CANCELLED',
+      'SUPERSEDED'
     ].includes(nextStatus)){
       item.execution.closedAt=now;
     }
@@ -654,38 +661,79 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
           :'RUNNING'
     };
 
-    if(old){
-      Object.assign(old,item);
-    }else{
-      d.signals.push(item);
-    }
+    if(old) Object.assign(old,item);
+    else d.signals.push(item);
 
     saveSig(d);
 
     const engine=String(s.engine||'').toUpperCase();
     const signalName=String(s.signal||'').toUpperCase();
+
     const eligibleEngine=
       engine.includes('SMC') ||
       engine.includes('SNIPER') ||
       engine.includes('HYBRID');
+
     const eligibleSignal=[
       'PREPARE LONG',
       'PREPARE SHORT'
     ].includes(signalName);
 
-    let queueEvent=null;
+    const emaYes=String(s.emaConfirm||'').toUpperCase()==='YES';
 
-    if(eligibleEngine&&eligibleSignal&&String(s.emaConfirm||'').toUpperCase()==='YES'){
+    let queueEvent=null;
+    let supersededIds=[];
+
+    if(eligibleEngine&&eligibleSignal&&emaYes){
       const ed=eadb();
       const eo=ed.signals.find(x=>x.key===key);
 
-      const previousSignal=eo
-        ?String(eo.signal||'').toUpperCase()
-        :null;
+      const engineFamily=value=>{
+        const e=String(value||'').toUpperCase();
+        if(e.includes('HYBRID')) return 'HYBRID';
+        if(e.includes('SNIPER')) return 'SNIPER';
+        if(e.includes('SMC')) return 'SMC';
+        return e;
+      };
 
-      const previousUpdatedAt=eo
-        ?String(eo.updatedAt||'')
-        :null;
+      const pairNorm=normalizeEaSymbol(s.pair);
+      const tfNorm=normalizeEaTimeframe(s.tf);
+      const family=engineFamily(s.engine);
+
+      // Supersede only pending/NEW setups for same pair+TF+engine.
+      // Executed/open positions are intentionally left alone.
+      for(const prev of ed.signals){
+        if(eo && String(prev.id)===String(eo.id)) continue;
+
+        const samePair=normalizeEaSymbol(prev.pair)===pairNorm;
+        const sameTf=normalizeEaTimeframe(prev.tf)===tfNorm;
+        const sameFamily=engineFamily(prev.engine)===family;
+        const prevExec=String(
+          (prev.execution&&prev.execution.status)||'NEW'
+        ).toUpperCase();
+
+        if(
+          samePair &&
+          sameTf &&
+          sameFamily &&
+          prevExec==='NEW' &&
+          String(prev.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED'
+        ){
+          prev.lifecycleStatus='SUPERSEDED';
+          prev.supersededBySignalId=eo?eo.id:item.id;
+          prev.supersededAt=now;
+          prev.execution={
+            ...(prev.execution||{}),
+            status:'SUPERSEDED',
+            updatedAt:now,
+            closedAt:now
+          };
+          prev.updatedAt=now;
+          supersededIds.push(String(prev.id));
+        }
+      }
+
+      const previousUpdatedAt=eo?String(eo.updatedAt||''):null;
 
       const ei={
         id:eo?eo.id:item.id,
@@ -699,7 +747,12 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
           (signalName.includes('LONG')?'LONG':'SHORT'),
         engine:s.engine,
         grade:s.grade,
-        emaConfirm:String(s.emaConfirm||''),
+        emaConfirm:String(s.emaConfirm||'YES'),
+        lifecycleStatus:'ACTIVE',
+        supersedesSignalId:
+          supersededIds.length
+            ?supersededIds[supersededIds.length-1]
+            :null,
         entry:Number(s.entry||0),
         tp1:Number(s.tp1||0),
         tp2:Number(s.tp2||0),
@@ -720,19 +773,12 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
         }
       };
 
-      const shouldQueue=
-        !eo ||
-        previousSignal!==signalName ||
-        previousUpdatedAt!==String(ei.updatedAt||'');
-
-      if(eo){
-        Object.assign(eo,ei);
-      }else{
-        ed.signals.push(ei);
-      }
+      if(eo) Object.assign(eo,ei);
+      else ed.signals.push(ei);
 
       saveEa(ed);
 
+      const shouldQueue=!eo || previousUpdatedAt!==String(ei.updatedAt||'');
       if(shouldQueue){
         queueEvent=eaV9Store.pushEvent(ei);
       }
@@ -742,7 +788,9 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
       success:true,
       signalId:item.id,
       queued:!!queueEvent,
-      queueEvent
+      queueEvent,
+      supersededIds,
+      lifecycle:'LATEST_PENDING_WINS'
     });
   }catch(err){
     console.error('signals upsert error:',err);
@@ -751,7 +799,6 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
     });
   }
 });
-
 app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
 
 app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});

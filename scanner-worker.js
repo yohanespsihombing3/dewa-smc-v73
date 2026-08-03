@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V10.9 PINE-STATE MATCH
+  DEWA SMC SERVER-SIDE SCANNER WORKER V11.0 PERSISTENT PINE STATE
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -46,7 +46,7 @@ const ENABLED = String(process.env.WORKER_ENABLED || "true").toLowerCase() === "
 const SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SCAN_SECONDS || 300));
 const FAST_SCAN_SECONDS = Math.max(30, Number(process.env.WORKER_FAST_SCAN_SECONDS || 60));
 const SLOW_SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SLOW_SCAN_SECONDS || 300));
-const OUTPUT_SIZE = Math.max(80, Math.min(500, Number(process.env.WORKER_OUTPUTSIZE || 180)));
+const OUTPUT_SIZE = Math.max(120, Math.min(500, Number(process.env.WORKER_OUTPUTSIZE || 500)));
 
 const DEFAULT_PAIRS = String(
   process.env.WORKER_PAIRS ||
@@ -301,6 +301,9 @@ function saveState(state) {
 }
 
 const state = loadState();
+state.lastSignalByPairTf = state.lastSignalByPairTf || {};
+state.lastDirectionByPairTf = state.lastDirectionByPairTf || {};
+state.pineStructureByPairTf = state.pineStructureByPairTf || {};
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -452,7 +455,7 @@ function pivotLowAt(candles, index, left, right) {
   return value;
 }
 
-function buildTvStructure(candles, structurePeriod) {
+function buildTvStructureSnapshot(candles, structurePeriod) {
   let lastHigh = NaN;
   let lastLow = NaN;
   let lastHighIndex = -1;
@@ -613,6 +616,176 @@ function targetLevels(direction, entry, atr14) {
   };
 }
 
+
+function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
+  const key = pair + "|" + tf;
+  const previous = state.pineStructureByPairTf[key] || null;
+
+  // Bootstrap from a long history on first run, after state loss/redeploy,
+  // period change, or when the stored candle is no longer represented.
+  const lastClosedTime = candles.length ? candles[candles.length - 1].time : null;
+  const storedTime = previous?.lastProcessedCandleTime || null;
+  const storedStillInWindow =
+    storedTime && candles.some(c => c.time === storedTime);
+
+  if (
+    !previous ||
+    Number(previous.structurePeriod) !== Number(structurePeriod) ||
+    !storedStillInWindow
+  ) {
+    const snap = buildTvStructureSnapshot(candles, structurePeriod);
+    state.pineStructureByPairTf[key] = {
+      structurePeriod,
+      lastProcessedCandleTime: lastClosedTime,
+      lastHigh: snap.lastHigh,
+      lastLow: snap.lastLow,
+      lastHighTime:
+        snap.lastHighIndex >= 0 ? candles[snap.lastHighIndex]?.time || null : null,
+      lastLowTime:
+        snap.lastLowIndex >= 0 ? candles[snap.lastLowIndex]?.time || null : null,
+      highBreakPending: snap.highBreakPending,
+      lowBreakPending: snap.lowBreakPending,
+      trendDirection: snap.trendDirection,
+      lastBreak: snap.lastBreak,
+      pivotHighHistory: snap.pivotHighHistory || [],
+      pivotLowHistory: snap.pivotLowHistory || []
+    };
+    saveState(state);
+    return { ...snap, persistentMode: "BOOTSTRAP" };
+  }
+
+  // Reconstruct enough context to confirm pivots whose right bars have just
+  // completed, but preserve Pine `var` state from the previous scan.
+  let lastHigh = Number(previous.lastHigh);
+  let lastLow = Number(previous.lastLow);
+  let highBreakPending = !!previous.highBreakPending;
+  let lowBreakPending = !!previous.lowBreakPending;
+  let trendDirection = Number(previous.trendDirection || 0);
+  let lastBreak = previous.lastBreak || null;
+  let pivotHighHistory = Array.isArray(previous.pivotHighHistory)
+    ? previous.pivotHighHistory.slice(-5) : [];
+  let pivotLowHistory = Array.isArray(previous.pivotLowHistory)
+    ? previous.pivotLowHistory.slice(-5) : [];
+
+  const startIndex = candles.findIndex(c => c.time === storedTime);
+  const firstNewIndex = startIndex >= 0 ? startIndex + 1 : 0;
+
+  for (let i = firstNewIndex; i < candles.length; i++) {
+    const pivotIndex = i - structurePeriod;
+
+    if (pivotIndex >= 0) {
+      const ph = pivotHighAt(candles, pivotIndex, structurePeriod, structurePeriod);
+      const pl = pivotLowAt(candles, pivotIndex, structurePeriod, structurePeriod);
+
+      if (ph !== null) {
+        lastHigh = ph;
+        previous.lastHighTime = candles[pivotIndex]?.time || null;
+        highBreakPending = true;
+        pivotHighHistory.push({
+          price: ph, index: pivotIndex, time: previous.lastHighTime
+        });
+        pivotHighHistory = pivotHighHistory.slice(-5);
+      }
+
+      if (pl !== null) {
+        lastLow = pl;
+        previous.lastLowTime = candles[pivotIndex]?.time || null;
+        lowBreakPending = true;
+        pivotLowHistory.push({
+          price: pl, index: pivotIndex, time: previous.lastLowTime
+        });
+        pivotLowHistory = pivotLowHistory.slice(-5);
+      }
+    }
+
+    const candle = candles[i];
+    const previousTrend = trendDirection;
+    let highBroken = false;
+    let lowBroken = false;
+
+    if (highBreakPending && Number.isFinite(lastHigh) && candle.close > lastHigh) {
+      highBroken = true;
+      highBreakPending = false;
+    }
+    if (lowBreakPending && Number.isFinite(lastLow) && candle.close < lastLow) {
+      lowBroken = true;
+      lowBreakPending = false;
+    }
+
+    if (highBroken) trendDirection = 1;
+    else if (lowBroken) trendDirection = -1;
+
+    const choch =
+      (previousTrend === -1 && trendDirection === 1) ||
+      (previousTrend === 1 && trendDirection === -1);
+
+    if (highBroken) {
+      lastBreak = {
+        index: i,
+        direction: "LONG",
+        type: choch ? "CHoCH BULLISH" : "BOS BULLISH",
+        structure: lastHigh,
+        structureTime: previous.lastHighTime || null,
+        candleTime: candle.time
+      };
+    } else if (lowBroken) {
+      lastBreak = {
+        index: i,
+        direction: "SHORT",
+        type: choch ? "CHoCH BEARISH" : "BOS BEARISH",
+        structure: lastLow,
+        structureTime: previous.lastLowTime || null,
+        candleTime: candle.time
+      };
+    }
+  }
+
+  const lastHighIndex = candles.findIndex(c => c.time === previous.lastHighTime);
+  const lastLowIndex = candles.findIndex(c => c.time === previous.lastLowTime);
+
+  const result = {
+    lastHigh,
+    lastLow,
+    lastHighIndex,
+    lastLowIndex,
+    highBreakPending,
+    lowBreakPending,
+    trendDirection,
+    lastBreak,
+    pivotHighHistory,
+    pivotLowHistory,
+    persistentMode: "INCREMENTAL",
+    pineState: {
+      lastHigh,
+      lastLow,
+      lastHighTime: previous.lastHighTime || null,
+      lastLowTime: previous.lastLowTime || null,
+      highBreakPending,
+      lowBreakPending,
+      trendDirection,
+      lastProcessedCandleTime: lastClosedTime
+    }
+  };
+
+  state.pineStructureByPairTf[key] = {
+    structurePeriod,
+    lastProcessedCandleTime: lastClosedTime,
+    lastHigh,
+    lastLow,
+    lastHighTime: previous.lastHighTime || null,
+    lastLowTime: previous.lastLowTime || null,
+    highBreakPending,
+    lowBreakPending,
+    trendDirection,
+    lastBreak,
+    pivotHighHistory,
+    pivotLowHistory
+  };
+  saveState(state);
+
+  return result;
+}
+
 function analyzeSmc(pair, tf, candles, pairConfig = {}) {
   /*
     Twelve Data normally includes the currently-forming candle as the final item.
@@ -647,7 +820,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
   }
 
   // Build structure using CLOSED candles only.
-  const structure = buildTvStructure(closed, structurePeriod);
+  const structure = buildTvStructurePersistent(pair, tf, closed, structurePeriod);
 
   // Indicator calculations.
   // For confirmed ENTRY use closed-bar values.
@@ -780,6 +953,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
         pivotHighHistory: structure.pivotHighHistory,
         pivotLowHistory: structure.pivotLowHistory,
         pineState: structure.pineState,
+        persistentMode: structure.persistentMode,
         ema9: closedEma9,
         ema20: closedEma20,
         emaLong: closedEmaLong,
@@ -901,6 +1075,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
         pivotHighHistory: structure.pivotHighHistory,
         pivotLowHistory: structure.pivotLowHistory,
         pineState: structure.pineState,
+        persistentMode: structure.persistentMode,
         highBreakPending: structure.highBreakPending,
         lowBreakPending: structure.lowBreakPending,
         prepareDistancePct,
@@ -1032,6 +1207,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       pivotHighHistory: structure.pivotHighHistory,
       pivotLowHistory: structure.pivotLowHistory,
       pineState: structure.pineState,
+      persistentMode: structure.persistentMode,
       highBreakPending: structure.highBreakPending,
       lowBreakPending: structure.lowBreakPending,
       prepareDistancePct,
@@ -1051,7 +1227,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       tp3: prepareLevels.tp3,
       sl: prepareLevels.sl
     },
-    sourceMode: "PINE_STATE_EMA_ACTIONABLE_PREPARE",
+    sourceMode: "PERSISTENT_PINE_STATE_EMA_ACTIONABLE_PREPARE",
     createdAt: new Date().toISOString()
   };
 }
@@ -1281,6 +1457,7 @@ function printTvDiagnostic(signal, pair, tf) {
     pivotHighHistory: d.pivotHighHistory,
     pivotLowHistory: d.pivotLowHistory,
     pineState: d.pineState,
+    persistentMode: d.persistentMode,
     highBreakPending: d.highBreakPending,
     lowBreakPending: d.lowBreakPending,
     prepareDistancePct: d.prepareDistancePct,
@@ -1476,7 +1653,7 @@ async function runScannerForTf(tf, mode) {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V10.9 PINE-STATE MATCH");
+  console.log("DEWA SMC SERVER SCANNER WORKER V11.0 PERSISTENT PINE STATE");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V11.0 PERSISTENT PINE STATE
+  DEWA SMC SERVER-SIDE SCANNER WORKER V11.1 BREAK FRESHNESS FIX
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -304,6 +304,7 @@ const state = loadState();
 state.lastSignalByPairTf = state.lastSignalByPairTf || {};
 state.lastDirectionByPairTf = state.lastDirectionByPairTf || {};
 state.pineStructureByPairTf = state.pineStructureByPairTf || {};
+state.lastConsumedBreakTimeByPairTf = state.lastConsumedBreakTimeByPairTf || {};
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -897,13 +898,37 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
   // ===========================================================================
   // 1) CONFIRMED BOS / CHoCH
   // ===========================================================================
+  const lastClosedTime = lastClosed?.time || null;
+  const lastBreakTime = structure.lastBreak?.candleTime || null;
+
   const freshBreak =
     structure.lastBreak &&
-    structure.lastBreak.index === closed.length - 1
+    lastBreakTime &&
+    lastClosedTime &&
+    lastBreakTime === lastClosedTime
       ? structure.lastBreak
       : null;
 
   if (freshBreak) {
+    const breakStateKey = pair + "|" + tf;
+    const consumedBreakTime =
+      state.lastConsumedBreakTimeByPairTf[breakStateKey] || null;
+
+    if (consumedBreakTime === freshBreak.candleTime) {
+      return {
+        valid: false,
+        reason: "BREAKOUT ALREADY CONSUMED",
+        direction: freshBreak.direction,
+        mainSignal: freshBreak.type,
+        structureHigh: structure.lastHigh,
+        structureLow: structure.lastLow
+      };
+    }
+
+    state.lastConsumedBreakTimeByPairTf[breakStateKey] =
+      freshBreak.candleTime;
+    saveState(state);
+
     const emaOk =
       freshBreak.direction === "LONG"
         ? closedEmaLong
@@ -1653,7 +1678,7 @@ async function runScannerForTf(tf, mode) {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V11.0 PERSISTENT PINE STATE");
+  console.log("DEWA SMC SERVER SCANNER WORKER V11.1 BREAK FRESHNESS FIX");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

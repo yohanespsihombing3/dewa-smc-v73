@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V11.1 BREAK FRESHNESS FIX
+  DEWA SMC SERVER-SIDE SCANNER WORKER V11.2 STRUCTURE TIME + BREAK FRESHNESS MATCH
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -659,6 +659,8 @@ function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
   // completed, but preserve Pine `var` state from the previous scan.
   let lastHigh = Number(previous.lastHigh);
   let lastLow = Number(previous.lastLow);
+  let lastHighTime = previous.lastHighTime || null;
+  let lastLowTime = previous.lastLowTime || null;
   let highBreakPending = !!previous.highBreakPending;
   let lowBreakPending = !!previous.lowBreakPending;
   let trendDirection = Number(previous.trendDirection || 0);
@@ -726,7 +728,7 @@ function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
         direction: "LONG",
         type: choch ? "CHoCH BULLISH" : "BOS BULLISH",
         structure: lastHigh,
-        structureTime: previous.lastHighTime || null,
+        structureTime: lastHighTime,
         candleTime: candle.time
       };
     } else if (lowBroken) {
@@ -735,14 +737,14 @@ function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
         direction: "SHORT",
         type: choch ? "CHoCH BEARISH" : "BOS BEARISH",
         structure: lastLow,
-        structureTime: previous.lastLowTime || null,
+        structureTime: lastLowTime,
         candleTime: candle.time
       };
     }
   }
 
-  const lastHighIndex = candles.findIndex(c => c.time === previous.lastHighTime);
-  const lastLowIndex = candles.findIndex(c => c.time === previous.lastLowTime);
+  const lastHighIndex = candles.findIndex(c => c.time === lastHighTime);
+  const lastLowIndex = candles.findIndex(c => c.time === lastLowTime);
 
   const result = {
     lastHigh,
@@ -759,8 +761,8 @@ function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
     pineState: {
       lastHigh,
       lastLow,
-      lastHighTime: previous.lastHighTime || null,
-      lastLowTime: previous.lastLowTime || null,
+      lastHighTime,
+      lastLowTime,
       highBreakPending,
       lowBreakPending,
       trendDirection,
@@ -773,8 +775,8 @@ function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
     lastProcessedCandleTime: lastClosedTime,
     lastHigh,
     lastLow,
-    lastHighTime: previous.lastHighTime || null,
-    lastLowTime: previous.lastLowTime || null,
+    lastHighTime,
+    lastLowTime,
     highBreakPending,
     lowBreakPending,
     trendDirection,
@@ -901,6 +903,12 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
   const lastClosedTime = lastClosed?.time || null;
   const lastBreakTime = structure.lastBreak?.candleTime || null;
 
+  // V11.2 hard guard: an old break may remain in persistent history,
+  // but it is never an actionable/current BREAKOUT.
+  if (lastBreakTime && lastClosedTime && lastBreakTime !== lastClosedTime) {
+    structure.lastBreak = null;
+  }
+
   const freshBreak =
     structure.lastBreak &&
     lastBreakTime &&
@@ -947,6 +955,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       structureLow: structure.lastLow,
       diagnostic: {
         mode: "BREAKOUT",
+        scannerVersion: "V11.2",
         feedSymbol: pairConfig.dataSymbol || pair,
         pair,
         tf: tfLabel(tf),
@@ -1069,6 +1078,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       volatilityOk: liveVolatilityOk,
       diagnostic: {
         mode: "SCAN",
+      scannerVersion: "V11.2",
         feedSymbol: pairConfig.dataSymbol || pair,
         pair,
         tf: tfLabel(tf),
@@ -1678,7 +1688,7 @@ async function runScannerForTf(tf, mode) {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V11.1 BREAK FRESHNESS FIX");
+  console.log("DEWA SMC SERVER SCANNER WORKER V11.2 STRUCTURE TIME + BREAK FRESHNESS MATCH");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

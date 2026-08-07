@@ -1,65 +1,1094 @@
- Using Node.js version 24.14.1 (default)
-==> Docs on specifying a Node.js version: https://render.com/docs/node-version
-==> Running build command 'npm install'...
-up to date, audited 111 packages in 582ms
-19 packages are looking for funding
-  run `npm fund` for details
-2 vulnerabilities (1 low, 1 moderate)
-To address issues that do not require attention, run:
-  npm audit fix
-To address all issues (including breaking changes), run:
-  npm audit fix --force
-Run `npm audit` for details.
-==> Uploading build...
-==> Uploaded in 1.7s. Compression took 0.4s
-==> Build successful 🎉
-==> Deploying...
-==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
-==> Running 'npm start'
-> dewa-smc-v75-ea-pending-chain-final@7.5.0 start
-> node server.js
-==============================================
-DEWA SMC SERVER SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME
-APP: https://dewa-smc-ai.onrender.com
-PAIR ENV FALLBACK: XAU/USD, BTC/USD, ETH/USD, EUR/USD, GBP/USD
-TF ENV FALLBACK: 5, 15
-FAST M5: 60 detik
-SLOW M15: 300 detik
-CONFIG REFRESH: 300 detik
-==============================================
-[WORKER START ERROR] Error: WORKER_ADMIN_EMAIL / WORKER_ADMIN_PASSWORD belum diisi
-    at login (/opt/render/project/src/server.js:1350:11)
-    at main (/opt/render/project/src/server.js:1765:9)
-    at Object.<anonymous> (/opt/render/project/src/server.js:1794:1)
-    at Module._compile (node:internal/modules/cjs/loader:1812:14)
-    at Object..js (node:internal/modules/cjs/loader:1943:10)
-    at Module.load (node:internal/modules/cjs/loader:1533:32)
-    at Module._load (node:internal/modules/cjs/loader:1335:12)
-    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
-    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
-    at node:internal/main/run_main_module:33:47
-==> Exited with status 1
-==> Common ways to troubleshoot your deploy: https://render.com/docs/troubleshooting-deploys
-==> Running 'npm start'
-> dewa-smc-v75-ea-pending-chain-final@7.5.0 start
-> node server.js
-==============================================
-DEWA SMC SERVER SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME
-APP: https://dewa-smc-ai.onrender.com
-PAIR ENV FALLBACK: XAU/USD, BTC/USD, ETH/USD, EUR/USD, GBP/USD
-TF ENV FALLBACK: 5, 15
-FAST M5: 60 detik
-SLOW M15: 300 detik
-CONFIG REFRESH: 300 detik
-==============================================
-[WORKER START ERROR] Error: WORKER_ADMIN_EMAIL / WORKER_ADMIN_PASSWORD belum diisi
-    at login (/opt/render/project/src/server.js:1350:11)
-    at main (/opt/render/project/src/server.js:1765:9)
-    at Object.<anonymous> (/opt/render/project/src/server.js:1794:1)
-    at Module._compile (node:internal/modules/cjs/loader:1812:14)
-    at Object..js (node:internal/modules/cjs/loader:1943:10)
-    at Module.load (node:internal/modules/cjs/loader:1533:32)
-    at Module._load (node:internal/modules/cjs/loader:1335:12)
-    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
-    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
-    at node:internal/main/run_main_module:33:47
+require('dotenv').config();
+console.log('DEWA SMC V12 ONE SOURCE OF TRUTH: WEB = WORKER = EA');
+const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
+const { createClient } = require('@supabase/supabase-js');
+const { createEaV9Store } = require('./lib/ea-v9-store');
+const { registerV10Admin } = require('./lib/v10-admin');
+const app=express(),PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET||'change-me',CACHE_MS=Number(process.env.CACHE_SECONDS||120)*1000;
+const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
+const EA_SIGNAL_MAX_AGE_MINUTES = Math.max(
+  1,
+  Number(process.env.EA_SIGNAL_MAX_AGE_MINUTES || 20)
+);
+const EA_SIGNAL_MAX_AGE_MS = EA_SIGNAL_MAX_AGE_MINUTES * 60 * 1000;
+
+const supabase = USE_SUPABASE
+  ? createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SECRET_KEY
+    )
+  : null;
+const KEYS=[process.env.TWELVE_DATA_API_KEY_1,process.env.TWELVE_DATA_API_KEY_2,process.env.TWELVE_DATA_API_KEY_3].filter(Boolean);
+let keyIndex=0;const cache=new Map(),DATA=path.join(__dirname,'data'),UF=path.join(DATA,'users.json'),SF=path.join(DATA,'signals.json'),EF=path.join(DATA,'ea-signals.json'),PF=path.join(DATA,'push-subscriptions.json'),KF=path.join(DATA,'push-keys.json');
+const eaV9Store=createEaV9Store({dataDir:DATA,retentionDays:Number(process.env.EA_QUEUE_RETENTION_DAYS||14),maxEvents:Number(process.env.EA_QUEUE_MAX_EVENTS||10000)});
+app.use(cors());app.use(express.json({limit:'3mb'}));app.use(express.static(path.join(__dirname,'public')));
+function ensure(){if(!fs.existsSync(DATA))fs.mkdirSync(DATA,{recursive:true});for(const [f,d] of [[UF,'{"users":[]}'],[SF,'{"signals":[]}'],[EF,'{"signals":[]}'],[PF,'{"subscriptions":[]}']])if(!fs.existsSync(f))fs.writeFileSync(f,d);if(!fs.existsSync(KF))fs.writeFileSync(KF,JSON.stringify(webpush.generateVAPIDKeys(),null,2))}
+function read(f,x){ensure();try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return x}}function write(f,d){ensure();fs.writeFileSync(f,JSON.stringify(d,null,2))}
+function db(){return read(UF,{users:[]})}
+function saveDb(d){write(UF,d)}
+function sigdb(){return read(SF,{signals:[]})}
+function saveSig(d){write(SF,d)}
+function eadb(){return read(EF,{signals:[]})}
+function saveEa(d){write(EF,d)}
+
+let PUSH_CACHE = {subscriptions:[]};
+
+async function loadPushFromSupabase(){
+  if(!USE_SUPABASE || !supabase) return read(PF,{subscriptions:[]});
+
+  const { data, error } = await supabase
+    .from('push_subscriptions_data')
+    .select('id,data');
+
+  if(error){
+    console.error('Supabase load push error:', error.message);
+    return read(PF,{subscriptions:[]});
+  }
+
+  return {
+    subscriptions: (data || []).map(x => x.data)
+  };
+}
+
+async function savePushToSupabase(d){
+  if(!USE_SUPABASE || !supabase){
+    write(PF,d);
+    return;
+  }
+
+  for(const item of d.subscriptions || []){
+    await supabase
+      .from('push_subscriptions_data')
+      .upsert({
+        id: item.id || item.endpoint || uuid(),
+        data: item
+      });
+  }
+}
+
+function pushdb(){
+  return PUSH_CACHE;
+}
+
+function savePush(d){
+  PUSH_CACHE = d;
+  savePushToSupabase(d).catch(e=>console.error('Save push supabase error:',e.message));
+}
+function keys(){return read(KF,webpush.generateVAPIDKeys())}function setupPush(){let k=keys();webpush.setVapidDetails('mailto:admin@dewa.ai',k.publicKey,k.privateKey)}
+function addDays(n){let d=new Date();d.setDate(d.getDate()+Number(n||0));return d.toISOString()}function newKey(){return 'DEWA-'+crypto.randomBytes(24).toString('hex').toUpperCase()}
+function active(u){return u.role==='admin'||((u.status||'ACTIVE')==='ACTIVE'&&u.expiredAt&&new Date(u.expiredAt)>Date.now())}
+
+function normalizeEmail(value=''){
+  return String(value).toLowerCase().trim();
+}
+
+function normalizeMt5Account(value=''){
+  return String(value).replace(/\D/g,'');
+}
+
+function normalizeEaTimeframe(value=''){
+  const tf=String(value).toLowerCase().trim();
+  if(tf==='5m'||tf==='m5'||tf==='5min')return '5m';
+  if(tf==='15m'||tf==='m15'||tf==='15min')return '15m';
+  return '';
+}
+
+function normalizeEaSymbol(value=''){
+  const raw=String(value).toUpperCase().trim();
+  const compact=raw.replace(/[^A-Z0-9]/g,'');
+
+  const supported=[
+    ['XAUUSD','XAU/USD'],
+    ['XAGUSD','XAG/USD'],
+    ['BTCUSD','BTC/USD'],
+    ['ETHUSD','ETH/USD'],
+    ['EURUSD','EUR/USD'],
+    ['GBPUSD','GBP/USD'],
+    ['USDJPY','USD/JPY'],
+    ['AUDUSD','AUD/USD'],
+    ['USDCAD','USD/CAD'],
+    ['USDCHF','USD/CHF'],
+    ['NZDUSD','NZD/USD']
+  ];
+
+  for(const [brokerCode,serverPair] of supported){
+    if(compact.includes(brokerCode))return serverPair;
+  }
+
+  return '';
+}
+
+function isFreshEaSignal(signal){
+  const created=new Date(signal.createdAt||signal.updatedAt||0).getTime();
+  return Number.isFinite(created)&&created>0&&(Date.now()-created)<=EA_SIGNAL_MAX_AGE_MS;
+}
+
+function isGradeAPlus(g){return String(g||'').toUpperCase()==='A'||String(g||'').toUpperCase()==='A+'}
+function safe(u){return{id:u.id,email:u.email,role:u.role,plan:u.plan,status:u.status||'ACTIVE',expiredAt:u.expiredAt,active:active(u),mustChangePassword:!!u.mustChangePassword,eaApiKey:u.eaApiKey||'',eaEnabled:u.eaEnabled!==false,mt5Account:u.mt5Account||''}}
+function makeToken(u){return jwt.sign({id:u.id,email:u.email,role:u.role},SECRET,{expiresIn:'7d'})}
+function auth(req,res,next){try{let t=(req.headers.authorization||'').replace('Bearer ','');if(!t)throw Error('Unauthorized');let p=jwt.verify(t,SECRET),u=db().users.find(x=>x.id===p.id);if(!u)throw Error('User tidak ditemukan');if(!active(u))return res.status(403).json({error:'Akun expired / belum aktif'});req.user=u;next()}catch(e){res.status(401).json({error:e.message})}}
+
+async function eaAuth(req,res,next){
+  try{
+    const email=normalizeEmail(req.query.email);
+    const mt5=normalizeMt5Account(req.query.mt5);
+
+    if(!email||!email.includes('@')){
+      return res.status(400).json({error:'Email EA tidak valid'});
+    }
+    if(!mt5){
+      return res.status(400).json({error:'Nomor akun MT5 wajib dikirim'});
+    }
+
+    // V10.3+: EA Membership di Supabase menjadi sumber utama.
+    if(supabase){
+      const {data:member,error}=await supabase
+        .from('ea_members')
+        .select('*')
+        .eq('email',email)
+        .eq('mt5_account',mt5)
+        .maybeSingle();
+
+      if(error){
+        console.error('[EA AUTH SUPABASE]',error);
+        return res.status(503).json({error:'Validasi EA Membership gagal'});
+      }
+
+      if(member){
+        const status=String(member.status||'ACTIVE').toUpperCase();
+        const enabled=member.ea_enabled!==false;
+        const expiresAt=member.expires_at ? new Date(member.expires_at) : null;
+        const expired=expiresAt && !Number.isNaN(expiresAt.getTime()) && expiresAt.getTime()<=Date.now();
+
+        if(status!=='ACTIVE'){
+          return res.status(403).json({error:'Member EA tidak aktif'});
+        }
+        if(!enabled){
+          return res.status(403).json({error:'EA disabled'});
+        }
+        if(expired){
+          return res.status(403).json({error:'Membership EA expired'});
+        }
+
+        req.eaUser={
+          id:member.id,
+          email:member.email,
+          mt5Account:String(member.mt5_account||''),
+          eaEnabled:enabled,
+          status,
+          expiredAt:member.expires_at||null,
+          source:'SUPABASE_EA_MEMBERS'
+        };
+        req.eaMember=member;
+        req.eaMt5=mt5;
+        return next();
+      }
+
+      // Jika email ada tetapi MT5 berbeda, beri pesan yang lebih tepat.
+      const {data:emailMember,error:emailError}=await supabase
+        .from('ea_members')
+        .select('id,email,mt5_account,status,ea_enabled,expires_at')
+        .eq('email',email)
+        .limit(1)
+        .maybeSingle();
+
+      if(emailError){
+        console.error('[EA AUTH SUPABASE EMAIL]',emailError);
+        return res.status(503).json({error:'Validasi EA Membership gagal'});
+      }
+      if(emailMember){
+        return res.status(401).json({error:'Nomor akun MT5 tidak sesuai dengan EA Membership'});
+      }
+    }
+
+    // Compatibility sementara: registrasi MT5 lama tetap dapat digunakan.
+    const u=db().users.find(x=>normalizeEmail(x.email)===email);
+    if(!u){
+      return res.status(401).json({error:'Email tidak terdaftar di EA Membership'});
+    }
+    if(!active(u)){
+      return res.status(403).json({error:'Member tidak aktif / expired'});
+    }
+    if(u.eaEnabled===false){
+      return res.status(403).json({error:'EA disabled'});
+    }
+
+    const registeredMt5=normalizeMt5Account(u.mt5Account);
+    if(!registeredMt5){
+      return res.status(403).json({error:'Nomor akun MT5 belum didaftarkan'});
+    }
+    if(registeredMt5!==mt5){
+      return res.status(401).json({error:'Nomor akun MT5 tidak sesuai'});
+    }
+
+    req.eaUser=u;
+    req.eaMt5=mt5;
+    next();
+  }catch(e){
+    console.error('[EA AUTH]',e);
+    res.status(500).json({error:e.message});
+  }
+}
+async function ensureAdmin(){let d=db(),email=process.env.ADMIN_EMAIL||'admin@dewa.ai';if(!d.users.find(u=>u.email===email)){d.users.push({id:uuid(),email,passwordHash:await bcrypt.hash(process.env.ADMIN_PASSWORD||'admin12345',10),role:'admin',plan:'VIP',status:'ACTIVE',expiredAt:addDays(3650),createdAt:new Date().toISOString(),eaApiKey:newKey(),eaEnabled:true});saveDb(d);console.log('Admin created:',email)}}
+
+app.post('/api/auth/request-access',async(req,res)=>{try{let email=String(req.body.email||'').toLowerCase().trim();if(!email.includes('@'))return res.status(400).json({error:'Email tidak valid'});let d=db();if(d.users.find(u=>u.email===email))return res.status(400).json({error:'Email sudah terdaftar'});d.users.push({id:uuid(),email,passwordHash:'',role:'member',plan:'FREE',status:'PENDING',expiredAt:addDays(7),mustChangePassword:true,eaApiKey:'',eaEnabled:false,mt5Account:'',createdAt:new Date().toISOString()});saveDb(d);res.json({success:true})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/auth/register',async(req,res)=>{
+  try{
+    let email=String(req.body.email||'').toLowerCase().trim();
+    if(!email.includes('@'))return res.status(400).json({error:'Email tidak valid'});
+    let d=db();
+    if(d.users.find(u=>u.email===email))return res.status(400).json({error:'Email sudah terdaftar'});
+    d.users.push({id:uuid(),email,passwordHash:'',role:'member',plan:'FREE',status:'PENDING',expiredAt:addDays(7),mustChangePassword:true,eaApiKey:'',eaEnabled:false,mt5Account:'',createdAt:new Date().toISOString()});
+    saveDb(d);
+    res.json({success:true});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+app.post('/api/auth/login',async(req,res)=>{try{let email=String(req.body.email||'').toLowerCase().trim(),pw=String(req.body.password||''),u=db().users.find(x=>x.email===email);if(!u||!u.passwordHash||!await bcrypt.compare(pw,u.passwordHash))return res.status(401).json({error:'Login gagal'});if(!active(u))return res.status(403).json({error:'Belum approve / expired'});res.json({token:makeToken(u),user:safe(u)})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/auth/change-password',auth,async(req,res)=>{let d=db(),u=d.users.find(x=>x.id===req.user.id),p=String(req.body.password||'');if(p.length<6)return res.status(400).json({error:'Password minimal 6'});u.passwordHash=await bcrypt.hash(p,10);u.mustChangePassword=false;saveDb(d);res.json({success:true})});
+app.get('/api/auth/me',auth,(req,res)=>res.json({user:safe(req.user),limits:{maxPairs:req.user.plan==='VIP'?30:req.user.plan==='PRO'?15:3,delayMs:req.user.plan==='VIP'?2000:req.user.plan==='PRO'?5000:10000}}));
+
+app.post('/api/member/mt5-account',auth,(req,res)=>{
+  try{
+    const mt5Account=normalizeMt5Account(req.body.mt5Account);
+
+    if(!mt5Account){
+      return res.status(400).json({error:'Nomor akun MT5 wajib diisi'});
+    }
+
+    if(mt5Account.length<5||mt5Account.length>20){
+      return res.status(400).json({error:'Nomor akun MT5 tidak valid'});
+    }
+
+    const d=db();
+    const u=d.users.find(x=>x.id===req.user.id);
+
+    if(!u){
+      return res.status(404).json({error:'User tidak ditemukan'});
+    }
+
+    const duplicate=d.users.find(x=>
+      x.id!==u.id &&
+      normalizeMt5Account(x.mt5Account)===mt5Account
+    );
+
+    if(duplicate){
+      return res.status(409).json({
+        error:'Nomor akun MT5 sudah terdaftar pada member lain'
+      });
+    }
+
+    u.mt5Account=mt5Account;
+    u.eaEnabled=true;
+    u.mt5UpdatedAt=new Date().toISOString();
+    saveDb(d);
+
+    res.json({
+      success:true,
+      message:'Nomor akun MT5 berhasil disimpan',
+      user:safe(u)
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
+});
+
+app.delete('/api/member/mt5-account',auth,(req,res)=>{
+  try{
+    const d=db();
+    const u=d.users.find(x=>x.id===req.user.id);
+
+    if(!u){
+      return res.status(404).json({error:'User tidak ditemukan'});
+    }
+
+    u.mt5Account='';
+    u.mt5UpdatedAt=new Date().toISOString();
+    saveDb(d);
+
+    res.json({
+      success:true,
+      message:'Nomor akun MT5 berhasil dihapus',
+      user:safe(u)
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
+});
+
+
+
+registerV10Admin({
+  app,
+  auth,
+  dataDir: DATA,
+  db,
+  saveDb,
+  safe,
+  addDays,
+  newKey,
+  bcrypt,
+  uuid
+});
+
+app.get('/api/admin/users',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});res.json({users:db().users.map(safe)})});
+app.post('/api/admin/approve-user',auth,async(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);if(!u)return res.status(404).json({error:'User tidak ditemukan'});let tmp=req.body.password||'DEWA123456';u.passwordHash=await bcrypt.hash(tmp,10);u.status='ACTIVE';u.plan=req.body.plan||'FREE';u.expiredAt=addDays(req.body.days||30);u.mustChangePassword=true;u.eaApiKey=u.eaApiKey||newKey();u.eaEnabled=req.body.eaEnabled!==false;u.mt5Account=String(req.body.mt5Account||'');saveDb(d);res.json({success:true,tempPassword:tmp,user:safe(u)})});
+app.post('/api/admin/update-user',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);if(!u)return res.status(404).json({error:'User tidak ditemukan'});['plan','status','mt5Account'].forEach(k=>{if(req.body[k]!==undefined)u[k]=req.body[k]});if(req.body.days)u.expiredAt=addDays(req.body.days);if(req.body.eaEnabled!==undefined)u.eaEnabled=!!req.body.eaEnabled;saveDb(d);res.json({user:safe(u)})});
+app.post('/api/admin/regenerate-ea-key',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);u.eaApiKey=newKey();u.eaEnabled=true;saveDb(d);res.json({user:safe(u)})});
+app.delete('/api/admin/delete-user/:id',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),i=d.users.findIndex(x=>x.id===req.params.id);if(i<0)return res.status(404).json({error:'Tidak ditemukan'});if(d.users[i].role==='admin')return res.status(400).json({error:'Admin tidak boleh dihapus'});let del=d.users.splice(i,1)[0];saveDb(d);res.json({success:true,deleted:del.email})});
+
+app.get('/api/ea/verify',eaAuth,(req,res)=>{
+  res.json({
+    ok:true,
+    email:req.eaUser.email,
+    mt5Account:req.eaMt5,
+    eaEnabled:req.eaUser.eaEnabled!==false,
+    active:active(req.eaUser)
+  });
+});
+
+
+app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
+  try{
+    const symbol=normalizeEaSymbol(req.query.symbol);
+    const tf=normalizeEaTimeframe(req.query.tf);
+
+    if(!symbol){
+      return res.status(400).json({
+        error:'Symbol broker tidak didukung',
+        received:String(req.query.symbol||'')
+      });
+    }
+
+    if(!tf){
+      return res.status(400).json({
+        error:'Timeframe EA hanya boleh 5m atau 15m',
+        received:String(req.query.tf||'')
+      });
+    }
+
+    const all=eadb().signals.filter(s=>{
+      const engine=String(s.engine||'').toUpperCase();
+      const signalName=String(s.signal||'').toUpperCase();
+      const pair=normalizeEaSymbol(s.pair);
+      const signalTf=normalizeEaTimeframe(s.tf);
+      const isEntry=['PREPARE LONG','PREPARE SHORT'].includes(signalName);
+      const requestedEngine=String(req.query.engine||'SMC').toUpperCase();
+      const isSmc=engine.includes('SMC')&&!engine.includes('HYBRID');
+      const isSniper=engine.includes('SNIPER')&&!engine.includes('HYBRID');
+      const isHybrid=engine.includes('HYBRID');
+      const engineMatch=
+        (requestedEngine==='SMC' && isSmc) ||
+        (requestedEngine==='SNIPER' && isSniper) ||
+        (requestedEngine==='HYBRID' && isHybrid);
+
+      return (
+        isEntry &&
+        String(s.emaConfirm||'').toUpperCase()==='YES' &&
+        engineMatch &&
+        pair===symbol &&
+        signalTf===tf &&
+        String(s.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED' &&
+        String((s.execution&&s.execution.status)||'NEW').toUpperCase()!=='SUPERSEDED' &&
+        isFreshEaSignal(s)
+      );
+    });
+
+    const rank=s=>{
+      const e=String(s.engine||'').toUpperCase();
+      if(e.includes('SMC')&&!e.includes('HYBRID'))return 1;
+      if(e.includes('SNIPER')&&!e.includes('HYBRID'))return 2;
+      return 9;
+    };
+
+    all.sort((a,b)=>{
+      const pa=rank(a),pb=rank(b);
+      if(pa!==pb)return pa-pb;
+      return new Date(b.createdAt||b.updatedAt||0)-new Date(a.createdAt||a.updatedAt||0);
+    });
+
+    const latest=all[0]||null;
+
+    if(!latest){
+      return res.json({
+        ok:true,
+        authenticatedBy:'email+mt5',
+        symbol,
+        tf,
+        maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
+        priority:'LATEST ACTIONABLE PREPARE + EMA YES',
+        id:null,
+        signalId:null,
+        signal:null,
+        status:'NO_SIGNAL',
+        direction:null
+      });
+    }
+
+    const rawSignal=String(latest.signal||'').trim().toUpperCase();
+    const map={
+      'OPEN LONG':['OPEN_LONG','LONG'],
+      'OPEN SHORT':['OPEN_SHORT','SHORT'],
+      'REVERSE LONG':['REVERSE_LONG','LONG'],
+      'REVERSE SHORT':['REVERSE_SHORT','SHORT'],
+      'WAIT LONG':['PREPARE_LONG','LONG'],
+      'PREPARE LONG':['PREPARE_LONG','LONG'],
+      'WAIT SHORT':['PREPARE_SHORT','SHORT'],
+      'PREPARE SHORT':['PREPARE_SHORT','SHORT'],
+      'TP1':['TP1_HIT',null],
+      'TP1 HIT':['TP1_HIT',null],
+      'TP2':['TP2_HIT',null],
+      'TP2 HIT':['TP2_HIT',null],
+      'TP3':['TP3_HIT',null],
+      'TP3 HIT':['TP3_HIT',null],
+      'SL':['STOP_LOSS',null],
+      'STOP LOSS':['STOP_LOSS',null],
+      'STOP_LOSS':['STOP_LOSS',null],
+      'CANCELLED':['CANCELLED',null],
+      'CLOSED':['CLOSED',null],
+      'NO TRADE':['NO_TRADE',null],
+      'NO_TRADE':['NO_TRADE',null]
+    };
+    const [status,direction]=map[rawSignal]||['UNKNOWN',latest.direction||null];
+
+    return res.json({
+      ok:true,
+      authenticatedBy:'email+mt5',
+      symbol,
+      tf,
+      maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
+      priority:'LATEST ACTIONABLE PREPARE + EMA YES',
+      id:String(latest.id||''),
+      signalId:String(latest.id||''),
+      key:latest.key||'',
+      signal:rawSignal,
+      status,
+      direction,
+      engine:String(latest.engine||''),
+      grade:String(latest.grade||''),
+      emaConfirm:String(latest.emaConfirm||''),
+      lifecycleStatus:String(latest.lifecycleStatus||'ACTIVE'),
+      supersedesSignalId:String(latest.supersedesSignalId||''),
+      entry:Number(latest.entry||0),
+      tp1:Number(latest.tp1||0),
+      tp2:Number(latest.tp2||0),
+      tp3:Number(latest.tp3||0),
+      sl:Number(latest.sl||0),
+      createdAt:latest.createdAt||latest.updatedAt||null
+    });
+  }catch(err){
+    console.error('latest-signal error:',err);
+    return res.status(500).json({
+      ok:false,
+      error:err.message||'Gagal mengambil signal'
+    });
+  }
+});
+
+app.get('/api/ea/signals',eaAuth,(req,res)=>{
+  try{
+    const afterSequence=Math.max(0,Number(req.query.afterSequence||0));
+    const limit=Math.min(200,Math.max(1,Number(req.query.limit||50)));
+    const result=eaV9Store.getEvents(afterSequence,limit);
+
+    return res.json({
+      ok:true,
+      authenticatedBy:'email+mt5',
+      account:req.eaMt5,
+      afterSequence,
+      lastSequence:result.lastSequence,
+      events:result.events
+    });
+  }catch(err){
+    console.error('ea signals queue error:',err);
+    return res.status(500).json({
+      ok:false,
+      error:err.message||'Gagal mengambil queue'
+    });
+  }
+});
+
+app.post('/api/ea/signal-ack',eaAuth,(req,res)=>{
+  try{
+    const ack=eaV9Store.upsertAck(req.eaMt5,req.body||{});
+    return res.json({ok:true,ack});
+  }catch(err){
+    return res.status(err.statusCode||500).json({
+      ok:false,
+      error:err.message||'Gagal menyimpan ACK'
+    });
+  }
+});
+
+app.post('/api/ea/update-execution',eaAuth,(req,res)=>{
+  try{
+    const body=req.body||{};
+    const signalId=String(body.signalId||'').trim();
+    const nextStatus=String(
+      body.execution_status||
+      body.executionStatus||
+      body.status||
+      ''
+    ).trim().toUpperCase();
+
+    if(!signalId){
+      return res.status(400).json({
+        ok:false,
+        error:'signalId wajib diisi'
+      });
+    }
+
+    const allowedStatuses=[
+      'NEW',
+      'EXECUTED',
+      'TP1',
+      'TP2',
+      'TP3',
+      'BREAKEVEN',
+      'PARTIAL_CLOSE',
+      'STOP_LOSS',
+      'CLOSED',
+      'CANCELLED',
+      'SUPERSEDED',
+      'ERROR'
+    ];
+
+    if(!allowedStatuses.includes(nextStatus)){
+      return res.status(400).json({
+        ok:false,
+        error:'execution status tidak valid'
+      });
+    }
+
+    const ed=eadb();
+
+    const item=ed.signals.find(
+      x=>String(x.id)===signalId
+    );
+
+    if(!item){
+      return res.status(404).json({
+        ok:false,
+        error:'Signal tidak ditemukan'
+      });
+    }
+
+    const now=new Date().toISOString();
+
+    item.execution={
+      ...(item.execution||{}),
+      status:nextStatus,
+      updatedAt:now
+    };
+
+    if(body.ticket!==undefined)
+      item.execution.ticket=body.ticket;
+
+    if(body.volume!==undefined)
+      item.execution.volume=Number(body.volume);
+
+    if(body.fill_price!==undefined)
+      item.execution.fillPrice=Number(body.fill_price);
+
+    if(body.fillPrice!==undefined)
+      item.execution.fillPrice=Number(body.fillPrice);
+
+    if(body.close_price!==undefined)
+      item.execution.closePrice=Number(body.close_price);
+
+    if(body.closePrice!==undefined)
+      item.execution.closePrice=Number(body.closePrice);
+
+    if(body.profit!==undefined)
+      item.execution.profit=Number(body.profit);
+
+    if(nextStatus==='EXECUTED'){
+      item.execution.executedAt=
+        item.execution.executedAt||now;
+    }
+
+    if([
+      'TP3',
+      'STOP_LOSS',
+      'CLOSED',
+      'CANCELLED',
+      'SUPERSEDED'
+    ].includes(nextStatus)){
+      item.execution.closedAt=now;
+    }
+
+    item.updatedAt=now;
+
+    saveEa(ed);
+
+    return res.json({
+      ok:true,
+      signalId:item.id,
+      execution:item.execution
+    });
+
+  }catch(err){
+    console.error('Update execution error:',err);
+
+    return res.status(500).json({
+      ok:false,
+      error:err.message||'Gagal update execution'
+    });
+  }
+});  
+
+app.post('/api/signals/upsert',auth,(req,res)=>{
+  try{
+    const s=req.body||{};
+
+    if(!s.pair||!s.signal||!s.entry){
+      return res.status(400).json({error:'Data signal kurang'});
+    }
+
+    const d=sigdb();
+    const key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`;
+    const old=d.signals.find(x=>x.key===key);
+    const now=new Date().toISOString();
+
+    const item={
+      id:old?old.id:uuid(),
+      key,
+      ...s,
+      createdAt:s.createdAt||(old&&old.createdAt)||now,
+      updatedAt:now,
+      result:String(s.status||'').includes('SL HIT')
+        ?'LOSS'
+        :String(s.status||'').includes('TP')
+          ?'WIN'
+          :'RUNNING'
+    };
+
+    if(old) Object.assign(old,item);
+    else d.signals.push(item);
+
+    saveSig(d);
+
+    const engine=String(s.engine||'').toUpperCase();
+    const signalName=String(s.signal||'').toUpperCase();
+
+    const eligibleEngine=
+      engine.includes('SMC') ||
+      engine.includes('SNIPER') ||
+      engine.includes('HYBRID');
+
+    const eligibleSignal=[
+      'PREPARE LONG',
+      'PREPARE SHORT'
+    ].includes(signalName);
+
+    const emaYes=String(s.emaConfirm||'').toUpperCase()==='YES';
+
+    let queueEvent=null;
+    let supersededIds=[];
+
+    if(eligibleEngine&&eligibleSignal&&emaYes){
+      const ed=eadb();
+      const eo=ed.signals.find(x=>x.key===key);
+
+      const engineFamily=value=>{
+        const e=String(value||'').toUpperCase();
+        if(e.includes('HYBRID')) return 'HYBRID';
+        if(e.includes('SNIPER')) return 'SNIPER';
+        if(e.includes('SMC')) return 'SMC';
+        return e;
+      };
+
+      const pairNorm=normalizeEaSymbol(s.pair);
+      const tfNorm=normalizeEaTimeframe(s.tf);
+      const family=engineFamily(s.engine);
+
+      // Supersede only pending/NEW setups for same pair+TF+engine.
+      // Executed/open positions are intentionally left alone.
+      for(const prev of ed.signals){
+        if(eo && String(prev.id)===String(eo.id)) continue;
+
+        const samePair=normalizeEaSymbol(prev.pair)===pairNorm;
+        const sameTf=normalizeEaTimeframe(prev.tf)===tfNorm;
+        const sameFamily=engineFamily(prev.engine)===family;
+        const prevExec=String(
+          (prev.execution&&prev.execution.status)||'NEW'
+        ).toUpperCase();
+
+        if(
+          samePair &&
+          sameTf &&
+          sameFamily &&
+          prevExec==='NEW' &&
+          String(prev.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED'
+        ){
+          prev.lifecycleStatus='SUPERSEDED';
+          prev.supersededBySignalId=eo?eo.id:item.id;
+          prev.supersededAt=now;
+          prev.execution={
+            ...(prev.execution||{}),
+            status:'SUPERSEDED',
+            updatedAt:now,
+            closedAt:now
+          };
+          prev.updatedAt=now;
+          supersededIds.push(String(prev.id));
+        }
+      }
+
+      const previousUpdatedAt=eo?String(eo.updatedAt||''):null;
+
+      const ei={
+        id:eo?eo.id:item.id,
+        key,
+        pair:s.pair,
+        tf:s.tf,
+        signal:signalName,
+        status:s.status||null,
+        direction:
+          s.direction||
+          (signalName.includes('LONG')?'LONG':'SHORT'),
+        engine:s.engine,
+        grade:s.grade,
+        emaConfirm:String(s.emaConfirm||'YES'),
+        lifecycleStatus:'ACTIVE',
+        supersedesSignalId:
+          supersededIds.length
+            ?supersededIds[supersededIds.length-1]
+            :null,
+        entry:Number(s.entry||0),
+        tp1:Number(s.tp1||0),
+        tp2:Number(s.tp2||0),
+        tp3:Number(s.tp3||0),
+        sl:Number(s.sl||0),
+        createdAt:s.createdAt||(eo&&eo.createdAt)||now,
+        updatedAt:now,
+        execution:(eo&&eo.execution)||{
+          status:'NEW',
+          ticket:null,
+          volume:null,
+          fillPrice:null,
+          executedAt:null,
+          closePrice:null,
+          closedAt:null,
+          profit:null,
+          updatedAt:now
+        }
+      };
+
+      if(eo) Object.assign(eo,ei);
+      else ed.signals.push(ei);
+
+      saveEa(ed);
+
+      const shouldQueue=!eo || previousUpdatedAt!==String(ei.updatedAt||'');
+      if(shouldQueue){
+        queueEvent=eaV9Store.pushEvent(ei);
+      }
+    }
+
+    return res.json({
+      success:true,
+      signalId:item.id,
+      queued:!!queueEvent,
+      queueEvent,
+      supersededIds,
+      lifecycle:'LATEST_PENDING_WINS'
+    });
+  }catch(err){
+    console.error('signals upsert error:',err);
+    return res.status(500).json({
+      error:err.message||'Gagal menyimpan signal'
+    });
+  }
+});
+
+app.get('/api/scanner/current',auth,(req,res)=>{
+  try{
+    const tf=normalizeEaTimeframe(req.query.tf||'5');
+    const requestedEngine=String(req.query.engine||'SMC').toUpperCase();
+    const rawSymbols=String(req.query.symbols||'')
+      .split(',')
+      .map(x=>x.trim())
+      .filter(Boolean);
+
+    const requestedSymbols=rawSymbols
+      .map(normalizeEaSymbol)
+      .filter(Boolean);
+
+    const engineFamily=value=>{
+      const e=String(value||'').toUpperCase();
+      if(e.includes('HYBRID')) return 'HYBRID';
+      if(e.includes('SNIPER')) return 'SNIPER';
+      if(e.includes('SMC')) return 'SMC';
+      return e;
+    };
+
+    const requestedFamily=engineFamily(requestedEngine);
+    const terminalStatuses=[
+      'TP3',
+      'STOP_LOSS',
+      'CLOSED',
+      'CANCELLED',
+      'SUPERSEDED',
+      'ERROR'
+    ];
+
+    const all=eadb().signals
+      .filter(s=>{
+        const pair=normalizeEaSymbol(s.pair);
+        const signalTf=normalizeEaTimeframe(s.tf);
+        const exec=String(
+          (s.execution&&s.execution.status)||'NEW'
+        ).toUpperCase();
+
+        return (
+          pair &&
+          signalTf===tf &&
+          (!requestedSymbols.length || requestedSymbols.includes(pair)) &&
+          engineFamily(s.engine)===requestedFamily &&
+          String(s.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED' &&
+          !terminalStatuses.includes(exec)
+        );
+      })
+      .sort((a,b)=>
+        new Date(b.updatedAt||b.createdAt||0)-
+        new Date(a.updatedAt||a.createdAt||0)
+      );
+
+    const latestByPair=new Map();
+    for(const s of all){
+      const pair=normalizeEaSymbol(s.pair);
+      if(!latestByPair.has(pair)){
+        latestByPair.set(pair,s);
+      }
+    }
+
+    const displayStatus=(s)=>{
+      const exec=String(
+        (s.execution&&s.execution.status)||'NEW'
+      ).toUpperCase();
+      const dir=String(s.direction||'').toUpperCase();
+
+      if(exec==='EXECUTED') return 'ACTIVE '+dir;
+      if(exec==='TP1') return 'TP1 HIT';
+      if(exec==='TP2') return 'TP2 HIT';
+      if(exec==='BREAKEVEN') return 'BREAKEVEN';
+      if(exec==='PARTIAL_CLOSE') return 'PARTIAL CLOSE';
+      if(exec==='NEW'){
+        const raw=String(s.signal||'').toUpperCase();
+        if(raw==='PREPARE LONG') return 'PREPARE LONG';
+        if(raw==='PREPARE SHORT') return 'PREPARE SHORT';
+        return raw||'NEW';
+      }
+      return exec;
+    };
+
+    const rows=[];
+
+    const symbolsToRender=requestedSymbols.length
+      ?requestedSymbols
+      :[...latestByPair.keys()];
+
+    for(const pair of symbolsToRender){
+      const s=latestByPair.get(pair);
+
+      if(!s){
+        rows.push({
+          pair,
+          symbol:pair,
+          tf:tf+'m',
+          source:'SERVER WORKER',
+          signal:'WAIT',
+          status:'NO ACTIVE SIGNAL',
+          direction:null,
+          entry:null,
+          tp1:null,
+          tp2:null,
+          tp3:null,
+          sl:null,
+          signalId:null,
+          emaConfirm:null,
+          engine:requestedFamily,
+          lifecycleStatus:null,
+          executionStatus:null,
+          updatedAt:null
+        });
+        continue;
+      }
+
+      const rawSignal=String(s.signal||'').toUpperCase();
+      const direction=String(
+        s.direction||
+        (rawSignal.includes('LONG')?'LONG':
+         rawSignal.includes('SHORT')?'SHORT':'')
+      ).toUpperCase()||null;
+
+      rows.push({
+        pair,
+        symbol:pair,
+        tf:normalizeEaTimeframe(s.tf)+'m',
+        source:'SERVER WORKER',
+        signal:rawSignal,
+        status:displayStatus(s),
+        direction,
+        entry:Number(s.entry||0)||null,
+        tp1:Number(s.tp1||0)||null,
+        tp2:Number(s.tp2||0)||null,
+        tp3:Number(s.tp3||0)||null,
+        sl:Number(s.sl||0)||null,
+        signalId:String(s.id||''),
+        emaConfirm:String(s.emaConfirm||''),
+        engine:String(s.engine||''),
+        lifecycleStatus:String(s.lifecycleStatus||'ACTIVE'),
+        executionStatus:String(
+          (s.execution&&s.execution.status)||'NEW'
+        ),
+        createdAt:s.createdAt||null,
+        updatedAt:s.updatedAt||s.createdAt||null
+      });
+    }
+
+    return res.json({
+      ok:true,
+      source:'EA_SIGNAL_STORE',
+      sourceOfTruth:'BACKGROUND_WORKER',
+      tf:tf+'m',
+      engine:requestedFamily,
+      count:rows.length,
+      rows
+    });
+
+  }catch(err){
+    console.error('scanner current error:',err);
+    return res.status(500).json({
+      ok:false,
+      error:err.message||'Gagal mengambil signal scanner worker'
+    });
+  }
+});
+
+app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
+
+app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});
+app.post('/api/push/subscribe',auth,(req,res)=>{let sub=req.body.subscription;if(!sub||!sub.endpoint)return res.status(400).json({error:'Invalid'});let d=pushdb(),old=d.subscriptions.find(x=>x.endpoint===sub.endpoint);if(old)old.subscription=sub;else d.subscriptions.push({id:uuid(),userId:req.user.id,email:req.user.email,endpoint:sub.endpoint,subscription:sub});savePush(d);res.json({success:true})});
+app.post('/api/push/broadcast',auth,async(req,res)=>{
+  setupPush();
+
+  let s=req.body||{};
+  let title='⚡ DEWA SIGNAL';
+
+  if(s.signal==='OPEN LONG') title='🟢 NEW LONG';
+  else if(s.signal==='OPEN SHORT') title='🔴 NEW SHORT';
+  else if(s.signal==='REVERSE LONG') title='🔄 REVERSE LONG';
+  else if(s.signal==='REVERSE SHORT') title='🔄 REVERSE SHORT';
+
+  let action='';
+  if(s.signal==='REVERSE LONG') action='Close SELL → Open BUY\n';
+  if(s.signal==='REVERSE SHORT') action='Close BUY → Open SELL\n';
+
+  let body=`${s.pair} • ${s.signal}\n${action}Entry: ${s.entry} | TP1: ${s.tp1} | SL: ${s.sl}`;
+
+  let payload=JSON.stringify({
+    title,
+    body,
+    url:'/'
+  });
+
+  let d=pushdb();
+
+  for(let it of d.subscriptions){
+    try{
+      await webpush.sendNotification(it.subscription,payload);
+    }catch(e){}
+  }
+
+  res.json({success:true});
+});
+function getC(k){let o=cache.get(k);return o&&Date.now()-o.t<CACHE_MS?o.d:null}function setC(k,d){cache.set(k,{t:Date.now(),d})}
+app.get('/api/binance/candles',auth,async(req,res)=>{let symbol=String(req.query.symbol||'BTCUSDT').toUpperCase().replace(/[^A-Z0-9]/g,''),interval=req.query.interval||'5m',n=Math.min(Number(req.query.outputsize||180),500),ck=`B|${symbol}|${interval}|${n}`,c=getC(ck);if(c)return res.json({...c,cached:true});let r=await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${n}`),d=await r.json();if(!r.ok||!Array.isArray(d))return res.status(502).json({error:'Binance error'});let values=d.map(k=>({datetime:new Date(k[0]).toISOString(),open:k[1],high:k[2],low:k[3],close:k[4],volume:k[5]})).reverse(),out={symbol,interval,source:'Binance',values,cached:false};setC(ck,out);res.json(out)});
+app.get('/api/twelvedata/candles',auth,async(req,res)=>{if(!KEYS.length)return res.status(500).json({error:'Belum ada Twelve Data key'});let symbol=String(req.query.symbol||'XAU/USD').toUpperCase(),interval=req.query.interval||'5min',n=Math.min(Number(req.query.outputsize||180),500),ck=`T|${symbol}|${interval}|${n}`,c=getC(ck);if(c)return res.json({...c,cached:true});let key=KEYS[keyIndex++%KEYS.length],url=new URL('https://api.twelvedata.com/time_series');url.searchParams.set('symbol',symbol);url.searchParams.set('interval',interval);url.searchParams.set('outputsize',String(n));url.searchParams.set('format','JSON');url.searchParams.set('apikey',key);let r=await fetch(url),d=await r.json();if(!r.ok||d.status==='error')return res.status(502).json({error:d.message||'Twelve Data error'});let out={symbol,interval,source:'Twelve Data',values:d.values,cached:false};setC(ck,out);res.json(out)});
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    version: 'V8 EMAIL+MT5 AUTH | M5/M15 | SYMBOL NORMALIZATION',
+    version: 'V9 QUEUE+ACK | V8 COMPATIBLE | EMAIL+MT5 AUTH',
+    time: new Date().toISOString()
+  });
+});
+app.get('/api/subscriptions', (req, res) => {
+  try {
+    const data = pushdb();
+    res.json({
+      total: data.subscriptions.length,
+      subscriptions: data.subscriptions
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message
+    });
+  }
+});
+app.get('/test-notification', async (req, res) => {
+  try {
+    setupPush();
+
+    const data = pushdb();
+
+    const payload = JSON.stringify({
+      title: '🧪 TEST DEWA SMC',
+      body: 'Push notification berhasil dikirim',
+      icon: '/icon-192.png',
+      url: '/'
+    });
+
+    let sent = 0;
+
+    for (const item of data.subscriptions) {
+      try {
+        const sub = item.subscription || item;
+
+        await webpush.sendNotification(sub, payload);
+
+        sent++;
+      } catch (err) {
+        console.error(err.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      sent,
+      total: data.subscriptions.length
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+app.get('/debug/users', (req,res)=>{
+  res.json(db().users.map(u=>({
+    email:u.email,
+    role:u.role,
+    status:u.status,
+    active:active(u),
+    hasPassword:!!u.passwordHash
+  })));
+});
+
+app.get('*',(req,res)=>{
+  res.sendFile(path.join(__dirname,'public','index.html'));
+});
+
+ensureAdmin().then(async()=>{
+  setupPush();
+  PUSH_CACHE = await loadPushFromSupabase();
+
+  app.listen(PORT,'0.0.0.0',()=>{
+    console.log('DEWA SMC V8 EMAIL+MT5 AUTH running at http://0.0.0.0:'+PORT);
+    console.log('DEWA SMC V9 QUEUE+ACK running at http://0.0.0.0:'+PORT);
+    console.log('Push subscriptions loaded:', PUSH_CACHE.subscriptions.length);
+    console.log('Supabase:', USE_SUPABASE ? 'ON' : 'OFF');
+  });
+});

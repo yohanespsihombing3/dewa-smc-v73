@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V11.2 STRUCTURE TIME + BREAK FRESHNESS MATCH
+  DEWA SMC SERVER-SIDE SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -305,6 +305,7 @@ state.lastSignalByPairTf = state.lastSignalByPairTf || {};
 state.lastDirectionByPairTf = state.lastDirectionByPairTf || {};
 state.pineStructureByPairTf = state.pineStructureByPairTf || {};
 state.lastConsumedBreakTimeByPairTf = state.lastConsumedBreakTimeByPairTf || {};
+state.setupSnapshotByPairTf = state.setupSnapshotByPairTf || {};
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -682,20 +683,20 @@ function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
 
       if (ph !== null) {
         lastHigh = ph;
-        previous.lastHighTime = candles[pivotIndex]?.time || null;
+        lastHighTime = candles[pivotIndex]?.time || null;
         highBreakPending = true;
         pivotHighHistory.push({
-          price: ph, index: pivotIndex, time: previous.lastHighTime
+          price: ph, index: pivotIndex, time: lastHighTime
         });
         pivotHighHistory = pivotHighHistory.slice(-5);
       }
 
       if (pl !== null) {
         lastLow = pl;
-        previous.lastLowTime = candles[pivotIndex]?.time || null;
+        lastLowTime = candles[pivotIndex]?.time || null;
         lowBreakPending = true;
         pivotLowHistory.push({
-          price: pl, index: pivotIndex, time: previous.lastLowTime
+          price: pl, index: pivotIndex, time: lastLowTime
         });
         pivotLowHistory = pivotLowHistory.slice(-5);
       }
@@ -955,7 +956,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       structureLow: structure.lastLow,
       diagnostic: {
         mode: "BREAKOUT",
-        scannerVersion: "V11.2",
+        scannerVersion: "V11.3",
         feedSymbol: pairConfig.dataSymbol || pair,
         pair,
         tf: tfLabel(tf),
@@ -1078,7 +1079,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       volatilityOk: liveVolatilityOk,
       diagnostic: {
         mode: "SCAN",
-      scannerVersion: "V11.2",
+      scannerVersion: "V11.3",
         feedSymbol: pairConfig.dataSymbol || pair,
         pair,
         tf: tfLabel(tf),
@@ -1136,10 +1137,59 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       ? structure.lastHigh
       : structure.lastLow;
 
+  /*
+    V11.3 ATR SNAPSHOT LOCK
+    -----------------------
+    TradingView freezes the geometry of an already-created setup.
+    Do the same here: once a structure+direction becomes actionable, lock the
+    ATR used for Entry/SL/TP. Later scans may change live ATR, but MUST NOT
+    move the existing setup levels.
+
+    Snapshot identity is structure based. A new structure creates a new
+    snapshot automatically.
+  */
+  const snapshotStoreKey = pair + "|" + tf;
+  const snapshotIdentity = [
+    prepareDirection,
+    fmtPrice(prepareEntry),
+    prepareDirection === "LONG"
+      ? (structure.pineState?.lastHighTime || "")
+      : (structure.pineState?.lastLowTime || "")
+  ].join("|");
+
+  let setupSnapshot = state.setupSnapshotByPairTf[snapshotStoreKey] || null;
+
+  if (
+    !setupSnapshot ||
+    setupSnapshot.identity !== snapshotIdentity ||
+    !Number.isFinite(Number(setupSnapshot.atr14))
+  ) {
+    setupSnapshot = {
+      identity: snapshotIdentity,
+      direction: prepareDirection,
+      entry: prepareEntry,
+      atr14: liveAtr14,
+      atrSma20: liveAtrSma20,
+      structureTime:
+        prepareDirection === "LONG"
+          ? (structure.pineState?.lastHighTime || null)
+          : (structure.pineState?.lastLowTime || null),
+      signalCandleTime: current.time,
+      lastClosedTime: lastClosed.time,
+      ema9: liveEma9,
+      ema20: liveEma20,
+      createdAt: new Date().toISOString()
+    };
+    state.setupSnapshotByPairTf[snapshotStoreKey] = setupSnapshot;
+    saveState(state);
+  }
+
+  const lockedAtr14 = Number(setupSnapshot.atr14);
+
   const prepareLevels = targetLevels(
     prepareDirection,
     prepareEntry,
-    liveAtr14
+    lockedAtr14
   );
 
   const prepareSignal =
@@ -1184,7 +1234,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
     tp2: prepareLevels.tp2,
     tp3: prepareLevels.tp3,
     sl: prepareLevels.sl,
-    atr: liveAtr14,
+    atr: lockedAtr14,
     atrSma20: liveAtrSma20,
     targetRange: prepareLevels.targetRange,
     ema9: liveEma9,
@@ -1254,15 +1304,21 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       emaLong: liveEmaLong,
       emaShort: liveEmaShort,
       atr14: liveAtr14,
+      atr14Locked: lockedAtr14,
+      atrSnapshot: setupSnapshot,
       atrSma20: liveAtrSma20,
       volatilityOk: liveVolatilityOk,
       entry: prepareEntry,
+      targetCalculationMode: "ATR_SNAPSHOT_LOCKED",
+      snapshotIdentity,
+      snapshotCandleTime: setupSnapshot.signalCandleTime,
+      snapshotStructureTime: setupSnapshot.structureTime,
       tp1: prepareLevels.tp1,
       tp2: prepareLevels.tp2,
       tp3: prepareLevels.tp3,
       sl: prepareLevels.sl
     },
-    sourceMode: "PERSISTENT_PINE_STATE_EMA_ACTIONABLE_PREPARE",
+    sourceMode: "V11.3_PERSISTENT_PINE_ATR_SNAPSHOT_LOCKED",
     createdAt: new Date().toISOString()
   };
 }
@@ -1688,7 +1744,7 @@ async function runScannerForTf(tf, mode) {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V11.2 STRUCTURE TIME + BREAK FRESHNESS MATCH");
+  console.log("DEWA SMC SERVER SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

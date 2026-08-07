@@ -1,1094 +1,1797 @@
-require('dotenv').config();
-console.log('DEWA SMC V12 ONE SOURCE OF TRUTH: WEB = WORKER = EA');
-const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
-const { createClient } = require('@supabase/supabase-js');
-const { createEaV9Store } = require('./lib/ea-v9-store');
-const { registerV10Admin } = require('./lib/v10-admin');
-const app=express(),PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET||'change-me',CACHE_MS=Number(process.env.CACHE_SECONDS||120)*1000;
-const USE_SUPABASE = String(process.env.USE_SUPABASE || '').toLowerCase() === 'true';
-const EA_SIGNAL_MAX_AGE_MINUTES = Math.max(
-  1,
-  Number(process.env.EA_SIGNAL_MAX_AGE_MINUTES || 20)
-);
-const EA_SIGNAL_MAX_AGE_MS = EA_SIGNAL_MAX_AGE_MINUTES * 60 * 1000;
+require("dotenv").config();
 
-const supabase = USE_SUPABASE
-  ? createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SECRET_KEY
-    )
-  : null;
-const KEYS=[process.env.TWELVE_DATA_API_KEY_1,process.env.TWELVE_DATA_API_KEY_2,process.env.TWELVE_DATA_API_KEY_3].filter(Boolean);
-let keyIndex=0;const cache=new Map(),DATA=path.join(__dirname,'data'),UF=path.join(DATA,'users.json'),SF=path.join(DATA,'signals.json'),EF=path.join(DATA,'ea-signals.json'),PF=path.join(DATA,'push-subscriptions.json'),KF=path.join(DATA,'push-keys.json');
-const eaV9Store=createEaV9Store({dataDir:DATA,retentionDays:Number(process.env.EA_QUEUE_RETENTION_DAYS||14),maxEvents:Number(process.env.EA_QUEUE_MAX_EVENTS||10000)});
-app.use(cors());app.use(express.json({limit:'3mb'}));app.use(express.static(path.join(__dirname,'public')));
-function ensure(){if(!fs.existsSync(DATA))fs.mkdirSync(DATA,{recursive:true});for(const [f,d] of [[UF,'{"users":[]}'],[SF,'{"signals":[]}'],[EF,'{"signals":[]}'],[PF,'{"subscriptions":[]}']])if(!fs.existsSync(f))fs.writeFileSync(f,d);if(!fs.existsSync(KF))fs.writeFileSync(KF,JSON.stringify(webpush.generateVAPIDKeys(),null,2))}
-function read(f,x){ensure();try{return JSON.parse(fs.readFileSync(f,'utf8'))}catch{return x}}function write(f,d){ensure();fs.writeFileSync(f,JSON.stringify(d,null,2))}
-function db(){return read(UF,{users:[]})}
-function saveDb(d){write(UF,d)}
-function sigdb(){return read(SF,{signals:[]})}
-function saveSig(d){write(SF,d)}
-function eadb(){return read(EF,{signals:[]})}
-function saveEa(d){write(EF,d)}
+const fs = require("fs");
+const path = require("path");
+const fetch = require("node-fetch");
 
-let PUSH_CACHE = {subscriptions:[]};
+/*
+  DEWA SMC SERVER-SIDE SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME
+  ------------------------------------------------------------
+  Fungsi:
+  - Scan otomatis tanpa browser.
+  - Timeframe 5m dan 15m.
+  - SMC BOS/CHoCH + EMA 9/20 + ATR volatility.
+  - Mengirim signal Grade A/A+ ke server utama.
+  - Mengirim push notification melalui endpoint server.
+  - Mendukung PREPARE, OPEN, dan REVERSE.
+  - Market structure mengikuti Pine: ta.pivothigh/ta.pivotlow 20/20.
+  - BOS/CHoCH memakai candle body close.
+  - PREPARE memakai jarak structure 0.25% + EMA 9/20.
+  - ATR memakai Wilder/RMA seperti TradingView ta.atr(14).
+  - Volatility memakai ATR14 > SMA(ATR14,20).
 
-async function loadPushFromSupabase(){
-  if(!USE_SUPABASE || !supabase) return read(PF,{subscriptions:[]});
+  Environment wajib:
+  APP_BASE_URL=https://dewa-smc-ai.onrender.com
+  WORKER_ADMIN_EMAIL=email admin
+  WORKER_ADMIN_PASSWORD=password admin
+  TWELVE_DATA_API_KEY_1=...
+  TWELVE_DATA_API_KEY_2=...
+  TWELVE_DATA_API_KEY_3=...
 
-  const { data, error } = await supabase
-    .from('push_subscriptions_data')
-    .select('id,data');
+  Environment opsional:
+  WORKER_ENABLED=true
+  WORKER_SCAN_SECONDS=120
+  WORKER_PAIRS=XAU/USD,BTC/USD,ETH/USD,EUR/USD,GBP/USD
+  WORKER_TFS=5,15
+  WORKER_OUTPUTSIZE=180
+*/
 
-  if(error){
-    console.error('Supabase load push error:', error.message);
-    return read(PF,{subscriptions:[]});
-  }
+const APP_BASE_URL = String(
+  process.env.APP_BASE_URL || "https://dewa-smc-ai.onrender.com"
+).replace(/\/+$/, "");
+
+const ADMIN_EMAIL = String(process.env.WORKER_ADMIN_EMAIL || "").trim();
+const ADMIN_PASSWORD = String(process.env.WORKER_ADMIN_PASSWORD || "");
+const ENABLED = String(process.env.WORKER_ENABLED || "true").toLowerCase() === "true";
+const SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SCAN_SECONDS || 300));
+const FAST_SCAN_SECONDS = Math.max(30, Number(process.env.WORKER_FAST_SCAN_SECONDS || 60));
+const SLOW_SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SLOW_SCAN_SECONDS || 300));
+const OUTPUT_SIZE = Math.max(120, Math.min(500, Number(process.env.WORKER_OUTPUTSIZE || 500)));
+
+const DEFAULT_PAIRS = String(
+  process.env.WORKER_PAIRS ||
+  "XAU/USD,BTC/USD,ETH/USD,EUR/USD,GBP/USD"
+)
+  .split(",")
+  .map(x => x.trim().toUpperCase())
+  .filter(Boolean);
+
+const DEFAULT_TFS = String(process.env.WORKER_TFS || "5,15")
+  .split(",")
+  .map(x => x.trim())
+  .filter(x => x === "5" || x === "15");
+
+
+const DEFAULT_PAIR_SETTINGS = DEFAULT_PAIRS.map((symbol, index) => ({
+  symbol,
+  dataSymbol: symbol,
+  timeframes: [...DEFAULT_TFS],
+  enabled: true,
+  priority: "NORMAL",
+  structurePeriod: 20,
+  prepareDistancePct: 0.25,
+  volatilityEnabled: true,
+  minRrr: 1.5,
+  scanOrder: index
+}));
+
+let ACTIVE_PAIR_SETTINGS = [...DEFAULT_PAIR_SETTINGS];
+let LAST_CONFIG_REFRESH_AT = null;
+
+function normalizePriority(value) {
+  const priority = String(value || "NORMAL").trim().toUpperCase();
+  return ["HIGH", "NORMAL", "LOW"].includes(priority) ? priority : "NORMAL";
+}
+
+function priorityWeight(value) {
+  return { HIGH: 0, NORMAL: 1, LOW: 2 }[normalizePriority(value)];
+}
+
+function normalizeWorkerPair(raw, index = 0) {
+  const symbol = String(
+    raw?.symbol || raw?.displaySymbol || raw?.dataSymbol || raw?.data_symbol || ""
+  ).trim().toUpperCase();
+
+  const dataSymbol = String(
+    raw?.dataSymbol || raw?.data_symbol || symbol
+  ).trim().toUpperCase();
+
+  const rawTfs = Array.isArray(raw?.timeframes)
+    ? raw.timeframes
+    : DEFAULT_TFS;
+
+  const timeframes = [...new Set(
+    rawTfs.map(String).filter(tf => tf === "5" || tf === "15")
+  )];
 
   return {
-    subscriptions: (data || []).map(x => x.data)
+    symbol,
+    dataSymbol,
+    timeframes: timeframes.length ? timeframes : [...DEFAULT_TFS],
+    enabled: raw?.enabled !== false,
+    priority: normalizePriority(raw?.priority),
+    structurePeriod: Math.min(
+      60,
+      Math.max(2, Number(raw?.structurePeriod ?? raw?.structure_period ?? 20))
+    ),
+    prepareDistancePct: Math.min(
+      5,
+      Math.max(
+        0.00001,
+        Number(raw?.prepareDistancePct ?? raw?.prepare_distance_pct ?? 0.25)
+      )
+    ),
+    volatilityEnabled:
+      (raw?.volatilityEnabled ?? raw?.volatility_enabled) !== false,
+    minRrr: Math.max(
+      0.01,
+      Number(raw?.minRrr ?? raw?.min_rrr ?? 1.5)
+    ),
+    scanOrder: Number(raw?.scanOrder ?? raw?.scan_order ?? index)
   };
 }
 
-async function savePushToSupabase(d){
-  if(!USE_SUPABASE || !supabase){
-    write(PF,d);
-    return;
-  }
+function sortPairSettings(settings) {
+  return [...settings].sort((a, b) => {
+    const priorityDiff = priorityWeight(a.priority) - priorityWeight(b.priority);
+    if (priorityDiff !== 0) return priorityDiff;
 
-  for(const item of d.subscriptions || []){
-    await supabase
-      .from('push_subscriptions_data')
-      .upsert({
-        id: item.id || item.endpoint || uuid(),
-        data: item
-      });
-  }
-}
+    const orderDiff = Number(a.scanOrder || 0) - Number(b.scanOrder || 0);
+    if (orderDiff !== 0) return orderDiff;
 
-function pushdb(){
-  return PUSH_CACHE;
-}
-
-function savePush(d){
-  PUSH_CACHE = d;
-  savePushToSupabase(d).catch(e=>console.error('Save push supabase error:',e.message));
-}
-function keys(){return read(KF,webpush.generateVAPIDKeys())}function setupPush(){let k=keys();webpush.setVapidDetails('mailto:admin@dewa.ai',k.publicKey,k.privateKey)}
-function addDays(n){let d=new Date();d.setDate(d.getDate()+Number(n||0));return d.toISOString()}function newKey(){return 'DEWA-'+crypto.randomBytes(24).toString('hex').toUpperCase()}
-function active(u){return u.role==='admin'||((u.status||'ACTIVE')==='ACTIVE'&&u.expiredAt&&new Date(u.expiredAt)>Date.now())}
-
-function normalizeEmail(value=''){
-  return String(value).toLowerCase().trim();
-}
-
-function normalizeMt5Account(value=''){
-  return String(value).replace(/\D/g,'');
-}
-
-function normalizeEaTimeframe(value=''){
-  const tf=String(value).toLowerCase().trim();
-  if(tf==='5m'||tf==='m5'||tf==='5min')return '5m';
-  if(tf==='15m'||tf==='m15'||tf==='15min')return '15m';
-  return '';
-}
-
-function normalizeEaSymbol(value=''){
-  const raw=String(value).toUpperCase().trim();
-  const compact=raw.replace(/[^A-Z0-9]/g,'');
-
-  const supported=[
-    ['XAUUSD','XAU/USD'],
-    ['XAGUSD','XAG/USD'],
-    ['BTCUSD','BTC/USD'],
-    ['ETHUSD','ETH/USD'],
-    ['EURUSD','EUR/USD'],
-    ['GBPUSD','GBP/USD'],
-    ['USDJPY','USD/JPY'],
-    ['AUDUSD','AUD/USD'],
-    ['USDCAD','USD/CAD'],
-    ['USDCHF','USD/CHF'],
-    ['NZDUSD','NZD/USD']
-  ];
-
-  for(const [brokerCode,serverPair] of supported){
-    if(compact.includes(brokerCode))return serverPair;
-  }
-
-  return '';
-}
-
-function isFreshEaSignal(signal){
-  const created=new Date(signal.createdAt||signal.updatedAt||0).getTime();
-  return Number.isFinite(created)&&created>0&&(Date.now()-created)<=EA_SIGNAL_MAX_AGE_MS;
-}
-
-function isGradeAPlus(g){return String(g||'').toUpperCase()==='A'||String(g||'').toUpperCase()==='A+'}
-function safe(u){return{id:u.id,email:u.email,role:u.role,plan:u.plan,status:u.status||'ACTIVE',expiredAt:u.expiredAt,active:active(u),mustChangePassword:!!u.mustChangePassword,eaApiKey:u.eaApiKey||'',eaEnabled:u.eaEnabled!==false,mt5Account:u.mt5Account||''}}
-function makeToken(u){return jwt.sign({id:u.id,email:u.email,role:u.role},SECRET,{expiresIn:'7d'})}
-function auth(req,res,next){try{let t=(req.headers.authorization||'').replace('Bearer ','');if(!t)throw Error('Unauthorized');let p=jwt.verify(t,SECRET),u=db().users.find(x=>x.id===p.id);if(!u)throw Error('User tidak ditemukan');if(!active(u))return res.status(403).json({error:'Akun expired / belum aktif'});req.user=u;next()}catch(e){res.status(401).json({error:e.message})}}
-
-async function eaAuth(req,res,next){
-  try{
-    const email=normalizeEmail(req.query.email);
-    const mt5=normalizeMt5Account(req.query.mt5);
-
-    if(!email||!email.includes('@')){
-      return res.status(400).json({error:'Email EA tidak valid'});
-    }
-    if(!mt5){
-      return res.status(400).json({error:'Nomor akun MT5 wajib dikirim'});
-    }
-
-    // V10.3+: EA Membership di Supabase menjadi sumber utama.
-    if(supabase){
-      const {data:member,error}=await supabase
-        .from('ea_members')
-        .select('*')
-        .eq('email',email)
-        .eq('mt5_account',mt5)
-        .maybeSingle();
-
-      if(error){
-        console.error('[EA AUTH SUPABASE]',error);
-        return res.status(503).json({error:'Validasi EA Membership gagal'});
-      }
-
-      if(member){
-        const status=String(member.status||'ACTIVE').toUpperCase();
-        const enabled=member.ea_enabled!==false;
-        const expiresAt=member.expires_at ? new Date(member.expires_at) : null;
-        const expired=expiresAt && !Number.isNaN(expiresAt.getTime()) && expiresAt.getTime()<=Date.now();
-
-        if(status!=='ACTIVE'){
-          return res.status(403).json({error:'Member EA tidak aktif'});
-        }
-        if(!enabled){
-          return res.status(403).json({error:'EA disabled'});
-        }
-        if(expired){
-          return res.status(403).json({error:'Membership EA expired'});
-        }
-
-        req.eaUser={
-          id:member.id,
-          email:member.email,
-          mt5Account:String(member.mt5_account||''),
-          eaEnabled:enabled,
-          status,
-          expiredAt:member.expires_at||null,
-          source:'SUPABASE_EA_MEMBERS'
-        };
-        req.eaMember=member;
-        req.eaMt5=mt5;
-        return next();
-      }
-
-      // Jika email ada tetapi MT5 berbeda, beri pesan yang lebih tepat.
-      const {data:emailMember,error:emailError}=await supabase
-        .from('ea_members')
-        .select('id,email,mt5_account,status,ea_enabled,expires_at')
-        .eq('email',email)
-        .limit(1)
-        .maybeSingle();
-
-      if(emailError){
-        console.error('[EA AUTH SUPABASE EMAIL]',emailError);
-        return res.status(503).json({error:'Validasi EA Membership gagal'});
-      }
-      if(emailMember){
-        return res.status(401).json({error:'Nomor akun MT5 tidak sesuai dengan EA Membership'});
-      }
-    }
-
-    // Compatibility sementara: registrasi MT5 lama tetap dapat digunakan.
-    const u=db().users.find(x=>normalizeEmail(x.email)===email);
-    if(!u){
-      return res.status(401).json({error:'Email tidak terdaftar di EA Membership'});
-    }
-    if(!active(u)){
-      return res.status(403).json({error:'Member tidak aktif / expired'});
-    }
-    if(u.eaEnabled===false){
-      return res.status(403).json({error:'EA disabled'});
-    }
-
-    const registeredMt5=normalizeMt5Account(u.mt5Account);
-    if(!registeredMt5){
-      return res.status(403).json({error:'Nomor akun MT5 belum didaftarkan'});
-    }
-    if(registeredMt5!==mt5){
-      return res.status(401).json({error:'Nomor akun MT5 tidak sesuai'});
-    }
-
-    req.eaUser=u;
-    req.eaMt5=mt5;
-    next();
-  }catch(e){
-    console.error('[EA AUTH]',e);
-    res.status(500).json({error:e.message});
-  }
-}
-async function ensureAdmin(){let d=db(),email=process.env.ADMIN_EMAIL||'admin@dewa.ai';if(!d.users.find(u=>u.email===email)){d.users.push({id:uuid(),email,passwordHash:await bcrypt.hash(process.env.ADMIN_PASSWORD||'admin12345',10),role:'admin',plan:'VIP',status:'ACTIVE',expiredAt:addDays(3650),createdAt:new Date().toISOString(),eaApiKey:newKey(),eaEnabled:true});saveDb(d);console.log('Admin created:',email)}}
-
-app.post('/api/auth/request-access',async(req,res)=>{try{let email=String(req.body.email||'').toLowerCase().trim();if(!email.includes('@'))return res.status(400).json({error:'Email tidak valid'});let d=db();if(d.users.find(u=>u.email===email))return res.status(400).json({error:'Email sudah terdaftar'});d.users.push({id:uuid(),email,passwordHash:'',role:'member',plan:'FREE',status:'PENDING',expiredAt:addDays(7),mustChangePassword:true,eaApiKey:'',eaEnabled:false,mt5Account:'',createdAt:new Date().toISOString()});saveDb(d);res.json({success:true})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/auth/register',async(req,res)=>{
-  try{
-    let email=String(req.body.email||'').toLowerCase().trim();
-    if(!email.includes('@'))return res.status(400).json({error:'Email tidak valid'});
-    let d=db();
-    if(d.users.find(u=>u.email===email))return res.status(400).json({error:'Email sudah terdaftar'});
-    d.users.push({id:uuid(),email,passwordHash:'',role:'member',plan:'FREE',status:'PENDING',expiredAt:addDays(7),mustChangePassword:true,eaApiKey:'',eaEnabled:false,mt5Account:'',createdAt:new Date().toISOString()});
-    saveDb(d);
-    res.json({success:true});
-  }catch(e){res.status(500).json({error:e.message})}
-});
-app.post('/api/auth/login',async(req,res)=>{try{let email=String(req.body.email||'').toLowerCase().trim(),pw=String(req.body.password||''),u=db().users.find(x=>x.email===email);if(!u||!u.passwordHash||!await bcrypt.compare(pw,u.passwordHash))return res.status(401).json({error:'Login gagal'});if(!active(u))return res.status(403).json({error:'Belum approve / expired'});res.json({token:makeToken(u),user:safe(u)})}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/auth/change-password',auth,async(req,res)=>{let d=db(),u=d.users.find(x=>x.id===req.user.id),p=String(req.body.password||'');if(p.length<6)return res.status(400).json({error:'Password minimal 6'});u.passwordHash=await bcrypt.hash(p,10);u.mustChangePassword=false;saveDb(d);res.json({success:true})});
-app.get('/api/auth/me',auth,(req,res)=>res.json({user:safe(req.user),limits:{maxPairs:req.user.plan==='VIP'?30:req.user.plan==='PRO'?15:3,delayMs:req.user.plan==='VIP'?2000:req.user.plan==='PRO'?5000:10000}}));
-
-app.post('/api/member/mt5-account',auth,(req,res)=>{
-  try{
-    const mt5Account=normalizeMt5Account(req.body.mt5Account);
-
-    if(!mt5Account){
-      return res.status(400).json({error:'Nomor akun MT5 wajib diisi'});
-    }
-
-    if(mt5Account.length<5||mt5Account.length>20){
-      return res.status(400).json({error:'Nomor akun MT5 tidak valid'});
-    }
-
-    const d=db();
-    const u=d.users.find(x=>x.id===req.user.id);
-
-    if(!u){
-      return res.status(404).json({error:'User tidak ditemukan'});
-    }
-
-    const duplicate=d.users.find(x=>
-      x.id!==u.id &&
-      normalizeMt5Account(x.mt5Account)===mt5Account
-    );
-
-    if(duplicate){
-      return res.status(409).json({
-        error:'Nomor akun MT5 sudah terdaftar pada member lain'
-      });
-    }
-
-    u.mt5Account=mt5Account;
-    u.eaEnabled=true;
-    u.mt5UpdatedAt=new Date().toISOString();
-    saveDb(d);
-
-    res.json({
-      success:true,
-      message:'Nomor akun MT5 berhasil disimpan',
-      user:safe(u)
-    });
-  }catch(e){
-    res.status(500).json({error:e.message});
-  }
-});
-
-app.delete('/api/member/mt5-account',auth,(req,res)=>{
-  try{
-    const d=db();
-    const u=d.users.find(x=>x.id===req.user.id);
-
-    if(!u){
-      return res.status(404).json({error:'User tidak ditemukan'});
-    }
-
-    u.mt5Account='';
-    u.mt5UpdatedAt=new Date().toISOString();
-    saveDb(d);
-
-    res.json({
-      success:true,
-      message:'Nomor akun MT5 berhasil dihapus',
-      user:safe(u)
-    });
-  }catch(e){
-    res.status(500).json({error:e.message});
-  }
-});
-
-
-
-registerV10Admin({
-  app,
-  auth,
-  dataDir: DATA,
-  db,
-  saveDb,
-  safe,
-  addDays,
-  newKey,
-  bcrypt,
-  uuid
-});
-
-app.get('/api/admin/users',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});res.json({users:db().users.map(safe)})});
-app.post('/api/admin/approve-user',auth,async(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);if(!u)return res.status(404).json({error:'User tidak ditemukan'});let tmp=req.body.password||'DEWA123456';u.passwordHash=await bcrypt.hash(tmp,10);u.status='ACTIVE';u.plan=req.body.plan||'FREE';u.expiredAt=addDays(req.body.days||30);u.mustChangePassword=true;u.eaApiKey=u.eaApiKey||newKey();u.eaEnabled=req.body.eaEnabled!==false;u.mt5Account=String(req.body.mt5Account||'');saveDb(d);res.json({success:true,tempPassword:tmp,user:safe(u)})});
-app.post('/api/admin/update-user',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);if(!u)return res.status(404).json({error:'User tidak ditemukan'});['plan','status','mt5Account'].forEach(k=>{if(req.body[k]!==undefined)u[k]=req.body[k]});if(req.body.days)u.expiredAt=addDays(req.body.days);if(req.body.eaEnabled!==undefined)u.eaEnabled=!!req.body.eaEnabled;saveDb(d);res.json({user:safe(u)})});
-app.post('/api/admin/regenerate-ea-key',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),u=d.users.find(x=>x.id===req.body.userId);u.eaApiKey=newKey();u.eaEnabled=true;saveDb(d);res.json({user:safe(u)})});
-app.delete('/api/admin/delete-user/:id',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Admin only'});let d=db(),i=d.users.findIndex(x=>x.id===req.params.id);if(i<0)return res.status(404).json({error:'Tidak ditemukan'});if(d.users[i].role==='admin')return res.status(400).json({error:'Admin tidak boleh dihapus'});let del=d.users.splice(i,1)[0];saveDb(d);res.json({success:true,deleted:del.email})});
-
-app.get('/api/ea/verify',eaAuth,(req,res)=>{
-  res.json({
-    ok:true,
-    email:req.eaUser.email,
-    mt5Account:req.eaMt5,
-    eaEnabled:req.eaUser.eaEnabled!==false,
-    active:active(req.eaUser)
+    return a.symbol.localeCompare(b.symbol);
   });
-});
+}
 
+async function refreshWorkerConfig() {
+  try {
+    const config = await authorizedApi("/api/worker/config");
 
-app.get('/api/ea/latest-signal',eaAuth,(req,res)=>{
-  try{
-    const symbol=normalizeEaSymbol(req.query.symbol);
-    const tf=normalizeEaTimeframe(req.query.tf);
+    let nextSettings = [];
 
-    if(!symbol){
-      return res.status(400).json({
-        error:'Symbol broker tidak didukung',
-        received:String(req.query.symbol||'')
-      });
+    if (Array.isArray(config.pairSettings) && config.pairSettings.length) {
+      nextSettings = config.pairSettings
+        .map(normalizeWorkerPair)
+        .filter(item => item.enabled && item.symbol && item.dataSymbol);
+    } else if (Array.isArray(config.pairs) && config.pairs.length) {
+      const globalTfs = Array.isArray(config.timeframes)
+        ? config.timeframes.map(String).filter(tf => tf === "5" || tf === "15")
+        : DEFAULT_TFS;
+
+      nextSettings = config.pairs
+        .map((pair, index) =>
+          normalizeWorkerPair(
+            {
+              symbol: pair,
+              dataSymbol: pair,
+              timeframes: globalTfs,
+              enabled: true,
+              scanOrder: index
+            },
+            index
+          )
+        )
+        .filter(item => item.symbol && item.dataSymbol);
     }
 
-    if(!tf){
-      return res.status(400).json({
-        error:'Timeframe EA hanya boleh 5m atau 15m',
-        received:String(req.query.tf||'')
-      });
+    if (!nextSettings.length) {
+      throw new Error("Konfigurasi pair aktif kosong");
     }
 
-    const all=eadb().signals.filter(s=>{
-      const engine=String(s.engine||'').toUpperCase();
-      const signalName=String(s.signal||'').toUpperCase();
-      const pair=normalizeEaSymbol(s.pair);
-      const signalTf=normalizeEaTimeframe(s.tf);
-      const isEntry=['PREPARE LONG','PREPARE SHORT'].includes(signalName);
-      const requestedEngine=String(req.query.engine||'SMC').toUpperCase();
-      const isSmc=engine.includes('SMC')&&!engine.includes('HYBRID');
-      const isSniper=engine.includes('SNIPER')&&!engine.includes('HYBRID');
-      const isHybrid=engine.includes('HYBRID');
-      const engineMatch=
-        (requestedEngine==='SMC' && isSmc) ||
-        (requestedEngine==='SNIPER' && isSniper) ||
-        (requestedEngine==='HYBRID' && isHybrid);
+    ACTIVE_PAIR_SETTINGS = sortPairSettings(nextSettings);
+    LAST_CONFIG_REFRESH_AT = new Date().toISOString();
 
-      return (
-        isEntry &&
-        String(s.emaConfirm||'').toUpperCase()==='YES' &&
-        engineMatch &&
-        pair===symbol &&
-        signalTf===tf &&
-        String(s.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED' &&
-        String((s.execution&&s.execution.status)||'NEW').toUpperCase()!=='SUPERSEDED' &&
-        isFreshEaSignal(s)
-      );
-    });
-
-    const rank=s=>{
-      const e=String(s.engine||'').toUpperCase();
-      if(e.includes('SMC')&&!e.includes('HYBRID'))return 1;
-      if(e.includes('SNIPER')&&!e.includes('HYBRID'))return 2;
-      return 9;
-    };
-
-    all.sort((a,b)=>{
-      const pa=rank(a),pb=rank(b);
-      if(pa!==pb)return pa-pb;
-      return new Date(b.createdAt||b.updatedAt||0)-new Date(a.createdAt||a.updatedAt||0);
-    });
-
-    const latest=all[0]||null;
-
-    if(!latest){
-      return res.json({
-        ok:true,
-        authenticatedBy:'email+mt5',
-        symbol,
-        tf,
-        maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
-        priority:'LATEST ACTIONABLE PREPARE + EMA YES',
-        id:null,
-        signalId:null,
-        signal:null,
-        status:'NO_SIGNAL',
-        direction:null
-      });
-    }
-
-    const rawSignal=String(latest.signal||'').trim().toUpperCase();
-    const map={
-      'OPEN LONG':['OPEN_LONG','LONG'],
-      'OPEN SHORT':['OPEN_SHORT','SHORT'],
-      'REVERSE LONG':['REVERSE_LONG','LONG'],
-      'REVERSE SHORT':['REVERSE_SHORT','SHORT'],
-      'WAIT LONG':['PREPARE_LONG','LONG'],
-      'PREPARE LONG':['PREPARE_LONG','LONG'],
-      'WAIT SHORT':['PREPARE_SHORT','SHORT'],
-      'PREPARE SHORT':['PREPARE_SHORT','SHORT'],
-      'TP1':['TP1_HIT',null],
-      'TP1 HIT':['TP1_HIT',null],
-      'TP2':['TP2_HIT',null],
-      'TP2 HIT':['TP2_HIT',null],
-      'TP3':['TP3_HIT',null],
-      'TP3 HIT':['TP3_HIT',null],
-      'SL':['STOP_LOSS',null],
-      'STOP LOSS':['STOP_LOSS',null],
-      'STOP_LOSS':['STOP_LOSS',null],
-      'CANCELLED':['CANCELLED',null],
-      'CLOSED':['CLOSED',null],
-      'NO TRADE':['NO_TRADE',null],
-      'NO_TRADE':['NO_TRADE',null]
-    };
-    const [status,direction]=map[rawSignal]||['UNKNOWN',latest.direction||null];
-
-    return res.json({
-      ok:true,
-      authenticatedBy:'email+mt5',
-      symbol,
-      tf,
-      maxSignalAgeMinutes:EA_SIGNAL_MAX_AGE_MINUTES,
-      priority:'LATEST ACTIONABLE PREPARE + EMA YES',
-      id:String(latest.id||''),
-      signalId:String(latest.id||''),
-      key:latest.key||'',
-      signal:rawSignal,
-      status,
-      direction,
-      engine:String(latest.engine||''),
-      grade:String(latest.grade||''),
-      emaConfirm:String(latest.emaConfirm||''),
-      lifecycleStatus:String(latest.lifecycleStatus||'ACTIVE'),
-      supersedesSignalId:String(latest.supersedesSignalId||''),
-      entry:Number(latest.entry||0),
-      tp1:Number(latest.tp1||0),
-      tp2:Number(latest.tp2||0),
-      tp3:Number(latest.tp3||0),
-      sl:Number(latest.sl||0),
-      createdAt:latest.createdAt||latest.updatedAt||null
-    });
-  }catch(err){
-    console.error('latest-signal error:',err);
-    return res.status(500).json({
-      ok:false,
-      error:err.message||'Gagal mengambil signal'
-    });
-  }
-});
-
-app.get('/api/ea/signals',eaAuth,(req,res)=>{
-  try{
-    const afterSequence=Math.max(0,Number(req.query.afterSequence||0));
-    const limit=Math.min(200,Math.max(1,Number(req.query.limit||50)));
-    const result=eaV9Store.getEvents(afterSequence,limit);
-
-    return res.json({
-      ok:true,
-      authenticatedBy:'email+mt5',
-      account:req.eaMt5,
-      afterSequence,
-      lastSequence:result.lastSequence,
-      events:result.events
-    });
-  }catch(err){
-    console.error('ea signals queue error:',err);
-    return res.status(500).json({
-      ok:false,
-      error:err.message||'Gagal mengambil queue'
-    });
-  }
-});
-
-app.post('/api/ea/signal-ack',eaAuth,(req,res)=>{
-  try{
-    const ack=eaV9Store.upsertAck(req.eaMt5,req.body||{});
-    return res.json({ok:true,ack});
-  }catch(err){
-    return res.status(err.statusCode||500).json({
-      ok:false,
-      error:err.message||'Gagal menyimpan ACK'
-    });
-  }
-});
-
-app.post('/api/ea/update-execution',eaAuth,(req,res)=>{
-  try{
-    const body=req.body||{};
-    const signalId=String(body.signalId||'').trim();
-    const nextStatus=String(
-      body.execution_status||
-      body.executionStatus||
-      body.status||
-      ''
-    ).trim().toUpperCase();
-
-    if(!signalId){
-      return res.status(400).json({
-        ok:false,
-        error:'signalId wajib diisi'
-      });
-    }
-
-    const allowedStatuses=[
-      'NEW',
-      'EXECUTED',
-      'TP1',
-      'TP2',
-      'TP3',
-      'BREAKEVEN',
-      'PARTIAL_CLOSE',
-      'STOP_LOSS',
-      'CLOSED',
-      'CANCELLED',
-      'SUPERSEDED',
-      'ERROR'
-    ];
-
-    if(!allowedStatuses.includes(nextStatus)){
-      return res.status(400).json({
-        ok:false,
-        error:'execution status tidak valid'
-      });
-    }
-
-    const ed=eadb();
-
-    const item=ed.signals.find(
-      x=>String(x.id)===signalId
+    console.log(
+      "[WORKER CONFIG]",
+      "source=SUPABASE",
+      "pairs=" + ACTIVE_PAIR_SETTINGS.length,
+      "refreshedAt=" + LAST_CONFIG_REFRESH_AT
     );
 
-    if(!item){
-      return res.status(404).json({
-        ok:false,
-        error:'Signal tidak ditemukan'
-      });
+    for (const item of ACTIVE_PAIR_SETTINGS) {
+      console.log(
+        "[PAIR CONFIG]",
+        item.symbol,
+        "data=" + item.dataSymbol,
+        "tf=" + item.timeframes.join(","),
+        "priority=" + item.priority,
+        "structure=" + item.structurePeriod,
+        "prepare=" + item.prepareDistancePct + "%",
+        "volatility=" + (item.volatilityEnabled ? "ON" : "OFF"),
+        "minRRR=" + item.minRrr,
+        "order=" + item.scanOrder
+      );
     }
+  } catch (error) {
+    console.warn(
+      "[WORKER CONFIG] Gagal membaca konfigurasi Supabase. " +
+      "Memakai cache terakhir/ENV fallback:",
+      error.message
+    );
 
-    const now=new Date().toISOString();
-
-    item.execution={
-      ...(item.execution||{}),
-      status:nextStatus,
-      updatedAt:now
-    };
-
-    if(body.ticket!==undefined)
-      item.execution.ticket=body.ticket;
-
-    if(body.volume!==undefined)
-      item.execution.volume=Number(body.volume);
-
-    if(body.fill_price!==undefined)
-      item.execution.fillPrice=Number(body.fill_price);
-
-    if(body.fillPrice!==undefined)
-      item.execution.fillPrice=Number(body.fillPrice);
-
-    if(body.close_price!==undefined)
-      item.execution.closePrice=Number(body.close_price);
-
-    if(body.closePrice!==undefined)
-      item.execution.closePrice=Number(body.closePrice);
-
-    if(body.profit!==undefined)
-      item.execution.profit=Number(body.profit);
-
-    if(nextStatus==='EXECUTED'){
-      item.execution.executedAt=
-        item.execution.executedAt||now;
+    if (!ACTIVE_PAIR_SETTINGS.length) {
+      ACTIVE_PAIR_SETTINGS = [...DEFAULT_PAIR_SETTINGS];
     }
-
-    if([
-      'TP3',
-      'STOP_LOSS',
-      'CLOSED',
-      'CANCELLED',
-      'SUPERSEDED'
-    ].includes(nextStatus)){
-      item.execution.closedAt=now;
-    }
-
-    item.updatedAt=now;
-
-    saveEa(ed);
-
-    return res.json({
-      ok:true,
-      signalId:item.id,
-      execution:item.execution
-    });
-
-  }catch(err){
-    console.error('Update execution error:',err);
-
-    return res.status(500).json({
-      ok:false,
-      error:err.message||'Gagal update execution'
-    });
   }
-});  
+}
 
-app.post('/api/signals/upsert',auth,(req,res)=>{
-  try{
-    const s=req.body||{};
+const API_KEYS = Object.keys(process.env)
+  .filter(k => k.startsWith("TWELVE_DATA_API_KEY_"))
+  .sort((a, b) => {
+    const na = Number(a.match(/\d+$/)?.[0] || 0);
+    const nb = Number(b.match(/\d+$/)?.[0] || 0);
+    return na - nb;
+  })
+  .map(k => process.env[k])
+  .filter(Boolean);
 
-    if(!s.pair||!s.signal||!s.entry){
-      return res.status(400).json({error:'Data signal kurang'});
-    }
+const STATE_FILE = path.join(__dirname, "data", "scanner-worker-state.json");
 
-    const d=sigdb();
-    const key=s.key||`${s.pair}|${s.tf}|${s.signal}|${s.entry}`;
-    const old=d.signals.find(x=>x.key===key);
-    const now=new Date().toISOString();
+let authToken = "";
+let keyIndex = 0;
+let running = false;
 
-    const item={
-      id:old?old.id:uuid(),
-      key,
-      ...s,
-      createdAt:s.createdAt||(old&&old.createdAt)||now,
-      updatedAt:now,
-      result:String(s.status||'').includes('SL HIT')
-        ?'LOSS'
-        :String(s.status||'').includes('TP')
-          ?'WIN'
-          :'RUNNING'
-    };
+const API_KEY_BLOCKED_UNTIL = new Map();
 
-    if(old) Object.assign(old,item);
-    else d.signals.push(item);
+function nextUtcMidnight(){
+  const now = new Date();
 
-    saveSig(d);
+  return Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0,
+    1,
+    0
+  );
+}
 
-    const engine=String(s.engine||'').toUpperCase();
-    const signalName=String(s.signal||'').toUpperCase();
+function isApiKeyBlocked(index){
+  const blockedUntil = API_KEY_BLOCKED_UNTIL.get(index) || 0;
 
-    const eligibleEngine=
-      engine.includes('SMC') ||
-      engine.includes('SNIPER') ||
-      engine.includes('HYBRID');
-
-    const eligibleSignal=[
-      'PREPARE LONG',
-      'PREPARE SHORT'
-    ].includes(signalName);
-
-    const emaYes=String(s.emaConfirm||'').toUpperCase()==='YES';
-
-    let queueEvent=null;
-    let supersededIds=[];
-
-    if(eligibleEngine&&eligibleSignal&&emaYes){
-      const ed=eadb();
-      const eo=ed.signals.find(x=>x.key===key);
-
-      const engineFamily=value=>{
-        const e=String(value||'').toUpperCase();
-        if(e.includes('HYBRID')) return 'HYBRID';
-        if(e.includes('SNIPER')) return 'SNIPER';
-        if(e.includes('SMC')) return 'SMC';
-        return e;
-      };
-
-      const pairNorm=normalizeEaSymbol(s.pair);
-      const tfNorm=normalizeEaTimeframe(s.tf);
-      const family=engineFamily(s.engine);
-
-      // Supersede only pending/NEW setups for same pair+TF+engine.
-      // Executed/open positions are intentionally left alone.
-      for(const prev of ed.signals){
-        if(eo && String(prev.id)===String(eo.id)) continue;
-
-        const samePair=normalizeEaSymbol(prev.pair)===pairNorm;
-        const sameTf=normalizeEaTimeframe(prev.tf)===tfNorm;
-        const sameFamily=engineFamily(prev.engine)===family;
-        const prevExec=String(
-          (prev.execution&&prev.execution.status)||'NEW'
-        ).toUpperCase();
-
-        if(
-          samePair &&
-          sameTf &&
-          sameFamily &&
-          prevExec==='NEW' &&
-          String(prev.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED'
-        ){
-          prev.lifecycleStatus='SUPERSEDED';
-          prev.supersededBySignalId=eo?eo.id:item.id;
-          prev.supersededAt=now;
-          prev.execution={
-            ...(prev.execution||{}),
-            status:'SUPERSEDED',
-            updatedAt:now,
-            closedAt:now
-          };
-          prev.updatedAt=now;
-          supersededIds.push(String(prev.id));
-        }
-      }
-
-      const previousUpdatedAt=eo?String(eo.updatedAt||''):null;
-
-      const ei={
-        id:eo?eo.id:item.id,
-        key,
-        pair:s.pair,
-        tf:s.tf,
-        signal:signalName,
-        status:s.status||null,
-        direction:
-          s.direction||
-          (signalName.includes('LONG')?'LONG':'SHORT'),
-        engine:s.engine,
-        grade:s.grade,
-        emaConfirm:String(s.emaConfirm||'YES'),
-        lifecycleStatus:'ACTIVE',
-        supersedesSignalId:
-          supersededIds.length
-            ?supersededIds[supersededIds.length-1]
-            :null,
-        entry:Number(s.entry||0),
-        tp1:Number(s.tp1||0),
-        tp2:Number(s.tp2||0),
-        tp3:Number(s.tp3||0),
-        sl:Number(s.sl||0),
-        createdAt:s.createdAt||(eo&&eo.createdAt)||now,
-        updatedAt:now,
-        execution:(eo&&eo.execution)||{
-          status:'NEW',
-          ticket:null,
-          volume:null,
-          fillPrice:null,
-          executedAt:null,
-          closePrice:null,
-          closedAt:null,
-          profit:null,
-          updatedAt:now
-        }
-      };
-
-      if(eo) Object.assign(eo,ei);
-      else ed.signals.push(ei);
-
-      saveEa(ed);
-
-      const shouldQueue=!eo || previousUpdatedAt!==String(ei.updatedAt||'');
-      if(shouldQueue){
-        queueEvent=eaV9Store.pushEvent(ei);
-      }
-    }
-
-    return res.json({
-      success:true,
-      signalId:item.id,
-      queued:!!queueEvent,
-      queueEvent,
-      supersededIds,
-      lifecycle:'LATEST_PENDING_WINS'
-    });
-  }catch(err){
-    console.error('signals upsert error:',err);
-    return res.status(500).json({
-      error:err.message||'Gagal menyimpan signal'
-    });
+  if(blockedUntil <= Date.now()){
+    API_KEY_BLOCKED_UNTIL.delete(index);
+    return false;
   }
-});
 
-app.get('/api/scanner/current',auth,(req,res)=>{
-  try{
-    const tf=normalizeEaTimeframe(req.query.tf||'5');
-    const requestedEngine=String(req.query.engine||'SMC').toUpperCase();
-    const rawSymbols=String(req.query.symbols||'')
-      .split(',')
-      .map(x=>x.trim())
-      .filter(Boolean);
+  return true;
+}
 
-    const requestedSymbols=rawSymbols
-      .map(normalizeEaSymbol)
-      .filter(Boolean);
+function blockApiKey(index, errorMessage){
+  const message = String(errorMessage || "").toLowerCase();
 
-    const engineFamily=value=>{
-      const e=String(value||'').toUpperCase();
-      if(e.includes('HYBRID')) return 'HYBRID';
-      if(e.includes('SNIPER')) return 'SNIPER';
-      if(e.includes('SMC')) return 'SMC';
-      return e;
-    };
+  const isDailyLimit =
+    message.includes("credits for the day") ||
+    message.includes("daily") ||
+    message.includes("current limit being");
 
-    const requestedFamily=engineFamily(requestedEngine);
-    const terminalStatuses=[
-      'TP3',
-      'STOP_LOSS',
-      'CLOSED',
-      'CANCELLED',
-      'SUPERSEDED',
-      'ERROR'
-    ];
+  const blockedUntil = isDailyLimit
+    ? nextUtcMidnight()
+    : Date.now() + 70 * 1000;
 
-    const all=eadb().signals
-      .filter(s=>{
-        const pair=normalizeEaSymbol(s.pair);
-        const signalTf=normalizeEaTimeframe(s.tf);
-        const exec=String(
-          (s.execution&&s.execution.status)||'NEW'
-        ).toUpperCase();
+  API_KEY_BLOCKED_UNTIL.set(index, blockedUntil);
 
-        return (
-          pair &&
-          signalTf===tf &&
-          (!requestedSymbols.length || requestedSymbols.includes(pair)) &&
-          engineFamily(s.engine)===requestedFamily &&
-          String(s.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED' &&
-          !terminalStatuses.includes(exec)
-        );
-      })
-      .sort((a,b)=>
-        new Date(b.updatedAt||b.createdAt||0)-
-        new Date(a.updatedAt||a.createdAt||0)
+  console.warn(
+    "[API KEY BLOCKED]",
+    "key",
+    index + 1,
+    "sampai",
+    new Date(blockedUntil).toISOString(),
+    isDailyLimit ? "(daily limit)" : "(minute limit)"
+  );
+}
+
+function ensureStateDir() {
+  const dir = path.dirname(STATE_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function loadState() {
+  ensureStateDir();
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return { lastSignalByPairTf: {}, lastDirectionByPairTf: {} };
+  }
+}
+
+function saveState(state) {
+  ensureStateDir();
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+const state = loadState();
+state.lastSignalByPairTf = state.lastSignalByPairTf || {};
+state.lastDirectionByPairTf = state.lastDirectionByPairTf || {};
+state.pineStructureByPairTf = state.pineStructureByPairTf || {};
+state.lastConsumedBreakTimeByPairTf = state.lastConsumedBreakTimeByPairTf || {};
+state.setupSnapshotByPairTf = state.setupSnapshotByPairTf || {};
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function intervalFromTf(tf) {
+  return tf === "15" ? "15min" : "5min";
+}
+
+function tfLabel(tf) {
+  return tf + "m";
+}
+
+function fmtPrice(x) {
+  if (!Number.isFinite(Number(x))) return "-";
+  return Number(x).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function emaSeries(values, period) {
+  if (!Array.isArray(values) || values.length === 0 || period <= 0) return [];
+
+  const alpha = 2 / (period + 1);
+  const output = [];
+  let value = Number(values[0]);
+
+  output.push(value);
+
+  for (let i = 1; i < values.length; i++) {
+    const source = Number(values[i]);
+    value = alpha * source + (1 - alpha) * value;
+    output.push(value);
+  }
+
+  return output;
+}
+
+function ema(values, period) {
+  const series = emaSeries(values, period);
+  return series.length ? series[series.length - 1] : NaN;
+}
+
+function sma(values, period) {
+  if (!Array.isArray(values) || values.length < period || period <= 0) {
+    return NaN;
+  }
+
+  const slice = values.slice(-period);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+function trueRangeSeries(candles) {
+  if (!Array.isArray(candles) || candles.length === 0) return [];
+
+  const output = [];
+
+  for (let i = 0; i < candles.length; i++) {
+    const current = candles[i];
+
+    if (i === 0) {
+      output.push(current.high - current.low);
+      continue;
+    }
+
+    const previousClose = candles[i - 1].close;
+
+    output.push(
+      Math.max(
+        current.high - current.low,
+        Math.abs(current.high - previousClose),
+        Math.abs(current.low - previousClose)
+      )
+    );
+  }
+
+  return output;
+}
+
+// TradingView ta.rma(): seed memakai SMA(period), lalu Wilder smoothing.
+function rmaSeries(values, period) {
+  if (!Array.isArray(values) || values.length < period || period <= 0) {
+    return [];
+  }
+
+  const output = new Array(values.length).fill(NaN);
+  let value =
+    values.slice(0, period).reduce((sum, item) => sum + item, 0) / period;
+
+  output[period - 1] = value;
+
+  for (let i = period; i < values.length; i++) {
+    value = (value * (period - 1) + values[i]) / period;
+    output[i] = value;
+  }
+
+  return output;
+}
+
+// TradingView ta.atr(period) = ta.rma(true range, period).
+function atrSeries(candles, period = 14) {
+  return rmaSeries(trueRangeSeries(candles), period);
+}
+
+function atr(candles, period = 14) {
+  const values = atrSeries(candles, period).filter(Number.isFinite);
+  return values.length ? values[values.length - 1] : NaN;
+}
+
+function getGrade(score) {
+  if (score >= 8) return "A+";
+  if (score >= 6.5) return "A";
+  if (score >= 5) return "B";
+  return "C";
+}
+
+// -----------------------------------------------------------------------------
+// TradingView/Pine compatibility helpers
+// Pine reference:
+//   ta.pivothigh(high, structurePeriod, structurePeriod)
+//   ta.pivotlow(low, structurePeriod, structurePeriod)
+// -----------------------------------------------------------------------------
+function pivotHighAt(candles, index, left, right) {
+  if (index - left < 0 || index + right >= candles.length) return null;
+  const value = candles[index].high;
+  if (!Number.isFinite(value)) return null;
+
+  // Closer to TradingView ta.pivothigh(): equal highs on the left are allowed,
+  // while an equal/larger high on the right makes the later extreme win.
+  for (let i = index - left; i < index; i++) {
+    if (candles[i].high > value) return null;
+  }
+  for (let i = index + 1; i <= index + right; i++) {
+    if (candles[i].high >= value) return null;
+  }
+  return value;
+}
+
+function pivotLowAt(candles, index, left, right) {
+  if (index - left < 0 || index + right >= candles.length) return null;
+  const value = candles[index].low;
+  if (!Number.isFinite(value)) return null;
+
+  // Closer to TradingView ta.pivotlow().
+  for (let i = index - left; i < index; i++) {
+    if (candles[i].low < value) return null;
+  }
+  for (let i = index + 1; i <= index + right; i++) {
+    if (candles[i].low <= value) return null;
+  }
+  return value;
+}
+
+function buildTvStructureSnapshot(candles, structurePeriod) {
+  let lastHigh = NaN;
+  let lastLow = NaN;
+  let lastHighIndex = -1;
+  let lastLowIndex = -1;
+
+  let highBreakPending = false;
+  let lowBreakPending = false;
+  let trendDirection = 0;
+
+  let lastBreak = null;
+  const pivotHighHistory = [];
+  const pivotLowHistory = [];
+
+  for (let i = 0; i < candles.length; i++) {
+    // Pine confirms a pivot only after `structurePeriod` right-hand bars.
+    const pivotIndex = i - structurePeriod;
+
+    if (pivotIndex >= 0) {
+      const ph = pivotHighAt(
+        candles,
+        pivotIndex,
+        structurePeriod,
+        structurePeriod
       );
 
-    const latestByPair=new Map();
-    for(const s of all){
-      const pair=normalizeEaSymbol(s.pair);
-      if(!latestByPair.has(pair)){
-        latestByPair.set(pair,s);
+      const pl = pivotLowAt(
+        candles,
+        pivotIndex,
+        structurePeriod,
+        structurePeriod
+      );
+
+      if (ph !== null) {
+        lastHigh = ph;
+        lastHighIndex = pivotIndex;
+        highBreakPending = true;
+        pivotHighHistory.push({
+          price: ph,
+          index: pivotIndex,
+          time: candles[pivotIndex]?.time || null
+        });
+      }
+
+      if (pl !== null) {
+        lastLow = pl;
+        lastLowIndex = pivotIndex;
+        lowBreakPending = true;
+        pivotLowHistory.push({
+          price: pl,
+          index: pivotIndex,
+          time: candles[pivotIndex]?.time || null
+        });
       }
     }
 
-    const displayStatus=(s)=>{
-      const exec=String(
-        (s.execution&&s.execution.status)||'NEW'
-      ).toUpperCase();
-      const dir=String(s.direction||'').toUpperCase();
+    const candle = candles[i];
+    let highBroken = false;
+    let lowBroken = false;
 
-      if(exec==='EXECUTED') return 'ACTIVE '+dir;
-      if(exec==='TP1') return 'TP1 HIT';
-      if(exec==='TP2') return 'TP2 HIT';
-      if(exec==='BREAKEVEN') return 'BREAKEVEN';
-      if(exec==='PARTIAL_CLOSE') return 'PARTIAL CLOSE';
-      if(exec==='NEW'){
-        const raw=String(s.signal||'').toUpperCase();
-        if(raw==='PREPARE LONG') return 'PREPARE LONG';
-        if(raw==='PREPARE SHORT') return 'PREPARE SHORT';
-        return raw||'NEW';
-      }
-      return exec;
+    // Pine confirmationType = "Body":
+    // bullish break only if close > structure high,
+    // bearish break only if close < structure low.
+    if (
+      highBreakPending &&
+      Number.isFinite(lastHigh) &&
+      candle.close > lastHigh
+    ) {
+      highBroken = true;
+      highBreakPending = false;
+    }
+
+    if (
+      lowBreakPending &&
+      Number.isFinite(lastLow) &&
+      candle.close < lastLow
+    ) {
+      lowBroken = true;
+      lowBreakPending = false;
+    }
+
+    const previousTrend = trendDirection;
+
+    // Pine uses if/else-if, therefore bullish gets priority
+    // only in the practically impossible case both are true.
+    if (highBroken) {
+      trendDirection = 1;
+    } else if (lowBroken) {
+      trendDirection = -1;
+    }
+
+    const choch =
+      (previousTrend === -1 && trendDirection === 1) ||
+      (previousTrend === 1 && trendDirection === -1);
+
+    if (highBroken) {
+      lastBreak = {
+        index: i,
+        direction: "LONG",
+        type: choch ? "CHoCH BULLISH" : "BOS BULLISH",
+        structure: lastHigh,
+        structureIndex: lastHighIndex,
+        candleTime: candle.time
+      };
+    } else if (lowBroken) {
+      lastBreak = {
+        index: i,
+        direction: "SHORT",
+        type: choch ? "CHoCH BEARISH" : "BOS BEARISH",
+        structure: lastLow,
+        structureIndex: lastLowIndex,
+        candleTime: candle.time
+      };
+    }
+  }
+
+  return {
+    lastHigh,
+    lastLow,
+    lastHighIndex,
+    lastLowIndex,
+    highBreakPending,
+    lowBreakPending,
+    trendDirection,
+    lastBreak,
+    pivotHighHistory: pivotHighHistory.slice(-5),
+    pivotLowHistory: pivotLowHistory.slice(-5),
+    pineState: {
+      lastHigh,
+      lastLow,
+      lastHighIndex,
+      lastLowIndex,
+      highBreakPending,
+      lowBreakPending,
+      trendDirection
+    }
+  };
+}
+
+function targetLevels(direction, entry, atr14) {
+  const targetRange = atr14 * 2.0;
+
+  if (direction === "LONG") {
+    return {
+      targetRange,
+      tp1: entry + targetRange * 0.8,
+      tp2: entry + targetRange * 1.6,
+      tp3: entry + targetRange * 2.8,
+      sl: entry - targetRange * 1.2
     };
+  }
 
-    const rows=[];
+  return {
+    targetRange,
+    tp1: entry - targetRange * 0.8,
+    tp2: entry - targetRange * 1.6,
+    tp3: entry - targetRange * 2.8,
+    sl: entry + targetRange * 1.2
+  };
+}
 
-    const symbolsToRender=requestedSymbols.length
-      ?requestedSymbols
-      :[...latestByPair.keys()];
 
-    for(const pair of symbolsToRender){
-      const s=latestByPair.get(pair);
+function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
+  const key = pair + "|" + tf;
+  const previous = state.pineStructureByPairTf[key] || null;
 
-      if(!s){
-        rows.push({
-          pair,
-          symbol:pair,
-          tf:tf+'m',
-          source:'SERVER WORKER',
-          signal:'WAIT',
-          status:'NO ACTIVE SIGNAL',
-          direction:null,
-          entry:null,
-          tp1:null,
-          tp2:null,
-          tp3:null,
-          sl:null,
-          signalId:null,
-          emaConfirm:null,
-          engine:requestedFamily,
-          lifecycleStatus:null,
-          executionStatus:null,
-          updatedAt:null
+  // Bootstrap from a long history on first run, after state loss/redeploy,
+  // period change, or when the stored candle is no longer represented.
+  const lastClosedTime = candles.length ? candles[candles.length - 1].time : null;
+  const storedTime = previous?.lastProcessedCandleTime || null;
+  const storedStillInWindow =
+    storedTime && candles.some(c => c.time === storedTime);
+
+  if (
+    !previous ||
+    Number(previous.structurePeriod) !== Number(structurePeriod) ||
+    !storedStillInWindow
+  ) {
+    const snap = buildTvStructureSnapshot(candles, structurePeriod);
+    state.pineStructureByPairTf[key] = {
+      structurePeriod,
+      lastProcessedCandleTime: lastClosedTime,
+      lastHigh: snap.lastHigh,
+      lastLow: snap.lastLow,
+      lastHighTime:
+        snap.lastHighIndex >= 0 ? candles[snap.lastHighIndex]?.time || null : null,
+      lastLowTime:
+        snap.lastLowIndex >= 0 ? candles[snap.lastLowIndex]?.time || null : null,
+      highBreakPending: snap.highBreakPending,
+      lowBreakPending: snap.lowBreakPending,
+      trendDirection: snap.trendDirection,
+      lastBreak: snap.lastBreak,
+      pivotHighHistory: snap.pivotHighHistory || [],
+      pivotLowHistory: snap.pivotLowHistory || []
+    };
+    saveState(state);
+    return { ...snap, persistentMode: "BOOTSTRAP" };
+  }
+
+  // Reconstruct enough context to confirm pivots whose right bars have just
+  // completed, but preserve Pine `var` state from the previous scan.
+  let lastHigh = Number(previous.lastHigh);
+  let lastLow = Number(previous.lastLow);
+  let lastHighTime = previous.lastHighTime || null;
+  let lastLowTime = previous.lastLowTime || null;
+  let highBreakPending = !!previous.highBreakPending;
+  let lowBreakPending = !!previous.lowBreakPending;
+  let trendDirection = Number(previous.trendDirection || 0);
+  let lastBreak = previous.lastBreak || null;
+  let pivotHighHistory = Array.isArray(previous.pivotHighHistory)
+    ? previous.pivotHighHistory.slice(-5) : [];
+  let pivotLowHistory = Array.isArray(previous.pivotLowHistory)
+    ? previous.pivotLowHistory.slice(-5) : [];
+
+  const startIndex = candles.findIndex(c => c.time === storedTime);
+  const firstNewIndex = startIndex >= 0 ? startIndex + 1 : 0;
+
+  for (let i = firstNewIndex; i < candles.length; i++) {
+    const pivotIndex = i - structurePeriod;
+
+    if (pivotIndex >= 0) {
+      const ph = pivotHighAt(candles, pivotIndex, structurePeriod, structurePeriod);
+      const pl = pivotLowAt(candles, pivotIndex, structurePeriod, structurePeriod);
+
+      if (ph !== null) {
+        lastHigh = ph;
+        lastHighTime = candles[pivotIndex]?.time || null;
+        highBreakPending = true;
+        pivotHighHistory.push({
+          price: ph, index: pivotIndex, time: lastHighTime
         });
+        pivotHighHistory = pivotHighHistory.slice(-5);
+      }
+
+      if (pl !== null) {
+        lastLow = pl;
+        lastLowTime = candles[pivotIndex]?.time || null;
+        lowBreakPending = true;
+        pivotLowHistory.push({
+          price: pl, index: pivotIndex, time: lastLowTime
+        });
+        pivotLowHistory = pivotLowHistory.slice(-5);
+      }
+    }
+
+    const candle = candles[i];
+    const previousTrend = trendDirection;
+    let highBroken = false;
+    let lowBroken = false;
+
+    if (highBreakPending && Number.isFinite(lastHigh) && candle.close > lastHigh) {
+      highBroken = true;
+      highBreakPending = false;
+    }
+    if (lowBreakPending && Number.isFinite(lastLow) && candle.close < lastLow) {
+      lowBroken = true;
+      lowBreakPending = false;
+    }
+
+    if (highBroken) trendDirection = 1;
+    else if (lowBroken) trendDirection = -1;
+
+    const choch =
+      (previousTrend === -1 && trendDirection === 1) ||
+      (previousTrend === 1 && trendDirection === -1);
+
+    if (highBroken) {
+      lastBreak = {
+        index: i,
+        direction: "LONG",
+        type: choch ? "CHoCH BULLISH" : "BOS BULLISH",
+        structure: lastHigh,
+        structureTime: lastHighTime,
+        candleTime: candle.time
+      };
+    } else if (lowBroken) {
+      lastBreak = {
+        index: i,
+        direction: "SHORT",
+        type: choch ? "CHoCH BEARISH" : "BOS BEARISH",
+        structure: lastLow,
+        structureTime: lastLowTime,
+        candleTime: candle.time
+      };
+    }
+  }
+
+  const lastHighIndex = candles.findIndex(c => c.time === lastHighTime);
+  const lastLowIndex = candles.findIndex(c => c.time === lastLowTime);
+
+  const result = {
+    lastHigh,
+    lastLow,
+    lastHighIndex,
+    lastLowIndex,
+    highBreakPending,
+    lowBreakPending,
+    trendDirection,
+    lastBreak,
+    pivotHighHistory,
+    pivotLowHistory,
+    persistentMode: "INCREMENTAL",
+    pineState: {
+      lastHigh,
+      lastLow,
+      lastHighTime,
+      lastLowTime,
+      highBreakPending,
+      lowBreakPending,
+      trendDirection,
+      lastProcessedCandleTime: lastClosedTime
+    }
+  };
+
+  state.pineStructureByPairTf[key] = {
+    structurePeriod,
+    lastProcessedCandleTime: lastClosedTime,
+    lastHigh,
+    lastLow,
+    lastHighTime,
+    lastLowTime,
+    highBreakPending,
+    lowBreakPending,
+    trendDirection,
+    lastBreak,
+    pivotHighHistory,
+    pivotLowHistory
+  };
+  saveState(state);
+
+  return result;
+}
+
+function analyzeSmc(pair, tf, candles, pairConfig = {}) {
+  /*
+    Twelve Data normally includes the currently-forming candle as the final item.
+
+    TradingView behavior we reproduce:
+    - BOS/CHoCH: only confirmed from a CLOSED candle.
+    - PREPARE: may use the latest/current price before the breakout,
+      which is what allows EA to place the pending order early.
+  */
+  if (!Array.isArray(candles) || candles.length < 90) {
+    return { valid: false, reason: "DATA LOW" };
+  }
+
+  const structurePeriod = Math.min(
+    50,
+    Math.max(5, Number(pairConfig.structurePeriod || 20))
+  );
+
+  const prepareDistancePct = Math.min(
+    5,
+    Math.max(
+      0.00001,
+      Number(pairConfig.prepareDistancePct || 0.25)
+    )
+  );
+
+  const current = candles[candles.length - 1];
+  const closed = candles.slice(0, -1);
+
+  if (closed.length < structurePeriod * 2 + 30) {
+    return { valid: false, reason: "DATA LOW FOR PIVOT" };
+  }
+
+  // Build structure using CLOSED candles only.
+  const structure = buildTvStructurePersistent(pair, tf, closed, structurePeriod);
+
+  // Indicator calculations.
+  // For confirmed ENTRY use closed-bar values.
+  const closedCloses = closed.map(c => c.close);
+  const closedEma9 = ema(closedCloses, 9);
+  const closedEma20 = ema(closedCloses, 20);
+
+  const closedAtrFull = atrSeries(closed, 14);
+  const closedAtrFinite = closedAtrFull.filter(Number.isFinite);
+  const closedAtr14 = closedAtrFinite.length
+    ? closedAtrFinite[closedAtrFinite.length - 1]
+    : NaN;
+  const closedAtrSma20 = sma(closedAtrFinite, 20);
+
+  // For PREPARE TradingView recalculates on the live candle.
+  const liveCloses = candles.map(c => c.close);
+  const liveEma9 = ema(liveCloses, 9);
+  const liveEma20 = ema(liveCloses, 20);
+
+  const liveAtrFull = atrSeries(candles, 14);
+  const liveAtrFinite = liveAtrFull.filter(Number.isFinite);
+  const liveAtr14 = liveAtrFinite.length
+    ? liveAtrFinite[liveAtrFinite.length - 1]
+    : NaN;
+  const liveAtrSma20 = sma(liveAtrFinite, 20);
+
+  const volatilityEnabled = pairConfig.volatilityEnabled !== false;
+
+  const closedVolatilityOk =
+    !volatilityEnabled ||
+    (
+      Number.isFinite(closedAtr14) &&
+      Number.isFinite(closedAtrSma20) &&
+      closedAtr14 > closedAtrSma20
+    );
+
+  const liveVolatilityOk =
+    !volatilityEnabled ||
+    (
+      Number.isFinite(liveAtr14) &&
+      Number.isFinite(liveAtrSma20) &&
+      liveAtr14 > liveAtrSma20
+    );
+
+  const lastClosed = closed[closed.length - 1];
+
+  const closedEmaLong =
+    closedEma9 > closedEma20 &&
+    lastClosed.close > closedEma9;
+
+  const closedEmaShort =
+    closedEma9 < closedEma20 &&
+    lastClosed.close < closedEma9;
+
+  const liveEmaLong =
+    liveEma9 > liveEma20 &&
+    current.close > liveEma9;
+
+  const liveEmaShort =
+    liveEma9 < liveEma20 &&
+    current.close < liveEma9;
+
+  const rrr = {
+    tp1: 0.8 / 1.2,
+    tp2: 1.6 / 1.2,
+    tp3: 2.8 / 1.2
+  };
+
+  const minRrr = Math.max(
+    0.01,
+    Number(pairConfig.minRrr || 1.5)
+  );
+
+  // ===========================================================================
+  // 1) CONFIRMED BOS / CHoCH
+  // ===========================================================================
+  const lastClosedTime = lastClosed?.time || null;
+  const lastBreakTime = structure.lastBreak?.candleTime || null;
+
+  // V11.2 hard guard: an old break may remain in persistent history,
+  // but it is never an actionable/current BREAKOUT.
+  if (lastBreakTime && lastClosedTime && lastBreakTime !== lastClosedTime) {
+    structure.lastBreak = null;
+  }
+
+  const freshBreak =
+    structure.lastBreak &&
+    lastBreakTime &&
+    lastClosedTime &&
+    lastBreakTime === lastClosedTime
+      ? structure.lastBreak
+      : null;
+
+  if (freshBreak) {
+    const breakStateKey = pair + "|" + tf;
+    const consumedBreakTime =
+      state.lastConsumedBreakTimeByPairTf[breakStateKey] || null;
+
+    if (consumedBreakTime === freshBreak.candleTime) {
+      return {
+        valid: false,
+        reason: "BREAKOUT ALREADY CONSUMED",
+        direction: freshBreak.direction,
+        mainSignal: freshBreak.type,
+        structureHigh: structure.lastHigh,
+        structureLow: structure.lastLow
+      };
+    }
+
+    state.lastConsumedBreakTimeByPairTf[breakStateKey] =
+      freshBreak.candleTime;
+    saveState(state);
+
+    const emaOk =
+      freshBreak.direction === "LONG"
+        ? closedEmaLong
+        : closedEmaShort;
+
+    return {
+      valid: false,
+      reason: emaOk
+        ? "BREAKOUT CONFIRMED - NO SECOND ORDER"
+        : "BREAKOUT CONFIRMED - EMA NO",
+      direction: freshBreak.direction,
+      mainSignal: freshBreak.type,
+      emaOk,
+      volatilityOk: closedVolatilityOk,
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      diagnostic: {
+        mode: "BREAKOUT",
+        scannerVersion: "V11.3",
+        feedSymbol: pairConfig.dataSymbol || pair,
+        pair,
+        tf: tfLabel(tf),
+        currentTime: current.time,
+        currentOHLC: {
+          open: current.open,
+          high: current.high,
+          low: current.low,
+          close: current.close
+        },
+        lastClosedTime: lastClosed.time,
+        lastClosedOHLC: {
+          open: lastClosed.open,
+          high: lastClosed.high,
+          low: lastClosed.low,
+          close: lastClosed.close
+        },
+        structurePeriod,
+        structureHigh: structure.lastHigh,
+        structureLow: structure.lastLow,
+        structureHighPivotTime:
+          structure.lastHighIndex >= 0
+            ? closed[structure.lastHighIndex]?.time || null
+            : null,
+        structureLowPivotTime:
+          structure.lastLowIndex >= 0
+            ? closed[structure.lastLowIndex]?.time || null
+            : null,
+        pivotHighHistory: structure.pivotHighHistory,
+        pivotLowHistory: structure.pivotLowHistory,
+        pineState: structure.pineState,
+        persistentMode: structure.persistentMode,
+        ema9: closedEma9,
+        ema20: closedEma20,
+        emaLong: closedEmaLong,
+        emaShort: closedEmaShort,
+        atr14: closedAtr14,
+        atrSma20: closedAtrSma20,
+        volatilityOk: closedVolatilityOk,
+        breakout: freshBreak
+      }
+    };
+  }
+
+  // ===========================================================================
+  // 2) PREPARE BEFORE BREAKOUT
+  //
+  // Pine:
+  // prepLongRaw  = abs(close-structHigh) <= structHigh*0.25% && close<structHigh
+  // prepShortRaw = abs(close-structLow)  <= structLow *0.25% && close>structLow
+  // PREPARE also requires EMA alignment.
+  //
+  // Extension for EA:
+  // Pine only visualizes PREPARE and does not emit target JSON for it.
+  // We derive TP/SL from the SAME ATR×2 formulas so EA can place pending order.
+  // ===========================================================================
+  const longThreshold =
+    Number.isFinite(structure.lastHigh)
+      ? Math.abs(structure.lastHigh) * (prepareDistancePct / 100)
+      : NaN;
+
+  const shortThreshold =
+    Number.isFinite(structure.lastLow)
+      ? Math.abs(structure.lastLow) * (prepareDistancePct / 100)
+      : NaN;
+
+  const prepLongRaw =
+    structure.highBreakPending &&
+    Number.isFinite(structure.lastHigh) &&
+    current.close < structure.lastHigh &&
+    Math.abs(current.close - structure.lastHigh) <= longThreshold;
+
+  const prepShortRaw =
+    structure.lowBreakPending &&
+    Number.isFinite(structure.lastLow) &&
+    current.close > structure.lastLow &&
+    Math.abs(current.close - structure.lastLow) <= shortThreshold;
+
+  const prepLong = prepLongRaw && liveEmaLong;
+  const prepShort = prepShortRaw && liveEmaShort;
+
+  let prepareDirection = null;
+
+  if (prepLong && prepShort) {
+    // Rare case: choose the structure level nearest to current price.
+    const distLong =
+      Math.abs(current.close - structure.lastHigh);
+    const distShort =
+      Math.abs(current.close - structure.lastLow);
+
+    prepareDirection =
+      distLong <= distShort ? "LONG" : "SHORT";
+  } else if (prepLong) {
+    prepareDirection = "LONG";
+  } else if (prepShort) {
+    prepareDirection = "SHORT";
+  }
+
+  if (!prepareDirection) {
+    const distanceToHighPct =
+      Number.isFinite(structure.lastHigh)
+        ? Math.abs(current.close - structure.lastHigh) /
+          Math.abs(structure.lastHigh) * 100
+        : null;
+
+    const distanceToLowPct =
+      Number.isFinite(structure.lastLow)
+        ? Math.abs(current.close - structure.lastLow) /
+          Math.abs(structure.lastLow) * 100
+        : null;
+
+    return {
+      valid: false,
+      reason: "NO ACTIONABLE PREPARE",
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      liveClose: current.close,
+      ema9: liveEma9,
+      ema20: liveEma20,
+      volatilityOk: liveVolatilityOk,
+      diagnostic: {
+        mode: "SCAN",
+      scannerVersion: "V11.3",
+        feedSymbol: pairConfig.dataSymbol || pair,
+        pair,
+        tf: tfLabel(tf),
+        currentTime: current.time,
+        currentOHLC: {
+          open: current.open,
+          high: current.high,
+          low: current.low,
+          close: current.close
+        },
+        lastClosedTime: lastClosed.time,
+        lastClosedOHLC: {
+          open: lastClosed.open,
+          high: lastClosed.high,
+          low: lastClosed.low,
+          close: lastClosed.close
+        },
+        structurePeriod,
+        structureHigh: structure.lastHigh,
+        structureLow: structure.lastLow,
+        structureHighPivotTime:
+          structure.lastHighIndex >= 0
+            ? closed[structure.lastHighIndex]?.time || null
+            : null,
+        structureLowPivotTime:
+          structure.lastLowIndex >= 0
+            ? closed[structure.lastLowIndex]?.time || null
+            : null,
+        pivotHighHistory: structure.pivotHighHistory,
+        pivotLowHistory: structure.pivotLowHistory,
+        pineState: structure.pineState,
+        persistentMode: structure.persistentMode,
+        highBreakPending: structure.highBreakPending,
+        lowBreakPending: structure.lowBreakPending,
+        prepareDistancePct,
+        distanceToHighPct,
+        distanceToLowPct,
+        prepLongRaw,
+        prepShortRaw,
+        prepLong,
+        prepShort,
+        ema9: liveEma9,
+        ema20: liveEma20,
+        emaLong: liveEmaLong,
+        emaShort: liveEmaShort,
+        atr14: liveAtr14,
+        atrSma20: liveAtrSma20,
+        volatilityOk: liveVolatilityOk
+      }
+    };
+  }
+
+  const prepareEntry =
+    prepareDirection === "LONG"
+      ? structure.lastHigh
+      : structure.lastLow;
+
+  /*
+    V11.3 ATR SNAPSHOT LOCK
+    -----------------------
+    TradingView freezes the geometry of an already-created setup.
+    Do the same here: once a structure+direction becomes actionable, lock the
+    ATR used for Entry/SL/TP. Later scans may change live ATR, but MUST NOT
+    move the existing setup levels.
+
+    Snapshot identity is structure based. A new structure creates a new
+    snapshot automatically.
+  */
+  const snapshotStoreKey = pair + "|" + tf;
+  const snapshotIdentity = [
+    prepareDirection,
+    fmtPrice(prepareEntry),
+    prepareDirection === "LONG"
+      ? (structure.pineState?.lastHighTime || "")
+      : (structure.pineState?.lastLowTime || "")
+  ].join("|");
+
+  let setupSnapshot = state.setupSnapshotByPairTf[snapshotStoreKey] || null;
+
+  if (
+    !setupSnapshot ||
+    setupSnapshot.identity !== snapshotIdentity ||
+    !Number.isFinite(Number(setupSnapshot.atr14))
+  ) {
+    setupSnapshot = {
+      identity: snapshotIdentity,
+      direction: prepareDirection,
+      entry: prepareEntry,
+      atr14: liveAtr14,
+      atrSma20: liveAtrSma20,
+      structureTime:
+        prepareDirection === "LONG"
+          ? (structure.pineState?.lastHighTime || null)
+          : (structure.pineState?.lastLowTime || null),
+      signalCandleTime: current.time,
+      lastClosedTime: lastClosed.time,
+      ema9: liveEma9,
+      ema20: liveEma20,
+      createdAt: new Date().toISOString()
+    };
+    state.setupSnapshotByPairTf[snapshotStoreKey] = setupSnapshot;
+    saveState(state);
+  }
+
+  const lockedAtr14 = Number(setupSnapshot.atr14);
+
+  const prepareLevels = targetLevels(
+    prepareDirection,
+    prepareEntry,
+    lockedAtr14
+  );
+
+  const prepareSignal =
+    prepareDirection === "LONG"
+      ? "PREPARE LONG"
+      : "PREPARE SHORT";
+
+  /*
+    Pine anti-spam compares structure price with lastAlertPrice.
+    For PREPARE we make the key structure-based (NOT candle-time based),
+    so the same structure does not create another pending order every scan.
+  */
+  const eventKey = [
+    "PREPARE",
+    pair,
+    tfLabel(tf),
+    prepareSignal,
+    fmtPrice(prepareEntry)
+  ].join("|");
+
+  const prepareScore =
+    2 +   // valid structure
+    1.5 + // EMA confirmed
+    1 +   // volatility
+    1.5 + // EMA direction
+    1;    // price close side
+
+  const prepareGrade = getGrade(prepareScore);
+
+  return {
+    valid: true,
+    key: eventKey,
+    pair,
+    tf: tfLabel(tf),
+    signal: prepareSignal,
+    status: prepareSignal,
+    engine: "SMC",
+    grade: prepareGrade,
+    score: prepareScore,
+    entry: prepareEntry,
+    tp1: prepareLevels.tp1,
+    tp2: prepareLevels.tp2,
+    tp3: prepareLevels.tp3,
+    sl: prepareLevels.sl,
+    atr: lockedAtr14,
+    atrSma20: liveAtrSma20,
+    targetRange: prepareLevels.targetRange,
+    ema9: liveEma9,
+    ema20: liveEma20,
+    emaConfirm: "YES",
+    volatilityOk: liveVolatilityOk,
+    volatilityEnabled,
+    structurePeriod,
+    prepareDistancePct,
+    minRrr,
+    rrr,
+    priority: pairConfig.priority || "NORMAL",
+    scanOrder: Number(pairConfig.scanOrder || 0),
+    dataSymbol: pairConfig.dataSymbol || pair,
+    structureHigh: structure.lastHigh,
+    structureLow: structure.lastLow,
+    mainSignal: "PREPARE",
+    candleTime: current.time,
+    direction: prepareDirection,
+    currentPrice: current.close,
+    distanceToEntryPct:
+      Math.abs(current.close - prepareEntry) /
+      Math.abs(prepareEntry) *
+      100,
+    diagnostic: {
+      mode: "ACTIONABLE_PREPARE",
+      feedSymbol: pairConfig.dataSymbol || pair,
+      pair,
+      tf: tfLabel(tf),
+      currentTime: current.time,
+      currentOHLC: {
+        open: current.open,
+        high: current.high,
+        low: current.low,
+        close: current.close
+      },
+      lastClosedTime: lastClosed.time,
+      lastClosedOHLC: {
+        open: lastClosed.open,
+        high: lastClosed.high,
+        low: lastClosed.low,
+        close: lastClosed.close
+      },
+      structurePeriod,
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      structureHighPivotTime:
+        structure.lastHighIndex >= 0
+          ? closed[structure.lastHighIndex]?.time || null
+          : null,
+      structureLowPivotTime:
+        structure.lastLowIndex >= 0
+          ? closed[structure.lastLowIndex]?.time || null
+          : null,
+      pivotHighHistory: structure.pivotHighHistory,
+      pivotLowHistory: structure.pivotLowHistory,
+      pineState: structure.pineState,
+      persistentMode: structure.persistentMode,
+      highBreakPending: structure.highBreakPending,
+      lowBreakPending: structure.lowBreakPending,
+      prepareDistancePct,
+      distanceToEntryPct:
+        Math.abs(current.close - prepareEntry) /
+        Math.abs(prepareEntry) * 100,
+      ema9: liveEma9,
+      ema20: liveEma20,
+      emaLong: liveEmaLong,
+      emaShort: liveEmaShort,
+      atr14: liveAtr14,
+      atr14Locked: lockedAtr14,
+      atrSnapshot: setupSnapshot,
+      atrSma20: liveAtrSma20,
+      volatilityOk: liveVolatilityOk,
+      entry: prepareEntry,
+      targetCalculationMode: "ATR_SNAPSHOT_LOCKED",
+      snapshotIdentity,
+      snapshotCandleTime: setupSnapshot.signalCandleTime,
+      snapshotStructureTime: setupSnapshot.structureTime,
+      tp1: prepareLevels.tp1,
+      tp2: prepareLevels.tp2,
+      tp3: prepareLevels.tp3,
+      sl: prepareLevels.sl
+    },
+    sourceMode: "V11.3_PERSISTENT_PINE_ATR_SNAPSHOT_LOCKED",
+    createdAt: new Date().toISOString()
+  };
+}
+
+async function getJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(
+      "Respons bukan JSON (" + response.status + "): " + text.slice(0, 120)
+    );
+  }
+
+  if (!response.ok || data.error) {
+    const error = new Error(data.error || "HTTP " + response.status);
+    error.status = response.status;
+    throw error;
+  }
+
+  return data;
+}
+
+async function login() {
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    throw new Error(
+      "WORKER_ADMIN_EMAIL / WORKER_ADMIN_PASSWORD belum diisi"
+    );
+  }
+
+  const data = await getJson(APP_BASE_URL + "/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      email: ADMIN_EMAIL,
+      password: ADMIN_PASSWORD
+    })
+  });
+
+  authToken = data.token;
+  console.log("[WORKER] Login admin berhasil:", ADMIN_EMAIL);
+}
+
+async function authorizedApi(pathname, options = {}, retry = true) {
+  if (!authToken) await login();
+
+  try {
+    return await getJson(APP_BASE_URL + pathname, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + authToken,
+        ...(options.headers || {})
+      }
+    });
+  } catch (error) {
+    if (retry && (error.status === 401 || error.status === 403)) {
+      authToken = "";
+      await login();
+      return authorizedApi(pathname, options, false);
+    }
+    throw error;
+  }
+}
+async function fetchCandles(pair, tf) {
+  if (!API_KEYS.length) {
+    throw new Error("Twelve Data API key belum diisi");
+  }
+
+  let lastError = null;
+  let availableKeyFound = false;
+
+  for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
+    const currentIndex = keyIndex++ % API_KEYS.length;
+
+    if (isApiKeyBlocked(currentIndex)) {
+      const blockedUntil = API_KEY_BLOCKED_UNTIL.get(currentIndex);
+
+      console.log(
+        "[API SKIP]",
+        "key",
+        currentIndex + 1,
+        "masih diblokir sampai",
+        new Date(blockedUntil).toISOString()
+      );
+
+      continue;
+    }
+
+    availableKeyFound = true;
+
+    const apiKey = API_KEYS[currentIndex];
+    const url = new URL("https://api.twelvedata.com/time_series");
+
+    url.searchParams.set("symbol", pair);
+    url.searchParams.set("interval", intervalFromTf(tf));
+    url.searchParams.set("outputsize", String(OUTPUT_SIZE));
+    url.searchParams.set("format", "JSON");
+    url.searchParams.set("apikey", apiKey);
+
+    console.log(
+      "[API]",
+      pair,
+      tfLabel(tf),
+      "key",
+      currentIndex + 1,
+      "of",
+      API_KEYS.length
+    );
+
+    try {
+      const data = await getJson(url.toString());
+
+      if (data.status === "error") {
+        throw new Error(data.message || "Twelve Data error");
+      }
+
+      const candles = (data.values || [])
+        .map(v => ({
+          time: v.datetime,
+          open: Number(v.open),
+          high: Number(v.high),
+          low: Number(v.low),
+          close: Number(v.close),
+          volume: Number(v.volume || 1)
+        }))
+        .filter(c =>
+          Number.isFinite(c.open) &&
+          Number.isFinite(c.high) &&
+          Number.isFinite(c.low) &&
+          Number.isFinite(c.close)
+        )
+        .reverse();
+
+      if (candles.length < 70) {
+        throw new Error("Candle kurang dari 70");
+      }
+
+      return candles;
+
+    } catch (error) {
+      lastError = error;
+
+      const message = String(error.message || "");
+
+      if (
+        error.status === 429 ||
+        message.includes("429") ||
+        message.toLowerCase().includes("credits for the day")
+      ) {
+        blockApiKey(currentIndex, message);
         continue;
       }
 
-      const rawSignal=String(s.signal||'').toUpperCase();
-      const direction=String(
-        s.direction||
-        (rawSignal.includes('LONG')?'LONG':
-         rawSignal.includes('SHORT')?'SHORT':'')
-      ).toUpperCase()||null;
+      throw error;
+    }
+  }
 
-      rows.push({
-        pair,
-        symbol:pair,
-        tf:normalizeEaTimeframe(s.tf)+'m',
-        source:'SERVER WORKER',
-        signal:rawSignal,
-        status:displayStatus(s),
-        direction,
-        entry:Number(s.entry||0)||null,
-        tp1:Number(s.tp1||0)||null,
-        tp2:Number(s.tp2||0)||null,
-        tp3:Number(s.tp3||0)||null,
-        sl:Number(s.sl||0)||null,
-        signalId:String(s.id||''),
-        emaConfirm:String(s.emaConfirm||''),
-        engine:String(s.engine||''),
-        lifecycleStatus:String(s.lifecycleStatus||'ACTIVE'),
-        executionStatus:String(
-          (s.execution&&s.execution.status)||'NEW'
-        ),
-        createdAt:s.createdAt||null,
-        updatedAt:s.updatedAt||s.createdAt||null
-      });
+  if (!availableKeyFound) {
+    const blockedTimes = [...API_KEY_BLOCKED_UNTIL.values()];
+    const nearest = blockedTimes.length
+      ? Math.min(...blockedTimes)
+      : null;
+
+    throw new Error(
+      nearest
+        ? "Semua API key sedang diblokir sampai minimal " +
+          new Date(nearest).toISOString()
+        : "Semua API key sedang diblokir"
+    );
+  }
+
+  throw new Error(
+    "Semua Twelve Data API key gagal atau terkena limit. " +
+    (lastError ? lastError.message : "")
+  );
+}
+async function saveSignal(signal) {
+  return authorizedApi("/api/signals/upsert", {
+    method: "POST",
+    body: JSON.stringify(signal)
+  });
+}
+
+async function sendNotification(signal) {
+  return authorizedApi("/api/push/broadcast", {
+    method: "POST",
+    body: JSON.stringify({
+      pair: signal.pair,
+      signal: signal.signal,
+      grade: signal.grade,
+      engine: signal.engine,
+      entry: fmtPrice(signal.entry),
+      tp1: fmtPrice(signal.tp1),
+      tp2: fmtPrice(signal.tp2),
+      tp3: fmtPrice(signal.tp3),
+      sl: fmtPrice(signal.sl),
+      emaConfirm: signal.emaConfirm,
+      volatility: signal.volatilityOk ? "OK" : "LOW",
+      mainSignal: signal.mainSignal,
+      sourceMode: signal.sourceMode
+    })
+  });
+}
+
+function printTvDiagnostic(signal, pair, tf) {
+  const d = signal?.diagnostic;
+  if (!d) return;
+
+  const compact = {
+    mode: d.mode,
+    feed: d.feedSymbol,
+    pair,
+    tf: tfLabel(tf),
+    currentTime: d.currentTime,
+    currentOHLC: d.currentOHLC,
+    lastClosedTime: d.lastClosedTime,
+    lastClosedOHLC: d.lastClosedOHLC,
+    structurePeriod: d.structurePeriod,
+    structureHigh: d.structureHigh,
+    structureLow: d.structureLow,
+    structureHighPivotTime: d.structureHighPivotTime,
+    structureLowPivotTime: d.structureLowPivotTime,
+    pivotHighHistory: d.pivotHighHistory,
+    pivotLowHistory: d.pivotLowHistory,
+    pineState: d.pineState,
+    persistentMode: d.persistentMode,
+    highBreakPending: d.highBreakPending,
+    lowBreakPending: d.lowBreakPending,
+    prepareDistancePct: d.prepareDistancePct,
+    distanceToHighPct: d.distanceToHighPct,
+    distanceToLowPct: d.distanceToLowPct,
+    distanceToEntryPct: d.distanceToEntryPct,
+    prepLongRaw: d.prepLongRaw,
+    prepShortRaw: d.prepShortRaw,
+    prepLong: d.prepLong,
+    prepShort: d.prepShort,
+    ema9: d.ema9,
+    ema20: d.ema20,
+    emaLong: d.emaLong,
+    emaShort: d.emaShort,
+    atr14: d.atr14,
+    atrSma20: d.atrSma20,
+    volatilityOk: d.volatilityOk,
+    entry: d.entry,
+    tp1: d.tp1,
+    tp2: d.tp2,
+    tp3: d.tp3,
+    sl: d.sl,
+    breakout: d.breakout
+  };
+
+  console.log("[TV-DIAG]", JSON.stringify(compact));
+}
+
+async function processPairTf(pairConfig, tf) {
+  const pair = pairConfig.symbol;
+  const candles = await fetchCandles(pairConfig.dataSymbol, tf);
+  const signal = analyzeSmc(pair, tf, candles, pairConfig);
+
+  printTvDiagnostic(signal, pair, tf);
+
+  if (!signal.valid) {
+    console.log(
+      "[SCAN]",
+      pair,
+      tfLabel(tf),
+      signal.reason,
+      signal.grade || ""
+    );
+    return signal;
+  }
+
+  const stateKey = pair + "|" + tf;
+  const lastKey = state.lastSignalByPairTf[stateKey];
+
+  if (lastKey === signal.key) {
+    console.log("[SCAN]", pair, tfLabel(tf), "signal sudah pernah dikirim");
+    return signal;
+  }
+
+  await saveSignal(signal);
+  await sendNotification(signal);
+
+  state.lastSignalByPairTf[stateKey] = signal.key;
+  state.lastDirectionByPairTf[stateKey] = signal.direction;
+  saveState(state);
+
+  console.log(
+    "[SIGNAL]",
+    signal.pair,
+    signal.tf,
+    signal.signal,
+    "EMA_ACTIONABLE",
+    "Entry",
+    fmtPrice(signal.entry),
+    "SL",
+    fmtPrice(signal.sl),
+    "TP1",
+    fmtPrice(signal.tp1),
+    "EMA",
+    signal.emaConfirm || "-",
+    "VOL",
+    signal.volatilityOk ? "OK" : "LOW",
+    signal.sourceMode || ""
+  );
+
+  return signal;
+}
+
+const runningByTf = { "5": false, "15": false };
+const LAST_DISTANCE_BY_KEY = {};
+
+function diagnosticDistance(signal) {
+  const d = signal?.diagnostic;
+  if (!d) return Number.POSITIVE_INFINITY;
+
+  const candidates = [
+    d.distanceToEntryPct,
+    d.distanceToHighPct,
+    d.distanceToLowPct
+  ]
+    .map(Number)
+    .filter(Number.isFinite);
+
+  return candidates.length
+    ? Math.min(...candidates)
+    : Number.POSITIVE_INFINITY;
+}
+
+function buildScanPlanForTf(tf) {
+  const jobs = ACTIVE_PAIR_SETTINGS
+    .filter(pairConfig =>
+      Array.isArray(pairConfig.timeframes) &&
+      pairConfig.timeframes.includes(String(tf))
+    )
+    .map(pairConfig => ({
+      pairConfig,
+      tf: String(tf),
+      distance:
+        LAST_DISTANCE_BY_KEY[pairConfig.symbol + "|" + tf] ??
+        Number.POSITIVE_INFINITY
+    }));
+
+  // Priority first, then pair nearest to structure, then scan_order.
+  jobs.sort((a, b) => {
+    const p =
+      priorityWeight(a.pairConfig.priority) -
+      priorityWeight(b.pairConfig.priority);
+    if (p !== 0) return p;
+
+    if (a.distance !== b.distance) {
+      return a.distance - b.distance;
     }
 
-    return res.json({
-      ok:true,
-      source:'EA_SIGNAL_STORE',
-      sourceOfTruth:'BACKGROUND_WORKER',
-      tf:tf+'m',
-      engine:requestedFamily,
-      count:rows.length,
-      rows
-    });
-
-  }catch(err){
-    console.error('scanner current error:',err);
-    return res.status(500).json({
-      ok:false,
-      error:err.message||'Gagal mengambil signal scanner worker'
-    });
-  }
-});
-
-app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
-
-app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});
-app.post('/api/push/subscribe',auth,(req,res)=>{let sub=req.body.subscription;if(!sub||!sub.endpoint)return res.status(400).json({error:'Invalid'});let d=pushdb(),old=d.subscriptions.find(x=>x.endpoint===sub.endpoint);if(old)old.subscription=sub;else d.subscriptions.push({id:uuid(),userId:req.user.id,email:req.user.email,endpoint:sub.endpoint,subscription:sub});savePush(d);res.json({success:true})});
-app.post('/api/push/broadcast',auth,async(req,res)=>{
-  setupPush();
-
-  let s=req.body||{};
-  let title='⚡ DEWA SIGNAL';
-
-  if(s.signal==='OPEN LONG') title='🟢 NEW LONG';
-  else if(s.signal==='OPEN SHORT') title='🔴 NEW SHORT';
-  else if(s.signal==='REVERSE LONG') title='🔄 REVERSE LONG';
-  else if(s.signal==='REVERSE SHORT') title='🔄 REVERSE SHORT';
-
-  let action='';
-  if(s.signal==='REVERSE LONG') action='Close SELL → Open BUY\n';
-  if(s.signal==='REVERSE SHORT') action='Close BUY → Open SELL\n';
-
-  let body=`${s.pair} • ${s.signal}\n${action}Entry: ${s.entry} | TP1: ${s.tp1} | SL: ${s.sl}`;
-
-  let payload=JSON.stringify({
-    title,
-    body,
-    url:'/'
+    return (
+      Number(a.pairConfig.scanOrder || 0) -
+      Number(b.pairConfig.scanOrder || 0)
+    );
   });
 
-  let d=pushdb();
+  return jobs;
+}
 
-  for(let it of d.subscriptions){
-    try{
-      await webpush.sendNotification(it.subscription,payload);
-    }catch(e){}
+async function runScannerForTf(tf, mode) {
+  tf = String(tf);
+
+  if (runningByTf[tf]) {
+    console.log("[WORKER]", tfLabel(tf), "scan sebelumnya masih berjalan, skip.");
+    return;
   }
 
-  res.json({success:true});
-});
-function getC(k){let o=cache.get(k);return o&&Date.now()-o.t<CACHE_MS?o.d:null}function setC(k,d){cache.set(k,{t:Date.now(),d})}
-app.get('/api/binance/candles',auth,async(req,res)=>{let symbol=String(req.query.symbol||'BTCUSDT').toUpperCase().replace(/[^A-Z0-9]/g,''),interval=req.query.interval||'5m',n=Math.min(Number(req.query.outputsize||180),500),ck=`B|${symbol}|${interval}|${n}`,c=getC(ck);if(c)return res.json({...c,cached:true});let r=await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${n}`),d=await r.json();if(!r.ok||!Array.isArray(d))return res.status(502).json({error:'Binance error'});let values=d.map(k=>({datetime:new Date(k[0]).toISOString(),open:k[1],high:k[2],low:k[3],close:k[4],volume:k[5]})).reverse(),out={symbol,interval,source:'Binance',values,cached:false};setC(ck,out);res.json(out)});
-app.get('/api/twelvedata/candles',auth,async(req,res)=>{if(!KEYS.length)return res.status(500).json({error:'Belum ada Twelve Data key'});let symbol=String(req.query.symbol||'XAU/USD').toUpperCase(),interval=req.query.interval||'5min',n=Math.min(Number(req.query.outputsize||180),500),ck=`T|${symbol}|${interval}|${n}`,c=getC(ck);if(c)return res.json({...c,cached:true});let key=KEYS[keyIndex++%KEYS.length],url=new URL('https://api.twelvedata.com/time_series');url.searchParams.set('symbol',symbol);url.searchParams.set('interval',interval);url.searchParams.set('outputsize',String(n));url.searchParams.set('format','JSON');url.searchParams.set('apikey',key);let r=await fetch(url),d=await r.json();if(!r.ok||d.status==='error')return res.status(502).json({error:d.message||'Twelve Data error'});let out={symbol,interval,source:'Twelve Data',values:d.values,cached:false};setC(ck,out);res.json(out)});
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    version: 'V8 EMAIL+MT5 AUTH | M5/M15 | SYMBOL NORMALIZATION',
-    version: 'V9 QUEUE+ACK | V8 COMPATIBLE | EMAIL+MT5 AUTH',
-    time: new Date().toISOString()
-  });
-});
-app.get('/api/subscriptions', (req, res) => {
+  runningByTf[tf] = true;
+  const started = Date.now();
+  const scanPlan = buildScanPlanForTf(tf);
+
+  console.log(
+    "\n[WORKER]",
+    mode,
+    "scan mulai",
+    tfLabel(tf),
+    new Date().toISOString(),
+    "jobs=" + scanPlan.length,
+    "configRefreshedAt=" + (LAST_CONFIG_REFRESH_AT || "ENV")
+  );
+
   try {
-    const data = pushdb();
-    res.json({
-      total: data.subscriptions.length,
-      subscriptions: data.subscriptions
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: err.message
-    });
-  }
-});
-app.get('/test-notification', async (req, res) => {
-  try {
-    setupPush();
+    for (const job of scanPlan) {
+      const { pairConfig } = job;
+      const stateKey = pairConfig.symbol + "|" + tf;
 
-    const data = pushdb();
-
-    const payload = JSON.stringify({
-      title: '🧪 TEST DEWA SMC',
-      body: 'Push notification berhasil dikirim',
-      icon: '/icon-192.png',
-      url: '/'
-    });
-
-    let sent = 0;
-
-    for (const item of data.subscriptions) {
       try {
-        const sub = item.subscription || item;
-
-        await webpush.sendNotification(sub, payload);
-
-        sent++;
-      } catch (err) {
-        console.error(err.message);
+        const signal = await processPairTf(pairConfig, tf);
+        LAST_DISTANCE_BY_KEY[stateKey] = diagnosticDistance(signal);
+      } catch (error) {
+        console.error(
+          "[SCAN ERROR]",
+          pairConfig.symbol,
+          tfLabel(tf),
+          error.message
+        );
       }
+
+      // Keep a buffer between Twelve Data requests.
+      await sleep(1500);
     }
+  } finally {
+    runningByTf[tf] = false;
 
-    res.json({
-      success: true,
-      sent,
-      total: data.subscriptions.length
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    console.log(
+      "[WORKER]",
+      mode,
+      tfLabel(tf),
+      "scan selesai dalam",
+      Math.round((Date.now() - started) / 1000),
+      "detik"
+    );
   }
-});
-app.get('/debug/users', (req,res)=>{
-  res.json(db().users.map(u=>({
-    email:u.email,
-    role:u.role,
-    status:u.status,
-    active:active(u),
-    hasPassword:!!u.passwordHash
-  })));
-});
+}
 
-app.get('*',(req,res)=>{
-  res.sendFile(path.join(__dirname,'public','index.html'));
-});
+async function main() {
+  console.log("==============================================");
+  console.log("DEWA SMC SERVER SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME");
+  console.log("APP:", APP_BASE_URL);
+  console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
+  console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));
+  console.log("FAST M5:", FAST_SCAN_SECONDS, "detik");
+  console.log("SLOW M15:", SLOW_SCAN_SECONDS, "detik");
+  console.log("CONFIG REFRESH:", SCAN_SECONDS, "detik");
+  console.log("==============================================");
 
-ensureAdmin().then(async()=>{
-  setupPush();
-  PUSH_CACHE = await loadPushFromSupabase();
+  if (!ENABLED) {
+    console.log("[WORKER] WORKER_ENABLED=false. Worker tidak dijalankan.");
+    return;
+  }
 
-  app.listen(PORT,'0.0.0.0',()=>{
-    console.log('DEWA SMC V8 EMAIL+MT5 AUTH running at http://0.0.0.0:'+PORT);
-    console.log('DEWA SMC V9 QUEUE+ACK running at http://0.0.0.0:'+PORT);
-    console.log('Push subscriptions loaded:', PUSH_CACHE.subscriptions.length);
-    console.log('Supabase:', USE_SUPABASE ? 'ON' : 'OFF');
-  });
+  if (!API_KEYS.length) {
+    throw new Error("Tidak ada TWELVE_DATA_API_KEY_*");
+  }
+
+  await login();
+  await refreshWorkerConfig();
+
+  // Initial scan.
+  await runScannerForTf("5", "FAST");
+  await runScannerForTf("15", "SLOW");
+
+  // Fast M5 loop: catches PREPARE before breakout.
+  setInterval(() => {
+    runScannerForTf("5", "FAST").catch(error => {
+      console.error("[WORKER FAST LOOP]", error);
+    });
+  }, FAST_SCAN_SECONDS * 1000);
+
+  // Slower M15 loop.
+  setInterval(() => {
+    runScannerForTf("15", "SLOW").catch(error => {
+      console.error("[WORKER SLOW LOOP]", error);
+    });
+  }, SLOW_SCAN_SECONDS * 1000);
+
+  // Configuration refresh is independent from market scans.
+  setInterval(() => {
+    refreshWorkerConfig().catch(error => {
+      console.error("[WORKER CONFIG LOOP]", error);
+    });
+  }, SCAN_SECONDS * 1000);
+}
+
+main().catch(error => {
+  console.error("[WORKER START ERROR]", error);
+  process.exit(1);
 });

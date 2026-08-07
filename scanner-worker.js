@@ -5,7 +5,7 @@ const path = require("path");
 const fetch = require("node-fetch");
 
 /*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V11.4 PREPARE-ZONE ATR SNAPSHOT + ATOMIC PIVOT TIME
+  DEWA SMC SERVER-SIDE SCANNER WORKER V11.5 TV-EVENT LIFECYCLE LOCK + ATR SNAPSHOT
   ------------------------------------------------------------
   Fungsi:
   - Scan otomatis tanpa browser.
@@ -306,6 +306,7 @@ state.lastDirectionByPairTf = state.lastDirectionByPairTf || {};
 state.pineStructureByPairTf = state.pineStructureByPairTf || {};
 state.lastConsumedBreakTimeByPairTf = state.lastConsumedBreakTimeByPairTf || {};
 state.setupSnapshotByPairTf = state.setupSnapshotByPairTf || {};
+state.tvEventLifecycleByPairTf = state.tvEventLifecycleByPairTf || {};
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -653,7 +654,18 @@ function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
       pivotLowHistory: snap.pivotLowHistory || []
     };
     saveState(state);
-    return { ...snap, persistentMode: "BOOTSTRAP" };
+    return {
+      ...snap,
+      persistentMode: "BOOTSTRAP",
+      pineState: {
+        ...snap.pineState,
+        lastHighTime:
+          snap.lastHighIndex >= 0 ? candles[snap.lastHighIndex]?.time || null : null,
+        lastLowTime:
+          snap.lastLowIndex >= 0 ? candles[snap.lastLowIndex]?.time || null : null,
+        lastProcessedCandleTime: lastClosedTime
+      }
+    };
   }
 
   // Reconstruct enough context to confirm pivots whose right bars have just
@@ -920,6 +932,26 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
 
   if (freshBreak) {
     const breakStateKey = pair + "|" + tf;
+
+    // V11.5: record confirmed TV-compatible structure events for setup lifecycle.
+    // A previous PREPARE may only generate another setup after a real market-structure
+    // transition, instead of merely because a newly confirmed pivot changed entry price.
+    const lifecycle = state.tvEventLifecycleByPairTf[breakStateKey] || null;
+    if (lifecycle && lifecycle.sentAt) {
+      lifecycle.lastBreakTime = freshBreak.candleTime;
+      lifecycle.lastBreakDirection = freshBreak.direction;
+      lifecycle.lastBreakType = freshBreak.type;
+
+      if (freshBreak.direction === lifecycle.direction) {
+        lifecycle.sameDirectionBreakAfterSignal = true;
+      } else if (String(freshBreak.type || "").startsWith("CHoCH")) {
+        lifecycle.oppositeChochAfterSignal = true;
+      }
+
+      state.tvEventLifecycleByPairTf[breakStateKey] = lifecycle;
+      saveState(state);
+    }
+
     const consumedBreakTime =
       state.lastConsumedBreakTimeByPairTf[breakStateKey] || null;
 
@@ -956,7 +988,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       structureLow: structure.lastLow,
       diagnostic: {
         mode: "BREAKOUT",
-        scannerVersion: "V11.4",
+        scannerVersion: "V11.5",
         feedSymbol: pairConfig.dataSymbol || pair,
         pair,
         tf: tfLabel(tf),
@@ -1036,7 +1068,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
     Math.abs(current.close - structure.lastLow) <= shortThreshold;
 
   /*
-    V11.4 PREPARE-ZONE ATR SNAPSHOT
+    V11.5 PREPARE-ZONE ATR SNAPSHOT
     --------------------------------
     Capture ATR at the FIRST raw touch of the 0.25% prepare zone.
     EMA still decides whether a signal becomes actionable, but later ATR
@@ -1093,8 +1125,9 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
     );
   }
 
-  const prepLong = prepLongRaw && liveEmaLong;
-  const prepShort = prepShortRaw && liveEmaShort;
+  // V11.5: volatility is a real gate, not only a diagnostic/score label.
+  const prepLong = prepLongRaw && liveEmaLong && liveVolatilityOk;
+  const prepShort = prepShortRaw && liveEmaShort && liveVolatilityOk;
 
   let prepareDirection = null;
 
@@ -1137,7 +1170,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       volatilityOk: liveVolatilityOk,
       diagnostic: {
         mode: "SCAN",
-      scannerVersion: "V11.4",
+      scannerVersion: "V11.5",
         feedSymbol: pairConfig.dataSymbol || pair,
         pair,
         tf: tfLabel(tf),
@@ -1195,8 +1228,100 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       ? structure.lastHigh
       : structure.lastLow;
 
+  // =========================================================================
+  // V11.5 TV-EVENT LIFECYCLE LOCK
+  // =========================================================================
+  // Problem fixed: V11.4 treated a changed pivot/entry as a brand-new PREPARE
+  // event. That could send a new setup to EA while TradingView still had no new
+  // signal. V11.5 keeps one market-leg lifecycle per pair/timeframe.
+  //
+  // Same direction: requires a confirmed BOS/CHoCH in that direction AFTER the
+  // previous signal, then a genuinely new pivot structure.
+  // Opposite direction: requires an opposite CHoCH AFTER the previous signal,
+  // then a genuinely new pivot structure. A plain pivot change is never enough.
+  const lifecycleKey = pair + "|" + tf;
+  const previousLifecycle = state.tvEventLifecycleByPairTf[lifecycleKey] || null;
+  const prepareStructureTime =
+    prepareDirection === "LONG"
+      ? (structure.pineState?.lastHighTime || null)
+      : (structure.pineState?.lastLowTime || null);
+
+  let lifecycleAllowed = true;
+  let lifecycleReason = "FIRST_SETUP";
+
+  if (previousLifecycle && previousLifecycle.sentAt) {
+    const sameDirection = previousLifecycle.direction === prepareDirection;
+    const newStructure =
+      !!prepareStructureTime &&
+      prepareStructureTime !== previousLifecycle.structureTime;
+
+    if (sameDirection) {
+      lifecycleAllowed =
+        previousLifecycle.sameDirectionBreakAfterSignal === true &&
+        newStructure;
+      lifecycleReason = lifecycleAllowed
+        ? "NEW_STRUCTURE_AFTER_CONFIRMED_BREAK"
+        : "LOCKED_WAIT_CONFIRMED_BREAK_AND_NEW_STRUCTURE";
+    } else {
+      lifecycleAllowed =
+        previousLifecycle.oppositeChochAfterSignal === true &&
+        structure.trendDirection === (prepareDirection === "LONG" ? 1 : -1) &&
+        newStructure;
+      lifecycleReason = lifecycleAllowed
+        ? "OPPOSITE_AFTER_CONFIRMED_CHOCH"
+        : "LOCKED_WAIT_OPPOSITE_CHOCH_AND_NEW_STRUCTURE";
+    }
+  }
+
+  if (!lifecycleAllowed) {
+    return {
+      valid: false,
+      reason: "TV EVENT LIFECYCLE LOCK",
+      direction: prepareDirection,
+      structureHigh: structure.lastHigh,
+      structureLow: structure.lastLow,
+      liveClose: current.close,
+      diagnostic: {
+        mode: "PREPARE_LOCKED",
+        scannerVersion: "V11.5",
+        feedSymbol: pairConfig.dataSymbol || pair,
+        pair,
+        tf: tfLabel(tf),
+        currentTime: current.time,
+        currentOHLC: current,
+        lastClosedTime: lastClosed.time,
+        structurePeriod,
+        structureHigh: structure.lastHigh,
+        structureLow: structure.lastLow,
+        structureHighPivotTime: structure.pineState?.lastHighTime || null,
+        structureLowPivotTime: structure.pineState?.lastLowTime || null,
+        highBreakPending: structure.highBreakPending,
+        lowBreakPending: structure.lowBreakPending,
+        trendDirection: structure.trendDirection,
+        prepareDistancePct,
+        prepLongRaw,
+        prepShortRaw,
+        prepLong,
+        prepShort,
+        ema9: liveEma9,
+        ema20: liveEma20,
+        emaLong: liveEmaLong,
+        emaShort: liveEmaShort,
+        atr14: liveAtr14,
+        atrSma20: liveAtrSma20,
+        volatilityOk: liveVolatilityOk,
+        candidateDirection: prepareDirection,
+        candidateEntry: prepareEntry,
+        candidateStructureTime: prepareStructureTime,
+        lifecycleAllowed,
+        lifecycleReason,
+        previousLifecycle
+      }
+    };
+  }
+
   /*
-    V11.4 ATR LOCK RESOLUTION
+    V11.5 ATR LOCK RESOLUTION
     -------------------------
     Prefer the ATR snapshot captured at the first raw PREPARE-zone touch.
     If state was lost/redeployed, create a safe fallback snapshot now.
@@ -1204,9 +1329,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
   const snapshotIdentity = [
     prepareDirection,
     fmtPrice(prepareEntry),
-    prepareDirection === "LONG"
-      ? (structure.pineState?.lastHighTime || "")
-      : (structure.pineState?.lastLowTime || "")
+    prepareStructureTime || ""
   ].join("|");
 
   let setupSnapshot = state.setupSnapshotByPairTf[snapshotStoreKey] || null;
@@ -1222,10 +1345,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       entry: prepareEntry,
       atr14: liveAtr14,
       atrSma20: liveAtrSma20,
-      structureTime:
-        prepareDirection === "LONG"
-          ? (structure.pineState?.lastHighTime || null)
-          : (structure.pineState?.lastLowTime || null),
+      structureTime: prepareStructureTime,
       rawPrepareCandleTime: current.time,
       lastClosedTime: lastClosed.time,
       ema9AtRawPrepare: liveEma9,
@@ -1308,6 +1428,9 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
     mainSignal: "PREPARE",
     candleTime: current.time,
     direction: prepareDirection,
+    lifecycleKey,
+    lifecycleStructureTime: prepareStructureTime,
+    lifecycleReason,
     currentPrice: current.close,
     distanceToEntryPct:
       Math.abs(current.close - prepareEntry) /
@@ -1373,7 +1496,7 @@ function analyzeSmc(pair, tf, candles, pairConfig = {}) {
       tp3: prepareLevels.tp3,
       sl: prepareLevels.sl
     },
-    sourceMode: "V11.4_PERSISTENT_PINE_PREPARE_ZONE_ATR_LOCKED",
+    sourceMode: "V11.5_TV_EVENT_LIFECYCLE_LOCKED_ATR_SNAPSHOT",
     createdAt: new Date().toISOString()
   };
 }
@@ -1626,6 +1749,12 @@ function printTvDiagnostic(signal, pair, tf) {
     tp2: d.tp2,
     tp3: d.tp3,
     sl: d.sl,
+    lifecycleAllowed: d.lifecycleAllowed,
+    lifecycleReason: d.lifecycleReason,
+    candidateDirection: d.candidateDirection,
+    candidateEntry: d.candidateEntry,
+    candidateStructureTime: d.candidateStructureTime,
+    previousLifecycle: d.previousLifecycle,
     breakout: d.breakout
   };
 
@@ -1663,6 +1792,22 @@ async function processPairTf(pairConfig, tf) {
 
   state.lastSignalByPairTf[stateKey] = signal.key;
   state.lastDirectionByPairTf[stateKey] = signal.direction;
+
+  // V11.5: lock this market leg only after the signal was successfully saved
+  // and broadcast. A failed network request must never consume the lifecycle.
+  state.tvEventLifecycleByPairTf[stateKey] = {
+    direction: signal.direction,
+    signalKey: signal.key,
+    entry: signal.entry,
+    structureTime: signal.lifecycleStructureTime || null,
+    candleTime: signal.candleTime || null,
+    sentAt: new Date().toISOString(),
+    sameDirectionBreakAfterSignal: false,
+    oppositeChochAfterSignal: false,
+    lastBreakTime: null,
+    lastBreakDirection: null,
+    lastBreakType: null
+  };
   saveState(state);
 
   console.log(
@@ -1799,7 +1944,7 @@ async function runScannerForTf(tf, mode) {
 
 async function main() {
   console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V11.4 PREPARE-ZONE ATR SNAPSHOT + ATOMIC PIVOT TIME");
+  console.log("DEWA SMC SERVER SCANNER WORKER V11.5 PREPARE-ZONE ATR SNAPSHOT + ATOMIC PIVOT TIME");
   console.log("APP:", APP_BASE_URL);
   console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
   console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));

@@ -1,1797 +1,2094 @@
-require("dotenv").config();
+let token = localStorage.getItem("TOKEN") || "";
+let me = null;
+let limits = null;
+let autoTimer = null;
+let queueRunning = false;
+let results = [];
+let selected = null;
+let locks = JSON.parse(localStorage.getItem("DEWA_V6_LOCKS") || "{}");
+let DEWA_LAST_DIR = JSON.parse(localStorage.getItem("DEWA_LAST_DIR") || "{}");
 
-const fs = require("fs");
-const path = require("path");
-const fetch = require("node-fetch");
+const $ = id => document.getElementById(id);
 
-/*
-  DEWA SMC SERVER-SIDE SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME
-  ------------------------------------------------------------
-  Fungsi:
-  - Scan otomatis tanpa browser.
-  - Timeframe 5m dan 15m.
-  - SMC BOS/CHoCH + EMA 9/20 + ATR volatility.
-  - Mengirim signal Grade A/A+ ke server utama.
-  - Mengirim push notification melalui endpoint server.
-  - Mendukung PREPARE, OPEN, dan REVERSE.
-  - Market structure mengikuti Pine: ta.pivothigh/ta.pivotlow 20/20.
-  - BOS/CHoCH memakai candle body close.
-  - PREPARE memakai jarak structure 0.25% + EMA 9/20.
-  - ATR memakai Wilder/RMA seperti TradingView ta.atr(14).
-  - Volatility memakai ATR14 > SMA(ATR14,20).
+const PRESETS = {
+  crypto: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"],
+  forex: ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD"],
+  gold: ["XAU/USD", "XAG/USD"],
+  hybrid: ["BTC/USD", "ETH/USD", "XAU/USD", "EUR/USD"]
+};
 
-  Environment wajib:
-  APP_BASE_URL=https://dewa-smc-ai.onrender.com
-  WORKER_ADMIN_EMAIL=email admin
-  WORKER_ADMIN_PASSWORD=password admin
-  TWELVE_DATA_API_KEY_1=...
-  TWELVE_DATA_API_KEY_2=...
-  TWELVE_DATA_API_KEY_3=...
-
-  Environment opsional:
-  WORKER_ENABLED=true
-  WORKER_SCAN_SECONDS=120
-  WORKER_PAIRS=XAU/USD,BTC/USD,ETH/USD,EUR/USD,GBP/USD
-  WORKER_TFS=5,15
-  WORKER_OUTPUTSIZE=180
-*/
-
-const APP_BASE_URL = String(
-  process.env.APP_BASE_URL || "https://dewa-smc-ai.onrender.com"
-).replace(/\/+$/, "");
-
-const ADMIN_EMAIL = String(process.env.WORKER_ADMIN_EMAIL || "").trim();
-const ADMIN_PASSWORD = String(process.env.WORKER_ADMIN_PASSWORD || "");
-const ENABLED = String(process.env.WORKER_ENABLED || "true").toLowerCase() === "true";
-const SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SCAN_SECONDS || 300));
-const FAST_SCAN_SECONDS = Math.max(30, Number(process.env.WORKER_FAST_SCAN_SECONDS || 60));
-const SLOW_SCAN_SECONDS = Math.max(60, Number(process.env.WORKER_SLOW_SCAN_SECONDS || 300));
-const OUTPUT_SIZE = Math.max(120, Math.min(500, Number(process.env.WORKER_OUTPUTSIZE || 500)));
-
-const DEFAULT_PAIRS = String(
-  process.env.WORKER_PAIRS ||
-  "XAU/USD,BTC/USD,ETH/USD,EUR/USD,GBP/USD"
-)
-  .split(",")
-  .map(x => x.trim().toUpperCase())
-  .filter(Boolean);
-
-const DEFAULT_TFS = String(process.env.WORKER_TFS || "5,15")
-  .split(",")
-  .map(x => x.trim())
-  .filter(x => x === "5" || x === "15");
-
-
-const DEFAULT_PAIR_SETTINGS = DEFAULT_PAIRS.map((symbol, index) => ({
-  symbol,
-  dataSymbol: symbol,
-  timeframes: [...DEFAULT_TFS],
-  enabled: true,
-  priority: "NORMAL",
-  structurePeriod: 20,
-  prepareDistancePct: 0.25,
-  volatilityEnabled: true,
-  minRrr: 1.5,
-  scanOrder: index
-}));
-
-let ACTIVE_PAIR_SETTINGS = [...DEFAULT_PAIR_SETTINGS];
-let LAST_CONFIG_REFRESH_AT = null;
-
-function normalizePriority(value) {
-  const priority = String(value || "NORMAL").trim().toUpperCase();
-  return ["HIGH", "NORMAL", "LOW"].includes(priority) ? priority : "NORMAL";
+function fmt(x) {
+  return Number.isFinite(x)
+    ? Number(x).toLocaleString("en-US", { maximumFractionDigits: 6 })
+    : "-";
 }
 
-function priorityWeight(value) {
-  return { HIGH: 0, NORMAL: 1, LOW: 2 }[normalizePriority(value)];
+function priceFmt(pair, x) {
+  if (!Number.isFinite(x)) return "-";
+
+  pair = String(pair || "");
+
+  if (pair.includes("JPY")) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 3 });
+  }
+
+  if (pair.includes("/") && !pair.includes("XAU") && !pair.includes("XAG")) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 5 });
+  }
+
+  if (pair.includes("XAU") || pair.includes("XAG")) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  }
+
+  if (Number(x) >= 1000) {
+    return Number(x).toLocaleString("en-US", { maximumFractionDigits: 2 });
+  }
+
+  return Number(x).toLocaleString("en-US", { maximumFractionDigits: 4 });
 }
 
-function normalizeWorkerPair(raw, index = 0) {
-  const symbol = String(
-    raw?.symbol || raw?.displaySymbol || raw?.dataSymbol || raw?.data_symbol || ""
-  ).trim().toUpperCase();
+function authLog(x) {
+  $("authLog").textContent =
+    new Date().toLocaleTimeString() + " - " + x + "\n" + $("authLog").textContent;
+}
 
-  const dataSymbol = String(
-    raw?.dataSymbol || raw?.data_symbol || symbol
-  ).trim().toUpperCase();
+function log(x) {
+  $("log").textContent =
+    new Date().toLocaleTimeString() + " - " + x + "\n" + $("log").textContent;
+}
 
-  const rawTfs = Array.isArray(raw?.timeframes)
-    ? raw.timeframes
-    : DEFAULT_TFS;
-
-  const timeframes = [...new Set(
-    rawTfs.map(String).filter(tf => tf === "5" || tf === "15")
-  )];
-
+function headers() {
   return {
-    symbol,
-    dataSymbol,
-    timeframes: timeframes.length ? timeframes : [...DEFAULT_TFS],
-    enabled: raw?.enabled !== false,
-    priority: normalizePriority(raw?.priority),
-    structurePeriod: Math.min(
-      60,
-      Math.max(2, Number(raw?.structurePeriod ?? raw?.structure_period ?? 20))
-    ),
-    prepareDistancePct: Math.min(
-      5,
-      Math.max(
-        0.00001,
-        Number(raw?.prepareDistancePct ?? raw?.prepare_distance_pct ?? 0.25)
-      )
-    ),
-    volatilityEnabled:
-      (raw?.volatilityEnabled ?? raw?.volatility_enabled) !== false,
-    minRrr: Math.max(
-      0.01,
-      Number(raw?.minRrr ?? raw?.min_rrr ?? 1.5)
-    ),
-    scanOrder: Number(raw?.scanOrder ?? raw?.scan_order ?? index)
+    "Content-Type": "application/json",
+    Authorization: "Bearer " + token
   };
 }
 
-function sortPairSettings(settings) {
-  return [...settings].sort((a, b) => {
-    const priorityDiff = priorityWeight(a.priority) - priorityWeight(b.priority);
-    if (priorityDiff !== 0) return priorityDiff;
-
-    const orderDiff = Number(a.scanOrder || 0) - Number(b.scanOrder || 0);
-    if (orderDiff !== 0) return orderDiff;
-
-    return a.symbol.localeCompare(b.symbol);
+async function api(p, o = {}) {
+  const r = await fetch(p, {
+    ...o,
+    headers: {
+      ...(o.headers || {}),
+      ...headers()
+    }
   });
-}
 
-async function refreshWorkerConfig() {
-  try {
-    const config = await authorizedApi("/api/worker/config");
+  const d = await r.json().catch(() => ({}));
 
-    let nextSettings = [];
-
-    if (Array.isArray(config.pairSettings) && config.pairSettings.length) {
-      nextSettings = config.pairSettings
-        .map(normalizeWorkerPair)
-        .filter(item => item.enabled && item.symbol && item.dataSymbol);
-    } else if (Array.isArray(config.pairs) && config.pairs.length) {
-      const globalTfs = Array.isArray(config.timeframes)
-        ? config.timeframes.map(String).filter(tf => tf === "5" || tf === "15")
-        : DEFAULT_TFS;
-
-      nextSettings = config.pairs
-        .map((pair, index) =>
-          normalizeWorkerPair(
-            {
-              symbol: pair,
-              dataSymbol: pair,
-              timeframes: globalTfs,
-              enabled: true,
-              scanOrder: index
-            },
-            index
-          )
-        )
-        .filter(item => item.symbol && item.dataSymbol);
-    }
-
-    if (!nextSettings.length) {
-      throw new Error("Konfigurasi pair aktif kosong");
-    }
-
-    ACTIVE_PAIR_SETTINGS = sortPairSettings(nextSettings);
-    LAST_CONFIG_REFRESH_AT = new Date().toISOString();
-
-    console.log(
-      "[WORKER CONFIG]",
-      "source=SUPABASE",
-      "pairs=" + ACTIVE_PAIR_SETTINGS.length,
-      "refreshedAt=" + LAST_CONFIG_REFRESH_AT
-    );
-
-    for (const item of ACTIVE_PAIR_SETTINGS) {
-      console.log(
-        "[PAIR CONFIG]",
-        item.symbol,
-        "data=" + item.dataSymbol,
-        "tf=" + item.timeframes.join(","),
-        "priority=" + item.priority,
-        "structure=" + item.structurePeriod,
-        "prepare=" + item.prepareDistancePct + "%",
-        "volatility=" + (item.volatilityEnabled ? "ON" : "OFF"),
-        "minRRR=" + item.minRrr,
-        "order=" + item.scanOrder
-      );
-    }
-  } catch (error) {
-    console.warn(
-      "[WORKER CONFIG] Gagal membaca konfigurasi Supabase. " +
-      "Memakai cache terakhir/ENV fallback:",
-      error.message
-    );
-
-    if (!ACTIVE_PAIR_SETTINGS.length) {
-      ACTIVE_PAIR_SETTINGS = [...DEFAULT_PAIR_SETTINGS];
-    }
-  }
-}
-
-const API_KEYS = Object.keys(process.env)
-  .filter(k => k.startsWith("TWELVE_DATA_API_KEY_"))
-  .sort((a, b) => {
-    const na = Number(a.match(/\d+$/)?.[0] || 0);
-    const nb = Number(b.match(/\d+$/)?.[0] || 0);
-    return na - nb;
-  })
-  .map(k => process.env[k])
-  .filter(Boolean);
-
-const STATE_FILE = path.join(__dirname, "data", "scanner-worker-state.json");
-
-let authToken = "";
-let keyIndex = 0;
-let running = false;
-
-const API_KEY_BLOCKED_UNTIL = new Map();
-
-function nextUtcMidnight(){
-  const now = new Date();
-
-  return Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate() + 1,
-    0,
-    1,
-    0
-  );
-}
-
-function isApiKeyBlocked(index){
-  const blockedUntil = API_KEY_BLOCKED_UNTIL.get(index) || 0;
-
-  if(blockedUntil <= Date.now()){
-    API_KEY_BLOCKED_UNTIL.delete(index);
-    return false;
+  if (!r.ok || d.error) {
+    throw Error(d.error || "API error");
   }
 
-  return true;
-}
-
-function blockApiKey(index, errorMessage){
-  const message = String(errorMessage || "").toLowerCase();
-
-  const isDailyLimit =
-    message.includes("credits for the day") ||
-    message.includes("daily") ||
-    message.includes("current limit being");
-
-  const blockedUntil = isDailyLimit
-    ? nextUtcMidnight()
-    : Date.now() + 70 * 1000;
-
-  API_KEY_BLOCKED_UNTIL.set(index, blockedUntil);
-
-  console.warn(
-    "[API KEY BLOCKED]",
-    "key",
-    index + 1,
-    "sampai",
-    new Date(blockedUntil).toISOString(),
-    isDailyLimit ? "(daily limit)" : "(minute limit)"
-  );
-}
-
-function ensureStateDir() {
-  const dir = path.dirname(STATE_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-function loadState() {
-  ensureStateDir();
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  } catch {
-    return { lastSignalByPairTf: {}, lastDirectionByPairTf: {} };
-  }
-}
-
-function saveState(state) {
-  ensureStateDir();
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-}
-
-const state = loadState();
-state.lastSignalByPairTf = state.lastSignalByPairTf || {};
-state.lastDirectionByPairTf = state.lastDirectionByPairTf || {};
-state.pineStructureByPairTf = state.pineStructureByPairTf || {};
-state.lastConsumedBreakTimeByPairTf = state.lastConsumedBreakTimeByPairTf || {};
-state.setupSnapshotByPairTf = state.setupSnapshotByPairTf || {};
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function intervalFromTf(tf) {
-  return tf === "15" ? "15min" : "5min";
-}
-
-function tfLabel(tf) {
-  return tf + "m";
-}
-
-function fmtPrice(x) {
-  if (!Number.isFinite(Number(x))) return "-";
-  return Number(x).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
-}
-
-function emaSeries(values, period) {
-  if (!Array.isArray(values) || values.length === 0 || period <= 0) return [];
-
-  const alpha = 2 / (period + 1);
-  const output = [];
-  let value = Number(values[0]);
-
-  output.push(value);
-
-  for (let i = 1; i < values.length; i++) {
-    const source = Number(values[i]);
-    value = alpha * source + (1 - alpha) * value;
-    output.push(value);
-  }
-
-  return output;
-}
-
-function ema(values, period) {
-  const series = emaSeries(values, period);
-  return series.length ? series[series.length - 1] : NaN;
-}
-
-function sma(values, period) {
-  if (!Array.isArray(values) || values.length < period || period <= 0) {
-    return NaN;
-  }
-
-  const slice = values.slice(-period);
-  return slice.reduce((a, b) => a + b, 0) / period;
-}
-
-function trueRangeSeries(candles) {
-  if (!Array.isArray(candles) || candles.length === 0) return [];
-
-  const output = [];
-
-  for (let i = 0; i < candles.length; i++) {
-    const current = candles[i];
-
-    if (i === 0) {
-      output.push(current.high - current.low);
-      continue;
-    }
-
-    const previousClose = candles[i - 1].close;
-
-    output.push(
-      Math.max(
-        current.high - current.low,
-        Math.abs(current.high - previousClose),
-        Math.abs(current.low - previousClose)
-      )
-    );
-  }
-
-  return output;
-}
-
-// TradingView ta.rma(): seed memakai SMA(period), lalu Wilder smoothing.
-function rmaSeries(values, period) {
-  if (!Array.isArray(values) || values.length < period || period <= 0) {
-    return [];
-  }
-
-  const output = new Array(values.length).fill(NaN);
-  let value =
-    values.slice(0, period).reduce((sum, item) => sum + item, 0) / period;
-
-  output[period - 1] = value;
-
-  for (let i = period; i < values.length; i++) {
-    value = (value * (period - 1) + values[i]) / period;
-    output[i] = value;
-  }
-
-  return output;
-}
-
-// TradingView ta.atr(period) = ta.rma(true range, period).
-function atrSeries(candles, period = 14) {
-  return rmaSeries(trueRangeSeries(candles), period);
-}
-
-function atr(candles, period = 14) {
-  const values = atrSeries(candles, period).filter(Number.isFinite);
-  return values.length ? values[values.length - 1] : NaN;
-}
-
-function getGrade(score) {
-  if (score >= 8) return "A+";
-  if (score >= 6.5) return "A";
-  if (score >= 5) return "B";
-  return "C";
-}
-
-// -----------------------------------------------------------------------------
-// TradingView/Pine compatibility helpers
-// Pine reference:
-//   ta.pivothigh(high, structurePeriod, structurePeriod)
-//   ta.pivotlow(low, structurePeriod, structurePeriod)
-// -----------------------------------------------------------------------------
-function pivotHighAt(candles, index, left, right) {
-  if (index - left < 0 || index + right >= candles.length) return null;
-  const value = candles[index].high;
-  if (!Number.isFinite(value)) return null;
-
-  // Closer to TradingView ta.pivothigh(): equal highs on the left are allowed,
-  // while an equal/larger high on the right makes the later extreme win.
-  for (let i = index - left; i < index; i++) {
-    if (candles[i].high > value) return null;
-  }
-  for (let i = index + 1; i <= index + right; i++) {
-    if (candles[i].high >= value) return null;
-  }
-  return value;
-}
-
-function pivotLowAt(candles, index, left, right) {
-  if (index - left < 0 || index + right >= candles.length) return null;
-  const value = candles[index].low;
-  if (!Number.isFinite(value)) return null;
-
-  // Closer to TradingView ta.pivotlow().
-  for (let i = index - left; i < index; i++) {
-    if (candles[i].low < value) return null;
-  }
-  for (let i = index + 1; i <= index + right; i++) {
-    if (candles[i].low <= value) return null;
-  }
-  return value;
-}
-
-function buildTvStructureSnapshot(candles, structurePeriod) {
-  let lastHigh = NaN;
-  let lastLow = NaN;
-  let lastHighIndex = -1;
-  let lastLowIndex = -1;
-
-  let highBreakPending = false;
-  let lowBreakPending = false;
-  let trendDirection = 0;
-
-  let lastBreak = null;
-  const pivotHighHistory = [];
-  const pivotLowHistory = [];
-
-  for (let i = 0; i < candles.length; i++) {
-    // Pine confirms a pivot only after `structurePeriod` right-hand bars.
-    const pivotIndex = i - structurePeriod;
-
-    if (pivotIndex >= 0) {
-      const ph = pivotHighAt(
-        candles,
-        pivotIndex,
-        structurePeriod,
-        structurePeriod
-      );
-
-      const pl = pivotLowAt(
-        candles,
-        pivotIndex,
-        structurePeriod,
-        structurePeriod
-      );
-
-      if (ph !== null) {
-        lastHigh = ph;
-        lastHighIndex = pivotIndex;
-        highBreakPending = true;
-        pivotHighHistory.push({
-          price: ph,
-          index: pivotIndex,
-          time: candles[pivotIndex]?.time || null
-        });
-      }
-
-      if (pl !== null) {
-        lastLow = pl;
-        lastLowIndex = pivotIndex;
-        lowBreakPending = true;
-        pivotLowHistory.push({
-          price: pl,
-          index: pivotIndex,
-          time: candles[pivotIndex]?.time || null
-        });
-      }
-    }
-
-    const candle = candles[i];
-    let highBroken = false;
-    let lowBroken = false;
-
-    // Pine confirmationType = "Body":
-    // bullish break only if close > structure high,
-    // bearish break only if close < structure low.
-    if (
-      highBreakPending &&
-      Number.isFinite(lastHigh) &&
-      candle.close > lastHigh
-    ) {
-      highBroken = true;
-      highBreakPending = false;
-    }
-
-    if (
-      lowBreakPending &&
-      Number.isFinite(lastLow) &&
-      candle.close < lastLow
-    ) {
-      lowBroken = true;
-      lowBreakPending = false;
-    }
-
-    const previousTrend = trendDirection;
-
-    // Pine uses if/else-if, therefore bullish gets priority
-    // only in the practically impossible case both are true.
-    if (highBroken) {
-      trendDirection = 1;
-    } else if (lowBroken) {
-      trendDirection = -1;
-    }
-
-    const choch =
-      (previousTrend === -1 && trendDirection === 1) ||
-      (previousTrend === 1 && trendDirection === -1);
-
-    if (highBroken) {
-      lastBreak = {
-        index: i,
-        direction: "LONG",
-        type: choch ? "CHoCH BULLISH" : "BOS BULLISH",
-        structure: lastHigh,
-        structureIndex: lastHighIndex,
-        candleTime: candle.time
-      };
-    } else if (lowBroken) {
-      lastBreak = {
-        index: i,
-        direction: "SHORT",
-        type: choch ? "CHoCH BEARISH" : "BOS BEARISH",
-        structure: lastLow,
-        structureIndex: lastLowIndex,
-        candleTime: candle.time
-      };
-    }
-  }
-
-  return {
-    lastHigh,
-    lastLow,
-    lastHighIndex,
-    lastLowIndex,
-    highBreakPending,
-    lowBreakPending,
-    trendDirection,
-    lastBreak,
-    pivotHighHistory: pivotHighHistory.slice(-5),
-    pivotLowHistory: pivotLowHistory.slice(-5),
-    pineState: {
-      lastHigh,
-      lastLow,
-      lastHighIndex,
-      lastLowIndex,
-      highBreakPending,
-      lowBreakPending,
-      trendDirection
-    }
-  };
-}
-
-function targetLevels(direction, entry, atr14) {
-  const targetRange = atr14 * 2.0;
-
-  if (direction === "LONG") {
-    return {
-      targetRange,
-      tp1: entry + targetRange * 0.8,
-      tp2: entry + targetRange * 1.6,
-      tp3: entry + targetRange * 2.8,
-      sl: entry - targetRange * 1.2
-    };
-  }
-
-  return {
-    targetRange,
-    tp1: entry - targetRange * 0.8,
-    tp2: entry - targetRange * 1.6,
-    tp3: entry - targetRange * 2.8,
-    sl: entry + targetRange * 1.2
-  };
-}
-
-
-function buildTvStructurePersistent(pair, tf, candles, structurePeriod) {
-  const key = pair + "|" + tf;
-  const previous = state.pineStructureByPairTf[key] || null;
-
-  // Bootstrap from a long history on first run, after state loss/redeploy,
-  // period change, or when the stored candle is no longer represented.
-  const lastClosedTime = candles.length ? candles[candles.length - 1].time : null;
-  const storedTime = previous?.lastProcessedCandleTime || null;
-  const storedStillInWindow =
-    storedTime && candles.some(c => c.time === storedTime);
-
-  if (
-    !previous ||
-    Number(previous.structurePeriod) !== Number(structurePeriod) ||
-    !storedStillInWindow
-  ) {
-    const snap = buildTvStructureSnapshot(candles, structurePeriod);
-    state.pineStructureByPairTf[key] = {
-      structurePeriod,
-      lastProcessedCandleTime: lastClosedTime,
-      lastHigh: snap.lastHigh,
-      lastLow: snap.lastLow,
-      lastHighTime:
-        snap.lastHighIndex >= 0 ? candles[snap.lastHighIndex]?.time || null : null,
-      lastLowTime:
-        snap.lastLowIndex >= 0 ? candles[snap.lastLowIndex]?.time || null : null,
-      highBreakPending: snap.highBreakPending,
-      lowBreakPending: snap.lowBreakPending,
-      trendDirection: snap.trendDirection,
-      lastBreak: snap.lastBreak,
-      pivotHighHistory: snap.pivotHighHistory || [],
-      pivotLowHistory: snap.pivotLowHistory || []
-    };
-    saveState(state);
-    return { ...snap, persistentMode: "BOOTSTRAP" };
-  }
-
-  // Reconstruct enough context to confirm pivots whose right bars have just
-  // completed, but preserve Pine `var` state from the previous scan.
-  let lastHigh = Number(previous.lastHigh);
-  let lastLow = Number(previous.lastLow);
-  let lastHighTime = previous.lastHighTime || null;
-  let lastLowTime = previous.lastLowTime || null;
-  let highBreakPending = !!previous.highBreakPending;
-  let lowBreakPending = !!previous.lowBreakPending;
-  let trendDirection = Number(previous.trendDirection || 0);
-  let lastBreak = previous.lastBreak || null;
-  let pivotHighHistory = Array.isArray(previous.pivotHighHistory)
-    ? previous.pivotHighHistory.slice(-5) : [];
-  let pivotLowHistory = Array.isArray(previous.pivotLowHistory)
-    ? previous.pivotLowHistory.slice(-5) : [];
-
-  const startIndex = candles.findIndex(c => c.time === storedTime);
-  const firstNewIndex = startIndex >= 0 ? startIndex + 1 : 0;
-
-  for (let i = firstNewIndex; i < candles.length; i++) {
-    const pivotIndex = i - structurePeriod;
-
-    if (pivotIndex >= 0) {
-      const ph = pivotHighAt(candles, pivotIndex, structurePeriod, structurePeriod);
-      const pl = pivotLowAt(candles, pivotIndex, structurePeriod, structurePeriod);
-
-      if (ph !== null) {
-        lastHigh = ph;
-        lastHighTime = candles[pivotIndex]?.time || null;
-        highBreakPending = true;
-        pivotHighHistory.push({
-          price: ph, index: pivotIndex, time: lastHighTime
-        });
-        pivotHighHistory = pivotHighHistory.slice(-5);
-      }
-
-      if (pl !== null) {
-        lastLow = pl;
-        lastLowTime = candles[pivotIndex]?.time || null;
-        lowBreakPending = true;
-        pivotLowHistory.push({
-          price: pl, index: pivotIndex, time: lastLowTime
-        });
-        pivotLowHistory = pivotLowHistory.slice(-5);
-      }
-    }
-
-    const candle = candles[i];
-    const previousTrend = trendDirection;
-    let highBroken = false;
-    let lowBroken = false;
-
-    if (highBreakPending && Number.isFinite(lastHigh) && candle.close > lastHigh) {
-      highBroken = true;
-      highBreakPending = false;
-    }
-    if (lowBreakPending && Number.isFinite(lastLow) && candle.close < lastLow) {
-      lowBroken = true;
-      lowBreakPending = false;
-    }
-
-    if (highBroken) trendDirection = 1;
-    else if (lowBroken) trendDirection = -1;
-
-    const choch =
-      (previousTrend === -1 && trendDirection === 1) ||
-      (previousTrend === 1 && trendDirection === -1);
-
-    if (highBroken) {
-      lastBreak = {
-        index: i,
-        direction: "LONG",
-        type: choch ? "CHoCH BULLISH" : "BOS BULLISH",
-        structure: lastHigh,
-        structureTime: lastHighTime,
-        candleTime: candle.time
-      };
-    } else if (lowBroken) {
-      lastBreak = {
-        index: i,
-        direction: "SHORT",
-        type: choch ? "CHoCH BEARISH" : "BOS BEARISH",
-        structure: lastLow,
-        structureTime: lastLowTime,
-        candleTime: candle.time
-      };
-    }
-  }
-
-  const lastHighIndex = candles.findIndex(c => c.time === lastHighTime);
-  const lastLowIndex = candles.findIndex(c => c.time === lastLowTime);
-
-  const result = {
-    lastHigh,
-    lastLow,
-    lastHighIndex,
-    lastLowIndex,
-    highBreakPending,
-    lowBreakPending,
-    trendDirection,
-    lastBreak,
-    pivotHighHistory,
-    pivotLowHistory,
-    persistentMode: "INCREMENTAL",
-    pineState: {
-      lastHigh,
-      lastLow,
-      lastHighTime,
-      lastLowTime,
-      highBreakPending,
-      lowBreakPending,
-      trendDirection,
-      lastProcessedCandleTime: lastClosedTime
-    }
-  };
-
-  state.pineStructureByPairTf[key] = {
-    structurePeriod,
-    lastProcessedCandleTime: lastClosedTime,
-    lastHigh,
-    lastLow,
-    lastHighTime,
-    lastLowTime,
-    highBreakPending,
-    lowBreakPending,
-    trendDirection,
-    lastBreak,
-    pivotHighHistory,
-    pivotLowHistory
-  };
-  saveState(state);
-
-  return result;
-}
-
-function analyzeSmc(pair, tf, candles, pairConfig = {}) {
-  /*
-    Twelve Data normally includes the currently-forming candle as the final item.
-
-    TradingView behavior we reproduce:
-    - BOS/CHoCH: only confirmed from a CLOSED candle.
-    - PREPARE: may use the latest/current price before the breakout,
-      which is what allows EA to place the pending order early.
-  */
-  if (!Array.isArray(candles) || candles.length < 90) {
-    return { valid: false, reason: "DATA LOW" };
-  }
-
-  const structurePeriod = Math.min(
-    50,
-    Math.max(5, Number(pairConfig.structurePeriod || 20))
-  );
-
-  const prepareDistancePct = Math.min(
-    5,
-    Math.max(
-      0.00001,
-      Number(pairConfig.prepareDistancePct || 0.25)
-    )
-  );
-
-  const current = candles[candles.length - 1];
-  const closed = candles.slice(0, -1);
-
-  if (closed.length < structurePeriod * 2 + 30) {
-    return { valid: false, reason: "DATA LOW FOR PIVOT" };
-  }
-
-  // Build structure using CLOSED candles only.
-  const structure = buildTvStructurePersistent(pair, tf, closed, structurePeriod);
-
-  // Indicator calculations.
-  // For confirmed ENTRY use closed-bar values.
-  const closedCloses = closed.map(c => c.close);
-  const closedEma9 = ema(closedCloses, 9);
-  const closedEma20 = ema(closedCloses, 20);
-
-  const closedAtrFull = atrSeries(closed, 14);
-  const closedAtrFinite = closedAtrFull.filter(Number.isFinite);
-  const closedAtr14 = closedAtrFinite.length
-    ? closedAtrFinite[closedAtrFinite.length - 1]
-    : NaN;
-  const closedAtrSma20 = sma(closedAtrFinite, 20);
-
-  // For PREPARE TradingView recalculates on the live candle.
-  const liveCloses = candles.map(c => c.close);
-  const liveEma9 = ema(liveCloses, 9);
-  const liveEma20 = ema(liveCloses, 20);
-
-  const liveAtrFull = atrSeries(candles, 14);
-  const liveAtrFinite = liveAtrFull.filter(Number.isFinite);
-  const liveAtr14 = liveAtrFinite.length
-    ? liveAtrFinite[liveAtrFinite.length - 1]
-    : NaN;
-  const liveAtrSma20 = sma(liveAtrFinite, 20);
-
-  const volatilityEnabled = pairConfig.volatilityEnabled !== false;
-
-  const closedVolatilityOk =
-    !volatilityEnabled ||
-    (
-      Number.isFinite(closedAtr14) &&
-      Number.isFinite(closedAtrSma20) &&
-      closedAtr14 > closedAtrSma20
-    );
-
-  const liveVolatilityOk =
-    !volatilityEnabled ||
-    (
-      Number.isFinite(liveAtr14) &&
-      Number.isFinite(liveAtrSma20) &&
-      liveAtr14 > liveAtrSma20
-    );
-
-  const lastClosed = closed[closed.length - 1];
-
-  const closedEmaLong =
-    closedEma9 > closedEma20 &&
-    lastClosed.close > closedEma9;
-
-  const closedEmaShort =
-    closedEma9 < closedEma20 &&
-    lastClosed.close < closedEma9;
-
-  const liveEmaLong =
-    liveEma9 > liveEma20 &&
-    current.close > liveEma9;
-
-  const liveEmaShort =
-    liveEma9 < liveEma20 &&
-    current.close < liveEma9;
-
-  const rrr = {
-    tp1: 0.8 / 1.2,
-    tp2: 1.6 / 1.2,
-    tp3: 2.8 / 1.2
-  };
-
-  const minRrr = Math.max(
-    0.01,
-    Number(pairConfig.minRrr || 1.5)
-  );
-
-  // ===========================================================================
-  // 1) CONFIRMED BOS / CHoCH
-  // ===========================================================================
-  const lastClosedTime = lastClosed?.time || null;
-  const lastBreakTime = structure.lastBreak?.candleTime || null;
-
-  // V11.2 hard guard: an old break may remain in persistent history,
-  // but it is never an actionable/current BREAKOUT.
-  if (lastBreakTime && lastClosedTime && lastBreakTime !== lastClosedTime) {
-    structure.lastBreak = null;
-  }
-
-  const freshBreak =
-    structure.lastBreak &&
-    lastBreakTime &&
-    lastClosedTime &&
-    lastBreakTime === lastClosedTime
-      ? structure.lastBreak
-      : null;
-
-  if (freshBreak) {
-    const breakStateKey = pair + "|" + tf;
-    const consumedBreakTime =
-      state.lastConsumedBreakTimeByPairTf[breakStateKey] || null;
-
-    if (consumedBreakTime === freshBreak.candleTime) {
-      return {
-        valid: false,
-        reason: "BREAKOUT ALREADY CONSUMED",
-        direction: freshBreak.direction,
-        mainSignal: freshBreak.type,
-        structureHigh: structure.lastHigh,
-        structureLow: structure.lastLow
-      };
-    }
-
-    state.lastConsumedBreakTimeByPairTf[breakStateKey] =
-      freshBreak.candleTime;
-    saveState(state);
-
-    const emaOk =
-      freshBreak.direction === "LONG"
-        ? closedEmaLong
-        : closedEmaShort;
-
-    return {
-      valid: false,
-      reason: emaOk
-        ? "BREAKOUT CONFIRMED - NO SECOND ORDER"
-        : "BREAKOUT CONFIRMED - EMA NO",
-      direction: freshBreak.direction,
-      mainSignal: freshBreak.type,
-      emaOk,
-      volatilityOk: closedVolatilityOk,
-      structureHigh: structure.lastHigh,
-      structureLow: structure.lastLow,
-      diagnostic: {
-        mode: "BREAKOUT",
-        scannerVersion: "V11.3",
-        feedSymbol: pairConfig.dataSymbol || pair,
-        pair,
-        tf: tfLabel(tf),
-        currentTime: current.time,
-        currentOHLC: {
-          open: current.open,
-          high: current.high,
-          low: current.low,
-          close: current.close
-        },
-        lastClosedTime: lastClosed.time,
-        lastClosedOHLC: {
-          open: lastClosed.open,
-          high: lastClosed.high,
-          low: lastClosed.low,
-          close: lastClosed.close
-        },
-        structurePeriod,
-        structureHigh: structure.lastHigh,
-        structureLow: structure.lastLow,
-        structureHighPivotTime:
-          structure.lastHighIndex >= 0
-            ? closed[structure.lastHighIndex]?.time || null
-            : null,
-        structureLowPivotTime:
-          structure.lastLowIndex >= 0
-            ? closed[structure.lastLowIndex]?.time || null
-            : null,
-        pivotHighHistory: structure.pivotHighHistory,
-        pivotLowHistory: structure.pivotLowHistory,
-        pineState: structure.pineState,
-        persistentMode: structure.persistentMode,
-        ema9: closedEma9,
-        ema20: closedEma20,
-        emaLong: closedEmaLong,
-        emaShort: closedEmaShort,
-        atr14: closedAtr14,
-        atrSma20: closedAtrSma20,
-        volatilityOk: closedVolatilityOk,
-        breakout: freshBreak
-      }
-    };
-  }
-
-  // ===========================================================================
-  // 2) PREPARE BEFORE BREAKOUT
-  //
-  // Pine:
-  // prepLongRaw  = abs(close-structHigh) <= structHigh*0.25% && close<structHigh
-  // prepShortRaw = abs(close-structLow)  <= structLow *0.25% && close>structLow
-  // PREPARE also requires EMA alignment.
-  //
-  // Extension for EA:
-  // Pine only visualizes PREPARE and does not emit target JSON for it.
-  // We derive TP/SL from the SAME ATR×2 formulas so EA can place pending order.
-  // ===========================================================================
-  const longThreshold =
-    Number.isFinite(structure.lastHigh)
-      ? Math.abs(structure.lastHigh) * (prepareDistancePct / 100)
-      : NaN;
-
-  const shortThreshold =
-    Number.isFinite(structure.lastLow)
-      ? Math.abs(structure.lastLow) * (prepareDistancePct / 100)
-      : NaN;
-
-  const prepLongRaw =
-    structure.highBreakPending &&
-    Number.isFinite(structure.lastHigh) &&
-    current.close < structure.lastHigh &&
-    Math.abs(current.close - structure.lastHigh) <= longThreshold;
-
-  const prepShortRaw =
-    structure.lowBreakPending &&
-    Number.isFinite(structure.lastLow) &&
-    current.close > structure.lastLow &&
-    Math.abs(current.close - structure.lastLow) <= shortThreshold;
-
-  const prepLong = prepLongRaw && liveEmaLong;
-  const prepShort = prepShortRaw && liveEmaShort;
-
-  let prepareDirection = null;
-
-  if (prepLong && prepShort) {
-    // Rare case: choose the structure level nearest to current price.
-    const distLong =
-      Math.abs(current.close - structure.lastHigh);
-    const distShort =
-      Math.abs(current.close - structure.lastLow);
-
-    prepareDirection =
-      distLong <= distShort ? "LONG" : "SHORT";
-  } else if (prepLong) {
-    prepareDirection = "LONG";
-  } else if (prepShort) {
-    prepareDirection = "SHORT";
-  }
-
-  if (!prepareDirection) {
-    const distanceToHighPct =
-      Number.isFinite(structure.lastHigh)
-        ? Math.abs(current.close - structure.lastHigh) /
-          Math.abs(structure.lastHigh) * 100
-        : null;
-
-    const distanceToLowPct =
-      Number.isFinite(structure.lastLow)
-        ? Math.abs(current.close - structure.lastLow) /
-          Math.abs(structure.lastLow) * 100
-        : null;
-
-    return {
-      valid: false,
-      reason: "NO ACTIONABLE PREPARE",
-      structureHigh: structure.lastHigh,
-      structureLow: structure.lastLow,
-      liveClose: current.close,
-      ema9: liveEma9,
-      ema20: liveEma20,
-      volatilityOk: liveVolatilityOk,
-      diagnostic: {
-        mode: "SCAN",
-      scannerVersion: "V11.3",
-        feedSymbol: pairConfig.dataSymbol || pair,
-        pair,
-        tf: tfLabel(tf),
-        currentTime: current.time,
-        currentOHLC: {
-          open: current.open,
-          high: current.high,
-          low: current.low,
-          close: current.close
-        },
-        lastClosedTime: lastClosed.time,
-        lastClosedOHLC: {
-          open: lastClosed.open,
-          high: lastClosed.high,
-          low: lastClosed.low,
-          close: lastClosed.close
-        },
-        structurePeriod,
-        structureHigh: structure.lastHigh,
-        structureLow: structure.lastLow,
-        structureHighPivotTime:
-          structure.lastHighIndex >= 0
-            ? closed[structure.lastHighIndex]?.time || null
-            : null,
-        structureLowPivotTime:
-          structure.lastLowIndex >= 0
-            ? closed[structure.lastLowIndex]?.time || null
-            : null,
-        pivotHighHistory: structure.pivotHighHistory,
-        pivotLowHistory: structure.pivotLowHistory,
-        pineState: structure.pineState,
-        persistentMode: structure.persistentMode,
-        highBreakPending: structure.highBreakPending,
-        lowBreakPending: structure.lowBreakPending,
-        prepareDistancePct,
-        distanceToHighPct,
-        distanceToLowPct,
-        prepLongRaw,
-        prepShortRaw,
-        prepLong,
-        prepShort,
-        ema9: liveEma9,
-        ema20: liveEma20,
-        emaLong: liveEmaLong,
-        emaShort: liveEmaShort,
-        atr14: liveAtr14,
-        atrSma20: liveAtrSma20,
-        volatilityOk: liveVolatilityOk
-      }
-    };
-  }
-
-  const prepareEntry =
-    prepareDirection === "LONG"
-      ? structure.lastHigh
-      : structure.lastLow;
-
-  /*
-    V11.3 ATR SNAPSHOT LOCK
-    -----------------------
-    TradingView freezes the geometry of an already-created setup.
-    Do the same here: once a structure+direction becomes actionable, lock the
-    ATR used for Entry/SL/TP. Later scans may change live ATR, but MUST NOT
-    move the existing setup levels.
-
-    Snapshot identity is structure based. A new structure creates a new
-    snapshot automatically.
-  */
-  const snapshotStoreKey = pair + "|" + tf;
-  const snapshotIdentity = [
-    prepareDirection,
-    fmtPrice(prepareEntry),
-    prepareDirection === "LONG"
-      ? (structure.pineState?.lastHighTime || "")
-      : (structure.pineState?.lastLowTime || "")
-  ].join("|");
-
-  let setupSnapshot = state.setupSnapshotByPairTf[snapshotStoreKey] || null;
-
-  if (
-    !setupSnapshot ||
-    setupSnapshot.identity !== snapshotIdentity ||
-    !Number.isFinite(Number(setupSnapshot.atr14))
-  ) {
-    setupSnapshot = {
-      identity: snapshotIdentity,
-      direction: prepareDirection,
-      entry: prepareEntry,
-      atr14: liveAtr14,
-      atrSma20: liveAtrSma20,
-      structureTime:
-        prepareDirection === "LONG"
-          ? (structure.pineState?.lastHighTime || null)
-          : (structure.pineState?.lastLowTime || null),
-      signalCandleTime: current.time,
-      lastClosedTime: lastClosed.time,
-      ema9: liveEma9,
-      ema20: liveEma20,
-      createdAt: new Date().toISOString()
-    };
-    state.setupSnapshotByPairTf[snapshotStoreKey] = setupSnapshot;
-    saveState(state);
-  }
-
-  const lockedAtr14 = Number(setupSnapshot.atr14);
-
-  const prepareLevels = targetLevels(
-    prepareDirection,
-    prepareEntry,
-    lockedAtr14
-  );
-
-  const prepareSignal =
-    prepareDirection === "LONG"
-      ? "PREPARE LONG"
-      : "PREPARE SHORT";
-
-  /*
-    Pine anti-spam compares structure price with lastAlertPrice.
-    For PREPARE we make the key structure-based (NOT candle-time based),
-    so the same structure does not create another pending order every scan.
-  */
-  const eventKey = [
-    "PREPARE",
-    pair,
-    tfLabel(tf),
-    prepareSignal,
-    fmtPrice(prepareEntry)
-  ].join("|");
-
-  const prepareScore =
-    2 +   // valid structure
-    1.5 + // EMA confirmed
-    1 +   // volatility
-    1.5 + // EMA direction
-    1;    // price close side
-
-  const prepareGrade = getGrade(prepareScore);
-
-  return {
-    valid: true,
-    key: eventKey,
-    pair,
-    tf: tfLabel(tf),
-    signal: prepareSignal,
-    status: prepareSignal,
-    engine: "SMC",
-    grade: prepareGrade,
-    score: prepareScore,
-    entry: prepareEntry,
-    tp1: prepareLevels.tp1,
-    tp2: prepareLevels.tp2,
-    tp3: prepareLevels.tp3,
-    sl: prepareLevels.sl,
-    atr: lockedAtr14,
-    atrSma20: liveAtrSma20,
-    targetRange: prepareLevels.targetRange,
-    ema9: liveEma9,
-    ema20: liveEma20,
-    emaConfirm: "YES",
-    volatilityOk: liveVolatilityOk,
-    volatilityEnabled,
-    structurePeriod,
-    prepareDistancePct,
-    minRrr,
-    rrr,
-    priority: pairConfig.priority || "NORMAL",
-    scanOrder: Number(pairConfig.scanOrder || 0),
-    dataSymbol: pairConfig.dataSymbol || pair,
-    structureHigh: structure.lastHigh,
-    structureLow: structure.lastLow,
-    mainSignal: "PREPARE",
-    candleTime: current.time,
-    direction: prepareDirection,
-    currentPrice: current.close,
-    distanceToEntryPct:
-      Math.abs(current.close - prepareEntry) /
-      Math.abs(prepareEntry) *
-      100,
-    diagnostic: {
-      mode: "ACTIONABLE_PREPARE",
-      feedSymbol: pairConfig.dataSymbol || pair,
-      pair,
-      tf: tfLabel(tf),
-      currentTime: current.time,
-      currentOHLC: {
-        open: current.open,
-        high: current.high,
-        low: current.low,
-        close: current.close
-      },
-      lastClosedTime: lastClosed.time,
-      lastClosedOHLC: {
-        open: lastClosed.open,
-        high: lastClosed.high,
-        low: lastClosed.low,
-        close: lastClosed.close
-      },
-      structurePeriod,
-      structureHigh: structure.lastHigh,
-      structureLow: structure.lastLow,
-      structureHighPivotTime:
-        structure.lastHighIndex >= 0
-          ? closed[structure.lastHighIndex]?.time || null
-          : null,
-      structureLowPivotTime:
-        structure.lastLowIndex >= 0
-          ? closed[structure.lastLowIndex]?.time || null
-          : null,
-      pivotHighHistory: structure.pivotHighHistory,
-      pivotLowHistory: structure.pivotLowHistory,
-      pineState: structure.pineState,
-      persistentMode: structure.persistentMode,
-      highBreakPending: structure.highBreakPending,
-      lowBreakPending: structure.lowBreakPending,
-      prepareDistancePct,
-      distanceToEntryPct:
-        Math.abs(current.close - prepareEntry) /
-        Math.abs(prepareEntry) * 100,
-      ema9: liveEma9,
-      ema20: liveEma20,
-      emaLong: liveEmaLong,
-      emaShort: liveEmaShort,
-      atr14: liveAtr14,
-      atr14Locked: lockedAtr14,
-      atrSnapshot: setupSnapshot,
-      atrSma20: liveAtrSma20,
-      volatilityOk: liveVolatilityOk,
-      entry: prepareEntry,
-      targetCalculationMode: "ATR_SNAPSHOT_LOCKED",
-      snapshotIdentity,
-      snapshotCandleTime: setupSnapshot.signalCandleTime,
-      snapshotStructureTime: setupSnapshot.structureTime,
-      tp1: prepareLevels.tp1,
-      tp2: prepareLevels.tp2,
-      tp3: prepareLevels.tp3,
-      sl: prepareLevels.sl
-    },
-    sourceMode: "V11.3_PERSISTENT_PINE_ATR_SNAPSHOT_LOCKED",
-    createdAt: new Date().toISOString()
-  };
-}
-
-async function getJson(url, options = {}) {
-  const response = await fetch(url, options);
-  const text = await response.text();
-
-  let data;
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(
-      "Respons bukan JSON (" + response.status + "): " + text.slice(0, 120)
-    );
-  }
-
-  if (!response.ok || data.error) {
-    const error = new Error(data.error || "HTTP " + response.status);
-    error.status = response.status;
-    throw error;
-  }
-
-  return data;
+  return d;
 }
 
 async function login() {
-  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-    throw new Error(
-      "WORKER_ADMIN_EMAIL / WORKER_ADMIN_PASSWORD belum diisi"
-    );
-  }
-
-  const data = await getJson(APP_BASE_URL + "/api/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      email: ADMIN_EMAIL,
-      password: ADMIN_PASSWORD
-    })
-  });
-
-  authToken = data.token;
-  console.log("[WORKER] Login admin berhasil:", ADMIN_EMAIL);
-}
-
-async function authorizedApi(pathname, options = {}, retry = true) {
-  if (!authToken) await login();
-
   try {
-    return await getJson(APP_BASE_URL + pathname, {
-      ...options,
+    const r = await fetch("/api/auth/login", {
+      method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + authToken,
-        ...(options.headers || {})
-      }
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        email: $("email").value,
+        password: $("password").value
+      })
     });
-  } catch (error) {
-    if (retry && (error.status === 401 || error.status === 403)) {
-      authToken = "";
-      await login();
-      return authorizedApi(pathname, options, false);
+
+    const d = await r.json();
+
+    if (!r.ok || d.error) {
+      throw Error(d.error || "Login gagal");
     }
-    throw error;
+
+    token = d.token;
+    localStorage.setItem("TOKEN", token);
+
+    await loadMe();
+  } catch (e) {
+    authLog(e.message);
   }
 }
-async function fetchCandles(pair, tf) {
-  if (!API_KEYS.length) {
-    throw new Error("Twelve Data API key belum diisi");
-  }
 
-  let lastError = null;
-  let availableKeyFound = false;
+async function requestAccess() {
+  try {
+    const r = await fetch("/api/auth/request-access", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        email: $("email").value
+      })
+    });
 
-  for (let attempt = 0; attempt < API_KEYS.length; attempt++) {
-    const currentIndex = keyIndex++ % API_KEYS.length;
+    const d = await r.json();
 
-    if (isApiKeyBlocked(currentIndex)) {
-      const blockedUntil = API_KEY_BLOCKED_UNTIL.get(currentIndex);
-
-      console.log(
-        "[API SKIP]",
-        "key",
-        currentIndex + 1,
-        "masih diblokir sampai",
-        new Date(blockedUntil).toISOString()
-      );
-
-      continue;
+    if (!r.ok || d.error) {
+      throw Error(d.error || "Request gagal");
     }
 
-    availableKeyFound = true;
-
-    const apiKey = API_KEYS[currentIndex];
-    const url = new URL("https://api.twelvedata.com/time_series");
-
-    url.searchParams.set("symbol", pair);
-    url.searchParams.set("interval", intervalFromTf(tf));
-    url.searchParams.set("outputsize", String(OUTPUT_SIZE));
-    url.searchParams.set("format", "JSON");
-    url.searchParams.set("apikey", apiKey);
-
-    console.log(
-      "[API]",
-      pair,
-      tfLabel(tf),
-      "key",
-      currentIndex + 1,
-      "of",
-      API_KEYS.length
-    );
-
-    try {
-      const data = await getJson(url.toString());
-
-      if (data.status === "error") {
-        throw new Error(data.message || "Twelve Data error");
-      }
-
-      const candles = (data.values || [])
-        .map(v => ({
-          time: v.datetime,
-          open: Number(v.open),
-          high: Number(v.high),
-          low: Number(v.low),
-          close: Number(v.close),
-          volume: Number(v.volume || 1)
-        }))
-        .filter(c =>
-          Number.isFinite(c.open) &&
-          Number.isFinite(c.high) &&
-          Number.isFinite(c.low) &&
-          Number.isFinite(c.close)
-        )
-        .reverse();
-
-      if (candles.length < 70) {
-        throw new Error("Candle kurang dari 70");
-      }
-
-      return candles;
-
-    } catch (error) {
-      lastError = error;
-
-      const message = String(error.message || "");
-
-      if (
-        error.status === 429 ||
-        message.includes("429") ||
-        message.toLowerCase().includes("credits for the day")
-      ) {
-        blockApiKey(currentIndex, message);
-        continue;
-      }
-
-      throw error;
-    }
+    authLog("Request access berhasil. Tunggu approval admin.");
+  } catch (e) {
+    authLog(e.message);
   }
-
-  if (!availableKeyFound) {
-    const blockedTimes = [...API_KEY_BLOCKED_UNTIL.values()];
-    const nearest = blockedTimes.length
-      ? Math.min(...blockedTimes)
-      : null;
-
-    throw new Error(
-      nearest
-        ? "Semua API key sedang diblokir sampai minimal " +
-          new Date(nearest).toISOString()
-        : "Semua API key sedang diblokir"
-    );
-  }
-
-  throw new Error(
-    "Semua Twelve Data API key gagal atau terkena limit. " +
-    (lastError ? lastError.message : "")
-  );
 }
-async function saveSignal(signal) {
-  return authorizedApi("/api/signals/upsert", {
-    method: "POST",
-    body: JSON.stringify(signal)
+
+function logout() {
+  localStorage.removeItem("TOKEN");
+  location.reload();
+}
+
+async function loadMe() {
+  try {
+    const d = await api("/api/auth/me");
+
+    me = d.user;
+    limits = d.limits;
+
+    $("authScreen").classList.add("hidden");
+    $("appScreen").classList.remove("hidden");
+    $("uEmail").textContent = me.email;
+    $("uPlan").textContent = me.plan;
+    $("uStatus").textContent = me.status;
+    $("uExpired").textContent = (me.expiredAt || "-").slice(0, 10);
+    $("uEaKey").textContent = me.eaApiKey || "-";
+    $("adminPanel").style.display = me.role === "admin" ? "block" : "none";
+
+    const mt5Input = $("memberMt5Account");
+    const mt5Status = $("memberMt5Status");
+
+    if (mt5Input) {
+      mt5Input.value = me.mt5Account || "";
+    }
+
+    if (mt5Status) {
+      mt5Status.textContent = me.mt5Account
+        ? "Terdaftar: " + me.mt5Account
+        : "Belum ada nomor akun MT5 yang terdaftar.";
+    }
+
+    if (me.mustChangePassword) {
+      showChangePassword();
+    }
+
+    applyMarket();
+  } catch (e) {
+    localStorage.removeItem("TOKEN");
+    authLog(e.message);
+  }
+}
+
+if (token) {
+  loadMe();
+}
+
+function showChangePassword() {
+  $("changePasswordCard").classList.remove("hidden");
+}
+
+async function changePassword() {
+  try {
+    await api("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({
+        password: $("newPassword").value
+      })
+    });
+
+    $("changePasswordCard").classList.add("hidden");
+    log("Password berhasil diganti.");
+
+    await loadMe();
+  } catch (e) {
+    log(e.message);
+  }
+}
+
+
+async function saveMemberMt5Account() {
+  try {
+    const input = $("memberMt5Account");
+    const status = $("memberMt5Status");
+    const mt5Account = String(input ? input.value : "").replace(/\D/g, "");
+
+    if (!mt5Account) {
+      throw Error("Masukkan nomor akun MT5.");
+    }
+
+    if (status) {
+      status.textContent = "Menyimpan...";
+    }
+
+    const d = await api("/api/member/mt5-account", {
+      method: "POST",
+      body: JSON.stringify({ mt5Account })
+    });
+
+    me = d.user || me;
+
+    if (input) {
+      input.value = me.mt5Account || mt5Account;
+    }
+
+    if (status) {
+      status.textContent = "Terdaftar: " + (me.mt5Account || mt5Account);
+    }
+
+    log("Nomor akun MT5 berhasil disimpan.");
+  } catch (e) {
+    const status = $("memberMt5Status");
+
+    if (status) {
+      status.textContent = e.message;
+    }
+
+    log(e.message);
+  }
+}
+
+async function removeMemberMt5Account() {
+  try {
+    const ok = confirm("Hapus nomor akun MT5 yang terdaftar?");
+    if (!ok) return;
+
+    const d = await api("/api/member/mt5-account", {
+      method: "DELETE"
+    });
+
+    me = d.user || me;
+
+    const input = $("memberMt5Account");
+    const status = $("memberMt5Status");
+
+    if (input) {
+      input.value = "";
+    }
+
+    if (status) {
+      status.textContent = "Belum ada nomor akun MT5 yang terdaftar.";
+    }
+
+    log("Nomor akun MT5 berhasil dihapus.");
+  } catch (e) {
+    log(e.message);
+  }
+}
+
+function saveLocks() {
+  localStorage.setItem("DEWA_V6_LOCKS", JSON.stringify(locks));
+}
+
+function saveLastDir() {
+  localStorage.setItem("DEWA_LAST_DIR", JSON.stringify(DEWA_LAST_DIR));
+}
+
+function symbols() {
+  return $("symbols").value
+    .split(",")
+    .map(x => x.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function applyMarket() {
+  const m = $("market").value;
+
+  if (m !== "custom") {
+    $("symbols").value = PRESETS[m].join(",");
+  }
+}
+
+function stop() {
+  if (autoTimer) {
+    clearInterval(autoTimer);
+  }
+
+  autoTimer = null;
+  queueRunning = false;
+  $("scanStatus").textContent = "Stopped";
+  log("Stopped");
+}
+
+function resetSignals() {
+  scanQueue();
+  log("RESET SIGNAL sekarang hanya refresh tampilan. Source of truth ada di worker/server.");
+}
+
+function start() {
+  stop();
+  scanQueue();
+  autoTimer = setInterval(scanQueue, Number($("refresh").value) * 1000);
+  $("scanStatus").textContent = "Auto ON";
+}
+
+function isCryptoSymbol(s) {
+  return !s.includes("/") && !s.includes(":");
+}
+
+function tfLabel() {
+  const v = $("tf").value;
+  return v === "60" ? "1H" : v === "240" ? "4H" : v + "m";
+}
+
+function getHTFTf() {
+  const tf = String($("tf").value);
+
+  if (tf === "5") return "60";
+  if (["15", "30", "60"].includes(tf)) return "240";
+  if (tf === "240") return "D";
+
+  return "60";
+}
+
+function intervalFromTf(src, tf) {
+  if (tf === "5") return "5min";
+  if (tf === "15") return "15min";
+  if (tf === "30") return "30min";
+  if (tf === "60") return "1h";
+  if (tf === "240") return "4h";
+  if (tf === "D") return "1day";
+
+  return "5min";
+}
+
+async function fetchCandles(symbol, customTf=null){
+  let tf=customTf||$("tf").value;
+  let url="/api/twelvedata/candles"
+    +"?symbol="+encodeURIComponent(symbol)
+    +"&interval="+intervalFromTf("twelvedata",tf)
+    +"&outputsize=180";
+
+  let r=await fetch(url,{
+    cache:"no-store",
+    headers:{"Authorization":"Bearer "+token}
   });
+
+  let d=await r.json();
+
+  if(!r.ok||d.error)throw Error(d.error||"Twelve Data error");
+
+  let candles=(d.values||[])
+    .map(v=>({
+      time:v.datetime,
+      open:+v.open,
+      high:+v.high,
+      low:+v.low,
+      close:+v.close,
+      volume:+(v.volume||1)
+    }))
+    .filter(c=>Number.isFinite(c.close))
+    .reverse();
+
+  if(candles.length<40)throw Error("Candle < 40");
+
+  return{candles,source:"Twelve Data"};
+}
+function lockExpired(sym){let L=locks[sym];if(!L)return true;let age=Date.now()-new Date(L.createdAt||0).getTime();return age>Number($("tf").value||5)*3*60*1000||["🔴 SL HIT","🏆 FULL TP"].includes(L.status)}
+async function scanQueue(){
+  if(queueRunning)return;
+
+  queueRunning=true;
+
+  try{
+    let list=symbols();
+
+    if(limits&&list.length>limits.maxPairs){
+      list=list.slice(0,limits.maxPairs);
+    }
+
+    const tf=String($("tf").value||"5");
+    const engineRaw=String($("engine").value||"SMC").toUpperCase();
+
+    let engine="SMC";
+    if(engineRaw.includes("HYBRID")) engine="HYBRID";
+    else if(engineRaw.includes("SNIPER")) engine="SNIPER";
+
+    $("scanStatus").textContent="Sync worker...";
+
+    const q=new URLSearchParams({
+      tf,
+      engine,
+      symbols:list.join(",")
+    });
+
+    const data=await api("/api/scanner/current?"+q.toString());
+    const rows=Array.isArray(data.rows)?data.rows:[];
+
+    results=rows.map(r=>{
+      const rawSignal=String(r.signal||"WAIT").toUpperCase();
+      const status=String(r.status||"NO ACTIVE SIGNAL").toUpperCase();
+      const direction=String(r.direction||"").toUpperCase();
+
+      let color="yellow";
+      if(direction==="LONG") color="green";
+      if(direction==="SHORT") color="red";
+      if(status.includes("TP")) color="green";
+      if(status.includes("STOP")||status.includes("SL")) color="red";
+
+      return {
+        symbol:r.symbol||r.pair,
+        source:"SERVER WORKER",
+        signal:rawSignal,
+        status:r.status||"NO ACTIVE SIGNAL",
+        color,
+        entry:r.entry,
+        tp1:r.tp1,
+        tp2:r.tp2,
+        tp3:r.tp3,
+        sl:r.sl,
+        candles:[],
+        structureHigh:null,
+        structureLow:null,
+        atr:null,
+        locked:!!r.signalId,
+        signalId:r.signalId,
+        emaConfirm:r.emaConfirm,
+        engine:r.engine,
+        createdAt:r.createdAt,
+        updatedAt:r.updatedAt,
+        aiAnalysis:
+          "<b>⚡ ONE SOURCE OF TRUTH</b><br>"+
+          "<b>Signal ID:</b> "+(r.signalId||"-")+"<br>"+
+          "<b>Source:</b> Background Worker<br>"+
+          "<b>Engine:</b> "+(r.engine||engine)+"<br>"+
+          "<b>EMA:</b> "+(r.emaConfirm||"-")+"<br>"+
+          "<b>Lifecycle:</b> "+(r.lifecycleStatus||"-")+"<br>"+
+          "<b>Execution:</b> "+(r.executionStatus||"-")
+      };
+    });
+
+    render();
+
+    if(results.length){
+      const keep=selected&&results.find(x=>x.symbol===selected.symbol);
+      pick(keep?keep.symbol:results[0].symbol);
+    }
+
+    $("scanStatus").textContent=
+      "Synced • Source: Background Worker • "+new Date().toLocaleTimeString("id-ID");
+
+    log("Web sync OK: "+rows.length+" pair dari Background Worker");
+
+  }catch(e){
+    $("scanStatus").textContent="Sync error";
+    log("Web worker sync error: "+e.message);
+  }finally{
+    queueRunning=false;
+  }
 }
 
-async function sendNotification(signal) {
-  return authorizedApi("/api/push/broadcast", {
-    method: "POST",
-    body: JSON.stringify({
-      pair: signal.pair,
-      signal: signal.signal,
-      grade: signal.grade,
-      engine: signal.engine,
-      entry: fmtPrice(signal.entry),
-      tp1: fmtPrice(signal.tp1),
-      tp2: fmtPrice(signal.tp2),
-      tp3: fmtPrice(signal.tp3),
-      sl: fmtPrice(signal.sl),
-      emaConfirm: signal.emaConfirm,
-      volatility: signal.volatilityOk ? "OK" : "LOW",
-      mainSignal: signal.mainSignal,
-      sourceMode: signal.sourceMode
-    })
-  });
-}
+function updateLockedSignal(sym,price){let L=locks[sym];if(!L||!Number.isFinite(price))return L;if(L.signal==="OPEN LONG"){if(price>=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price>=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price>=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price<=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}if(L.signal==="OPEN SHORT"){if(price<=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price<=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price<=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price>=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}saveSignal(sym,L);return L}async function saveSignal(sym,r){try{if(!r.entry)return;await api("/api/signals/upsert",{method:"POST",body:JSON.stringify({key:`${sym}|${r.tf||tfLabel()}|${r.signal}|${r.entry}`,pair:sym,tf:r.tf||tfLabel(),signal:r.signal,entry:r.entry,tp1:r.tp1,tp2:r.tp2,tp3:r.tp3,sl:r.sl,status:r.status,createdAt:r.createdAt||new Date().toISOString(),grade:r.grade,engine:r.engine})})}catch(e){}}
+function ema(a,p){if(!a.length)return NaN;let k=2/(p+1),e=a[0];for(let i=1;i<a.length;i++)e=a[i]*k+e*(1-k);return e}function atr(c,p=14){let t=[];for(let i=1;i<c.length;i++)t.push(Math.max(c[i].high-c[i].low,Math.abs(c[i].high-c[i-1].close),Math.abs(c[i].low-c[i-1].close)));let s=t.slice(-p);return s.length?s.reduce((a,b)=>a+b,0)/s.length:0}function sma(a,p){let s=a.slice(-p);return s.length?s.reduce((x,y)=>x+y,0)/s.length:0}function seriesEma(v,p){let out=Array(v.length).fill(null),k=2/(p+1),e=v[0];out[0]=e;for(let i=1;i<v.length;i++){e=v[i]*k+e*(1-k);out[i]=e}return out}function pineRsi(v,p=14){if(v.length<=p)return 50;let g=0,l=0;for(let i=1;i<=p;i++){let d=v[i]-v[i-1];if(d>=0)g+=d;else l-=d}let ag=g/p,al=l/p;for(let i=p+1;i<v.length;i++){let d=v[i]-v[i-1];ag=(ag*(p-1)+Math.max(d,0))/p;al=(al*(p-1)+Math.max(-d,0))/p}if(al===0)return 100;return 100-(100/(1+ag/al))}function pineMacd(v){let e12=seriesEma(v,12),e26=seriesEma(v,26),m=v.map((_,i)=>(e12[i]||0)-(e26[i]||0)),s=seriesEma(m,9),i=v.length-1;return{macdVal:m[i]||0,macdSig:s[i]||0,macdHist:(m[i]||0)-(s[i]||0)}}function getGrade(s){if(s>=8)return"A+";if(s>=6.5)return"A";if(s>=5)return"B";return"C"}function dmi(c,p=14){let trs=[],pd=[],md=[];for(let i=1;i<c.length;i++){let up=c[i].high-c[i-1].high,down=c[i-1].low-c[i].low;trs.push(Math.max(c[i].high-c[i].low,Math.abs(c[i].high-c[i-1].close),Math.abs(c[i].low-c[i-1].close)));pd.push(up>down&&up>0?up:0);md.push(down>up&&down>0?down:0)}let tr=sma(trs,p),diPlus=tr?100*sma(pd,p)/tr:0,diMinus=tr?100*sma(md,p)/tr:0,adx=(diPlus+diMinus)?100*Math.abs(diPlus-diMinus)/(diPlus+diMinus):0;return{adx,diPlus,diMinus}}function vwap(c){let pv=0,v=0;for(let k of c){let vol=k.volume||1,typ=(k.high+k.low+k.close)/3;pv+=typ*vol;v+=vol}return v?pv/v:c[c.length-1].close}
+function pineParams(){let tf=Number($("tf").value||5);if(tf<=5)return{preset:"Scalping",emaFast:5,emaSlow:13,emaTrend:34,rsiLen:8,atrLen:10,effectiveScore:4,slMult:.8};if(tf<=60)return{preset:"Default",emaFast:9,emaSlow:21,emaTrend:55,rsiLen:13,atrLen:14,effectiveScore:5,slMult:1.5};return{preset:"Swing",emaFast:13,emaSlow:34,emaTrend:89,rsiLen:21,atrLen:20,effectiveScore:6,slMult:2.5}}
+function analyzeSMCPine(symbol,candles,source,htfCandles){let c=candles.slice(0,-1),live=candles[candles.length-1];if(c.length<80)return{symbol,source,signal:"WAIT",status:"DATA LOW",color:"yellow",candles:c,engine:"SMC PINE",livePrice:live?.close};let last=c[c.length-1],close=c.map(x=>x.close),e9=ema(close.slice(-80),9),e20=ema(close.slice(-80),20),a=atr(c,14),s=c.slice(-20),structureHigh=Math.max(...s.map(x=>x.high)),structureLow=Math.min(...s.map(x=>x.low)),bosBull=last.close>structureHigh,bosBear=last.close<structureLow,emaLong=e9>e20&&last.close>e9,emaShort=e9<e20&&last.close<e9,htfBias=e9>e20?1:-1;if(htfCandles&&htfCandles.length>50){let hc=htfCandles.slice(0,-1).map(x=>x.close),hf=ema(hc.slice(-80),9),hs=ema(hc.slice(-80),20);htfBias=hf>hs?1:hf<hs?-1:0}let score=0;if(bosBull||bosBear)score+=2;if(emaLong||emaShort)score+=1.5;score+=1;if((bosBull&&htfBias===1)||(bosBear&&htfBias===-1))score+=1.5;let grade=getGrade(score),signal="WAIT",status="NO TRADE",color="yellow",entry,tp1,tp2,tp3,sl,target=a*2;if(bosBull&&emaLong&&htfBias!==-1&&score>=5){signal="OPEN LONG";status="SMC LONG";color="green";entry=structureHigh;tp1=entry+target*.8;tp2=entry+target*1.6;tp3=entry+target*2.8;sl=entry-target*1.2}else if(bosBear&&emaShort&&htfBias!==1&&score>=5){signal="OPEN SHORT";status="SMC SHORT";color="red";entry=structureLow;tp1=entry-target*.8;tp2=entry-target*1.6;tp3=entry-target*2.8;sl=entry+target*1.2}let aiAnalysis=`<b>⚡ DEWA SMC AI</b><br><b>Pair:</b> ${symbol}<br><b>Engine:</b> SMC PINE<br><b>HTF:</b> ${htfBias===1?"Bullish":"Bearish"}<br><b>Grade:</b> ${grade}<br><br><b>Entry:</b> ${priceFmt(symbol,entry)}<br><b>TP1:</b> ${priceFmt(symbol,tp1)}<br><b>TP2:</b> ${priceFmt(symbol,tp2)}<br><b>TP3:</b> ${priceFmt(symbol,tp3)}<br><b>SL:</b> ${priceFmt(symbol,sl)}`;return{symbol,source,signal,status,color,entry,tp1,tp2,tp3,sl,candles:c,structureHigh,structureLow,atr:a,volOk:true,locked:false,livePrice:live.close,engine:"SMC PINE",grade,score,aiAnalysis}}
+function analyzeSniperFull(symbol,candles,source,htfCandles){let c=candles.slice(0,-1),live=candles[candles.length-1];if(c.length<80)return{symbol,source,signal:"WAIT",status:"DATA LOW",color:"yellow",candles:c,engine:"SNIPER PINE HTF",livePrice:live?.close};let p=pineParams(),last=c[c.length-1],close=c.map(x=>x.close),ef=seriesEma(close,p.emaFast),es=seriesEma(close,p.emaSlow),et=ema(close.slice(-140),p.emaTrend),emaFast=ef.at(-1),emaSlow=es.at(-1),prevFast=ef.at(-2),prevSlow=es.at(-2),rsi=pineRsi(close,p.rsiLen),mac=pineMacd(close),adx=dmi(c,14),vw=vwap(c),a=atr(c,p.atrLen),vol=c.map(x=>x.volume||1),volAbove=vol.at(-1)>sma(vol,20)*1.2,htfBias=emaFast>emaSlow?1:-1;if(htfCandles&&htfCandles.length>50){let hc=htfCandles.slice(0,-1).map(x=>x.close),hf=ema(hc.slice(-120),p.emaFast),hs=ema(hc.slice(-120),p.emaSlow),ht=ema(hc.slice(-140),p.emaTrend);htfBias=(hf>hs&&hc.at(-1)>ht)?1:(hf<hs&&hc.at(-1)<ht)?-1:0}let bull=0,bear=0;bull+=emaFast>emaSlow?1:0;bear+=emaFast<emaSlow?1:0;bull+=last.close>et?1:0;bear+=last.close<et?1:0;bull+=rsi>50&&rsi<75?1:0;bear+=rsi<50&&rsi>25?1:0;bull+=mac.macdHist>0?1:0;bear+=mac.macdHist<0?1:0;bull+=mac.macdVal>mac.macdSig?1:0;bear+=mac.macdVal<mac.macdSig?1:0;bull+=last.close>vw?1:0;bear+=last.close<vw?1:0;bull+=volAbove?1:0;bear+=volAbove?1:0;bull+=adx.adx>20&&adx.diPlus>adx.diMinus?1:0;bear+=adx.adx>20&&adx.diMinus>adx.diPlus?1:0;bull+=htfBias===1?1.5:0;bear+=htfBias===-1?1.5:0;let crossB=prevFast<=prevSlow&&emaFast>emaSlow,crossS=prevFast>=prevSlow&&emaFast<emaSlow,rawB=crossB&&last.close>emaFast&&last.close>emaSlow&&rsi<75&&bull>=p.effectiveScore&&bull>=6.5,rawS=crossS&&last.close<emaFast&&last.close<emaSlow&&rsi>25&&bear>=p.effectiveScore&&bear>=6.5,lastDir=DEWA_LAST_DIR[symbol]||0,signal="WAIT",status="NO TRADE",color="yellow",entry,tp1,tp2,tp3,sl,grade=getGrade(Math.max(bull,bear)),sh=Math.max(...c.slice(-10).map(x=>x.high)),lo=Math.min(...c.slice(-10).map(x=>x.low));if(rawB&&lastDir!==1){entry=last.close;sl=Math.max(entry-a*p.slMult,lo-a*.2);let risk=Math.abs(entry-sl);tp1=entry+risk;tp2=entry+risk*2;tp3=entry+risk*3;signal="OPEN LONG";status="SNIPER LONG";color="green";DEWA_LAST_DIR[symbol]=1;saveLastDir()}else if(rawS&&lastDir!==-1){entry=last.close;sl=Math.min(entry+a*p.slMult,sh+a*.2);let risk=Math.abs(entry-sl);tp1=entry-risk;tp2=entry-risk*2;tp3=entry-risk*3;signal="OPEN SHORT";status="SNIPER SHORT";color="red";DEWA_LAST_DIR[symbol]=-1;saveLastDir()}let aiAnalysis=`<b>⚡ DEWA SNIPER AI</b><br><b>Pair:</b> ${symbol}<br><b>Engine:</b> SNIPER PINE HTF<br><b>Bull:</b> ${bull} | <b>Bear:</b> ${bear} | <b>Grade:</b> ${grade}<br><b>HTF:</b> ${htfBias===1?"Bullish":"Bearish"}<br><br><b>Entry:</b> ${priceFmt(symbol,entry)}<br><b>TP1:</b> ${priceFmt(symbol,tp1)}<br><b>TP2:</b> ${priceFmt(symbol,tp2)}<br><b>TP3:</b> ${priceFmt(symbol,tp3)}<br><b>SL:</b> ${priceFmt(symbol,sl)}`;return{symbol,source,signal,status,color,entry,tp1,tp2,tp3,sl,candles:c,structureHigh:sh,structureLow:lo,atr:a,volOk:true,locked:false,livePrice:live.close,engine:"SNIPER PINE HTF",bullScore:bull,bearScore:bear,grade,aiAnalysis}}
+function analyzeHybrid(symbol,candles,source,htf){let smc=analyzeSMCPine(symbol,candles,source,htf),sn=analyzeSniperFull(symbol,candles,source,htf);if(smc.signal===sn.signal&&smc.signal!=="WAIT"&&["A","A+"].includes(sn.grade))return{...sn,status:"HYBRID CONFIRM",engine:"HYBRID PINE HTF"};return{...sn,signal:"WAIT",status:"WAIT HYBRID",color:"yellow",engine:"HYBRID PINE HTF"}}function analyzeEngine(symbol,candles,source,htf){let mode=$("engine").value;if(mode==="sniper")return analyzeSniperFull(symbol,candles,source,htf);if(mode==="hybrid")return analyzeHybrid(symbol,candles,source,htf);return analyzeSMCPine(symbol,candles,source,htf)}
+function render(){
+  $("body").innerHTML=results.length
+    ?results.map((r,i)=>`
+      <tr onclick="pick('${r.symbol}')">
+        <td>${i+1}</td>
+        <td>${r.symbol}</td>
+        <td>${r.source||"-"}</td>
+        <td class="${r.color}"><b>${displaySignalName(r.signal,r.status)}</b></td>
+        <td class="${r.color}"><b>${r.status}</b></td>
+        <td>${priceFmt(r.symbol,r.entry)}</td>
+        <td>${priceFmt(r.symbol,r.tp1)}</td>
+        <td>${priceFmt(r.symbol,r.tp2)}</td>
+        <td>${priceFmt(r.symbol,r.tp3)}</td>
+        <td>${priceFmt(r.symbol,r.sl)}</td>
+        <td>${r.signalId?"#"+r.signalId:"-"}</td>
+      </tr>`).join("")
+    :'<tr><td colspan="11" class="muted">No worker signal.</td></tr>';
 
-function printTvDiagnostic(signal, pair, tf) {
-  const d = signal?.diagnostic;
-  if (!d) return;
+  $("stTotal").textContent=results.length;
+  $("stLong").textContent=results.filter(r=>
+    String(r.signal||"").includes("LONG")||
+    String(r.status||"").includes("LONG")
+  ).length;
+  $("stShort").textContent=results.filter(r=>
+    String(r.signal||"").includes("SHORT")||
+    String(r.status||"").includes("SHORT")
+  ).length;
+  $("stWait").textContent=results.filter(r=>
+    !r.signalId||String(r.signal||"")==="WAIT"
+  ).length;
+  $("stErr").textContent=0;
+}function pick(sym){let r=results.find(x=>x.symbol===sym);if(!r)return;selected=r;$("chartTitle").textContent=r.symbol+" - "+r.signal;$("mSignal").textContent=r.signal;$("mSignal").className=r.color;$("mStatus").textContent=r.status;$("mStatus").className=r.color;$("mSource").textContent=r.source||"-";$("mHigh").textContent=priceFmt(r.symbol,r.structureHigh);$("mLow").textContent=priceFmt(r.symbol,r.structureLow);$("dEntry").textContent=priceFmt(r.symbol,r.entry);$("dTP1").textContent=priceFmt(r.symbol,r.tp1);$("dTP2").textContent=priceFmt(r.symbol,r.tp2);$("dTP3").textContent=priceFmt(r.symbol,r.tp3);$("dSL").textContent=priceFmt(r.symbol,r.sl);$("dATR").textContent=priceFmt(r.symbol,r.atr);$("aiAnalysis").innerHTML=r.aiAnalysis||"Belum ada analisa";draw(r);calcLot()}
+function getSymbolSpec(pair){
+  const symbol = String(pair || "")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "");
 
-  const compact = {
-    mode: d.mode,
-    feed: d.feedSymbol,
-    pair,
-    tf: tfLabel(tf),
-    currentTime: d.currentTime,
-    currentOHLC: d.currentOHLC,
-    lastClosedTime: d.lastClosedTime,
-    lastClosedOHLC: d.lastClosedOHLC,
-    structurePeriod: d.structurePeriod,
-    structureHigh: d.structureHigh,
-    structureLow: d.structureLow,
-    structureHighPivotTime: d.structureHighPivotTime,
-    structureLowPivotTime: d.structureLowPivotTime,
-    pivotHighHistory: d.pivotHighHistory,
-    pivotLowHistory: d.pivotLowHistory,
-    pineState: d.pineState,
-    persistentMode: d.persistentMode,
-    highBreakPending: d.highBreakPending,
-    lowBreakPending: d.lowBreakPending,
-    prepareDistancePct: d.prepareDistancePct,
-    distanceToHighPct: d.distanceToHighPct,
-    distanceToLowPct: d.distanceToLowPct,
-    distanceToEntryPct: d.distanceToEntryPct,
-    prepLongRaw: d.prepLongRaw,
-    prepShortRaw: d.prepShortRaw,
-    prepLong: d.prepLong,
-    prepShort: d.prepShort,
-    ema9: d.ema9,
-    ema20: d.ema20,
-    emaLong: d.emaLong,
-    emaShort: d.emaShort,
-    atr14: d.atr14,
-    atrSma20: d.atrSma20,
-    volatilityOk: d.volatilityOk,
-    entry: d.entry,
-    tp1: d.tp1,
-    tp2: d.tp2,
-    tp3: d.tp3,
-    sl: d.sl,
-    breakout: d.breakout
+  if(symbol.includes("ETH")){
+    return {
+      contractSize: 1,
+      minLot: 0.10,
+      lotStep: 0.01
+    };
+  }
+
+  if(symbol.includes("BTC")){
+    return {
+      contractSize: 1,
+      minLot: 0.01,
+      lotStep: 0.01
+    };
+  }
+
+  if(symbol.includes("XAU")){
+    return {
+      contractSize: 100,
+      minLot: 0.01,
+      lotStep: 0.01
+    };
+  }
+
+  if(symbol.includes("XAG")){
+    return {
+      contractSize: 5000,
+      minLot: 0.01,
+      lotStep: 0.01
+    };
+  }
+
+  if(
+    symbol.includes("EURUSD") ||
+    symbol.includes("GBPUSD")
+  ){
+    return {
+      contractSize: 100000,
+      minLot: 0.01,
+      lotStep: 0.01
+    };
+  }
+
+  return {
+    contractSize: 1,
+    minLot: 0.01,
+    lotStep: 0.01
   };
+}
+function pl(pair, signal, lot, entry, target){
+  const spec = getSymbolSpec(pair);
 
-  console.log("[TV-DIAG]", JSON.stringify(compact));
+  const numericLot = Number(lot);
+  const numericEntry = Number(entry);
+  const numericTarget = Number(target);
+
+  const isLong =
+    String(signal || "").toUpperCase().includes("LONG");
+
+  const move = isLong
+    ? numericTarget - numericEntry
+    : numericEntry - numericTarget;
+
+  return move * numericLot * spec.contractSize;
+}
+function calcLot(){
+  if(!selected || !selected.entry){
+    $("calcResult").innerHTML =
+      "Pilih signal aktif yang memiliki entry.";
+    return;
+  }
+
+  const lot = Number($("lotInput").value || 0);
+  const r = selected;
+  const spec = getSymbolSpec(r.symbol);
+
+  if(!Number.isFinite(lot) || lot <= 0){
+    $("calcResult").innerHTML =
+      "Lot harus berupa angka yang valid.";
+    return;
+  }
+
+  if(lot < spec.minLot){
+    $("calcResult").innerHTML =
+      `<div class="row">
+        <span>Lot tidak valid</span>
+        <b class="red">
+          Minimum lot ${r.symbol} adalah ${spec.minLot}
+        </b>
+      </div>`;
+    return;
+  }
+
+  $("calcResult").innerHTML = `
+    <div class="row">
+      <span>Pair</span>
+      <b>${r.symbol}</b>
+    </div>
+
+    <div class="row">
+      <span>Lot</span>
+      <b>${lot}</b>
+    </div>
+
+    <div class="row">
+      <span>Contract Size</span>
+      <b>${spec.contractSize}</b>
+    </div>
+
+    <div class="row">
+      <span>TP1 Estimasi</span>
+      <b class="green">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp1))}
+      </b>
+    </div>
+
+    <div class="row">
+      <span>TP2 Estimasi</span>
+      <b class="green">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp2))}
+      </b>
+    </div>
+
+    <div class="row">
+      <span>TP3 Estimasi</span>
+      <b class="green">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.tp3))}
+      </b>
+    </div>
+
+    <div class="row">
+      <span>SL Estimasi</span>
+      <b class="red">
+        $${fmt(pl(r.symbol,r.signal,lot,r.entry,r.sl))}
+      </b>
+    </div>
+  `;
+}
+async function loadAnalytics(){try{let d=await api("/api/signals/analytics");$("analyticsBox").innerHTML=`<div class="analytics"><div class="stat"><small>TODAY</small><b>${d.today.winrate}%</b><div class="sub">Signal ${d.today.total}</div></div><div class="stat"><small>ALL TIME</small><b>${d.allTime.winrate}%</b><div class="sub">Signal ${d.allTime.total}</div></div></div>`}catch(e){log(e.message)}}async function loadUsers(){try{let d=await api("/api/admin/users");$("adminUsers").innerHTML=d.users.map(u=>`<div class="usercard"><div class="row"><span><b>${u.email}</b><br><span class="muted">${u.plan} • ${String(u.expiredAt||"-").slice(0,10)}</span><br><span class="muted">EA: ${u.eaEnabled?"ON":"OFF"} • MT5: ${u.mt5Account||"-"}</span><br><span class="muted" style="word-break:break-all">KEY: ${u.eaApiKey||"-"}</span></span><span class="badge">${u.status||"-"} ${u.active?"✅":"❌"}</span></div>${u.status==="PENDING"?`<div class="mini"><select id="plan_${u.id}"><option>FREE</option><option>PRO</option><option>VIP</option></select><input id="days_${u.id}" type="number" value="30"><input id="pass_${u.id}" value="DEWA123456"></div><input id="mt5_${u.id}" placeholder="MT5 Account optional"><button class="btnok" onclick="approveUser('${u.id}')">APPROVE</button>`:`<div class="mini"><select id="status_${u.id}"><option ${u.status==="ACTIVE"?"selected":""}>ACTIVE</option><option ${u.status==="BLOCKED"?"selected":""}>BLOCKED</option></select><input id="mt5_${u.id}" value="${u.mt5Account||""}"><select id="ea_${u.id}"><option value="true" ${u.eaEnabled?"selected":""}>EA ON</option><option value="false" ${!u.eaEnabled?"selected":""}>EA OFF</option></select></div><button class="btn2" onclick="updateUser('${u.id}')">UPDATE</button> <button class="btn2" onclick="regenEaKey('${u.id}')">NEW EA KEY</button>`} <button class="btnred" onclick="deleteUser('${u.id}')">DELETE</button></div>`).join("")}catch(e){log(e.message)}}async function approveUser(id){let d=await api("/api/admin/approve-user",{method:"POST",body:JSON.stringify({userId:id,plan:$("plan_"+id).value,days:Number($("days_"+id).value||30),password:$("pass_"+id).value,mt5Account:$("mt5_"+id).value,eaEnabled:true})});log("Approved: "+d.user.email+" | EA Key: "+d.user.eaApiKey);loadUsers()}async function updateUser(id){await api("/api/admin/update-user",{method:"POST",body:JSON.stringify({userId:id,status:$("status_"+id).value,mt5Account:$("mt5_"+id).value,eaEnabled:$("ea_"+id).value==="true"})});loadUsers()}async function regenEaKey(id){await api("/api/admin/regenerate-ea-key",{method:"POST",body:JSON.stringify({userId:id})});loadUsers()}async function deleteUser(id){if(!confirm("Hapus member/request ini?"))return;let r=await fetch("/api/admin/delete-user/"+id,{method:"DELETE",headers:headers()}),d=await r.json();if(!r.ok||d.error)alert(d.error||"Delete gagal");loadUsers()}
+function draw(r){let c=r.candles,cv=$("chart"),ctx=cv.getContext("2d");ctx.clearRect(0,0,cv.width,cv.height);ctx.fillStyle="#020617";ctx.fillRect(0,0,cv.width,cv.height);if(!c||c.length<2)return;let max=Math.max(...c.map(x=>x.high)),min=Math.min(...c.map(x=>x.low)),y=v=>cv.height-25-((v-min)/(max-min||1))*(cv.height-55),x=i=>30+i*((cv.width-55)/(c.length-1));c.forEach((k,i)=>{let xx=x(i),yo=y(k.open),yc=y(k.close),yh=y(k.high),yl=y(k.low);ctx.strokeStyle=k.close>=k.open?"#22c55e":"#ef4444";ctx.beginPath();ctx.moveTo(xx,yh);ctx.lineTo(xx,yl);ctx.stroke();ctx.fillStyle=ctx.strokeStyle;ctx.fillRect(xx-2,Math.min(yo,yc),4,Math.max(2,Math.abs(yc-yo)))})}function showPage(page){document.querySelectorAll('.nav div').forEach(x=>x.classList.remove('on'));if(page==="scanner"){$("navScanner").classList.add("on");$("scannerPanel").scrollIntoView({behavior:"smooth"})}if(page==="analytics"){$("navAnalytics").classList.add("on");$("analyticsPanel").scrollIntoView({behavior:"smooth"});loadAnalytics()}if(page==="member"){$("navMember").classList.add("on");document.querySelector(".userbox").scrollIntoView({behavior:"smooth"})}if(page==="admin"){$("navAdmin").classList.add("on");$("adminPanel").scrollIntoView({behavior:"smooth"});simpleLoadAdmin()}}
+function urlBase64ToUint8Array(b){const p="=".repeat((4-b.length%4)%4),base64=(b+p).replace(/-/g,"+").replace(/_/g,"/"),raw=atob(base64),out=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)out[i]=raw.charCodeAt(i);return out}async function enablePush(){let perm=await Notification.requestPermission();if(perm!=="granted")return alert("Izin notifikasi ditolak");let reg=await navigator.serviceWorker.ready,k=await api("/api/push/public-key"),sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:urlBase64ToUint8Array(k.publicKey)});await api("/api/push/subscribe",{method:"POST",body:JSON.stringify({subscription:sub})});new Notification("⚡ DEWA SMC SIGNAL",{body:"Notifikasi aktif.",icon:"/icon-192.png"})}async function broadcastSignal(sym,r){try{await api("/api/push/broadcast",{method:"POST",body:JSON.stringify({pair:sym,signal:r.signal,entry:priceFmt(sym,r.entry),tp1:priceFmt(sym,r.tp1),tp2:priceFmt(sym,r.tp2),tp3:priceFmt(sym,r.tp3),sl:priceFmt(sym,r.sl)})})}catch(e){}}
+
+
+/* =========================================================
+   V7.0 PINE STATE FIX OVERRIDE
+   Tujuan:
+   - SNIPER mengikuti Pine lebih dekat:
+     ema crossover/crossunder as trigger
+     bullScore/bearScore with same weights
+     HTF bias +1.5
+     grade filter
+     lastDirection memory
+     trade state: ACTIVE LONG/SHORT
+   - Jika signal sudah aktif, web tetap tampil ACTIVE seperti TradingView
+   - Entry/TP/SL dikunci sampai TP/SL/reverse
+   ========================================================= */
+
+let DEWA_TV_STATE = JSON.parse(localStorage.getItem("DEWA_TV_STATE") || "{}");
+
+function saveTvState(){
+  localStorage.setItem("DEWA_TV_STATE", JSON.stringify(DEWA_TV_STATE));
 }
 
-async function processPairTf(pairConfig, tf) {
-  const pair = pairConfig.symbol;
-  const candles = await fetchCandles(pairConfig.dataSymbol, tf);
-  const signal = analyzeSmc(pair, tf, candles, pairConfig);
+function tvGradeMode(){
+  // Default dibuat agar hanya A/A+ menjadi signal baru.
+  // Active trade B tetap bisa tampil karena berasal dari state sebelumnya.
+  return "A";
+}
 
-  printTvDiagnostic(signal, pair, tf);
+function passesGradeFilter(score){
+  const mode = tvGradeMode();
+  if(mode === "A+") return score >= 8;
+  if(mode === "A") return score >= 6.5;
+  if(mode === "B") return score >= 5;
+  return score >= 0;
+}
 
-  if (!signal.valid) {
-    console.log(
-      "[SCAN]",
-      pair,
-      tfLabel(tf),
-      signal.reason,
-      signal.grade || ""
+function getSniperStateKey(symbol){
+  return symbol + "|" + tfLabel() + "|SNIPER";
+}
+
+function normalizeStatePrice(v){
+  return Number.isFinite(Number(v)) ? Number(v) : NaN;
+}
+
+function isLongHit(price, level){ return Number.isFinite(price) && Number.isFinite(level) && price >= level; }
+function isShortHit(price, level){ return Number.isFinite(price) && Number.isFinite(level) && price <= level; }
+
+function updatePineTradeState(symbol, livePrice){
+  const key = getSniperStateKey(symbol);
+  const st = DEWA_TV_STATE[key];
+  if(!st || !Number.isFinite(livePrice)) return null;
+
+  if(st.dir === "LONG"){
+    if(livePrice <= st.sl){
+      st.tradeStatus = "SL HIT";
+      st.active = false;
+      st.color = "red";
+    }else if(livePrice >= st.tp3){
+      st.tradeStatus = "TP3 HIT";
+      st.active = false;
+      st.color = "green";
+    }else if(livePrice >= st.tp2){
+      st.tradeStatus = "TP2 HIT";
+      st.active = true;
+      st.color = "green";
+    }else if(livePrice >= st.tp1){
+      st.tradeStatus = "TP1 HIT";
+      st.active = true;
+      st.color = "green";
+    }else{
+      st.tradeStatus = "ACTIVE";
+      st.active = true;
+      st.color = "blue";
+    }
+  }
+
+  if(st.dir === "SHORT"){
+    if(livePrice >= st.sl){
+      st.tradeStatus = "SL HIT";
+      st.active = false;
+      st.color = "red";
+    }else if(livePrice <= st.tp3){
+      st.tradeStatus = "TP3 HIT";
+      st.active = false;
+      st.color = "green";
+    }else if(livePrice <= st.tp2){
+      st.tradeStatus = "TP2 HIT";
+      st.active = true;
+      st.color = "green";
+    }else if(livePrice <= st.tp1){
+      st.tradeStatus = "TP1 HIT";
+      st.active = true;
+      st.color = "green";
+    }else{
+      st.tradeStatus = "ACTIVE";
+      st.active = true;
+      st.color = "blue";
+    }
+  }
+
+  DEWA_TV_STATE[key] = st;
+  saveTvState();
+  return st;
+}
+
+function stateToResult(symbol, source, candles, live, st, extra={}){
+  const signal = st.dir === "LONG" ? "OPEN LONG" : "OPEN SHORT";
+  const isClosed = !st.active && (st.tradeStatus === "SL HIT" || st.tradeStatus === "TP3 HIT");
+  const status = isClosed ? st.tradeStatus : "ACTIVE " + st.dir;
+  const color = st.tradeStatus === "SL HIT" ? "red" : st.tradeStatus.includes("TP") ? "green" : "blue";
+  const aiAnalysis = `
+    <b>⚡ DEWA SNIPER AI - PINE STATE</b><br>
+    <b>Pair:</b> ${symbol}<br>
+    <b>Engine:</b> SNIPER PINE STATE<br>
+    <b>Status:</b> ${status}<br>
+    <b>Trend:</b> ${st.dir === "LONG" ? "BULLISH" : "BEARISH"}<br>
+    <b>RSI:</b> ${extra.rsiText || "-"}<br>
+    <b>ADX:</b> ${extra.adxText || "-"}<br>
+    <b>HTF:</b> ${extra.htfText || st.htfText || "-"}<br>
+    <b>Bull:</b> ${extra.bullScore ?? st.bullScore ?? "-"} |
+    <b>Bear:</b> ${extra.bearScore ?? st.bearScore ?? "-"} |
+    <b>Grade:</b> ${extra.grade || st.grade || "-"}<br><br>
+    <b>Entry:</b> ${priceFmt(symbol, st.entry)}<br>
+    <b>TP1:</b> ${priceFmt(symbol, st.tp1)}<br>
+    <b>TP2:</b> ${priceFmt(symbol, st.tp2)}<br>
+    <b>TP3:</b> ${priceFmt(symbol, st.tp3)}<br>
+    <b>SL:</b> ${priceFmt(symbol, st.sl)}<br><br>
+    <b>Catatan:</b> State ACTIVE mengikuti logic Pine: signal tidak reset tiap candle sampai TP/SL/reverse.
+  `;
+  return {
+    symbol, source,
+    signal,
+    status,
+    color,
+    entry: st.entry, tp1: st.tp1, tp2: st.tp2, tp3: st.tp3, sl: st.sl,
+    candles,
+    structureHigh: extra.structureHigh,
+    structureLow: extra.structureLow,
+    atr: extra.atrVal,
+    volOk: true,
+    locked:false,
+    livePrice: live ? live.close : undefined,
+    engine:"SNIPER PINE STATE",
+    grade: extra.grade || st.grade,
+    bullScore: extra.bullScore ?? st.bullScore,
+    bearScore: extra.bearScore ?? st.bearScore,
+    aiAnalysis
+  };
+}
+
+function analyzeSniperFull(symbol,candles,source,htfCandles){
+  const c=candles.slice(0,-1);
+  const live=candles[candles.length-1];
+
+  if(c.length<80){
+    return {symbol,source,signal:"WAIT",status:"DATA LOW",color:"yellow",candles:c,engine:"SNIPER PINE STATE",livePrice:live?.close};
+  }
+
+  const p=pineParams();
+  const last=c[c.length-1];
+  const close=c.map(x=>x.close);
+  const ef=seriesEma(close,p.emaFast);
+  const es=seriesEma(close,p.emaSlow);
+  const emaFast=ef.at(-1);
+  const emaSlow=es.at(-1);
+  const prevFast=ef.at(-2);
+  const prevSlow=es.at(-2);
+  const emaTrend=ema(close.slice(-Math.max(140,p.emaTrend*2)),p.emaTrend);
+
+  const rsi=pineRsi(close,p.rsiLen);
+  const mac=pineMacd(close);
+  const adx=dmi(c,14);
+  const vw=vwap(c);
+  const a=atr(c,p.atrLen);
+  const vol=c.map(x=>x.volume||1);
+  const volAbove=vol.at(-1)>sma(vol,20)*1.2;
+
+  let htfBias=emaFast>emaSlow?1:emaFast<emaSlow?-1:0;
+  let htfText="Fallback";
+  if(htfCandles&&htfCandles.length>50){
+    const hc=htfCandles.slice(0,-1).map(x=>x.close);
+    const hf=ema(hc.slice(-120),p.emaFast);
+    const hs=ema(hc.slice(-120),p.emaSlow);
+    const ht=ema(hc.slice(-140),p.emaTrend);
+    htfBias=(hf>hs&&hc.at(-1)>ht)?1:(hf<hs&&hc.at(-1)<ht)?-1:0;
+    htfText=htfBias===1?"Bullish HTF":htfBias===-1?"Bearish HTF":"Neutral HTF";
+  }
+
+  let bull=0,bear=0;
+  bull+=emaFast>emaSlow?1:0;
+  bear+=emaFast<emaSlow?1:0;
+  bull+=last.close>emaTrend?1:0;
+  bear+=last.close<emaTrend?1:0;
+  bull+=rsi>50&&rsi<75?1:0;
+  bear+=rsi<50&&rsi>25?1:0;
+  bull+=mac.macdHist>0?1:0;
+  bear+=mac.macdHist<0?1:0;
+  bull+=mac.macdVal>mac.macdSig?1:0;
+  bear+=mac.macdVal<mac.macdSig?1:0;
+  bull+=last.close>vw?1:0;
+  bear+=last.close<vw?1:0;
+  bull+=volAbove?1:0;
+  bear+=volAbove?1:0;
+  bull+=adx.adx>20&&adx.diPlus>adx.diMinus?1:0;
+  bear+=adx.adx>20&&adx.diMinus>adx.diPlus?1:0;
+  bull+=htfBias===1?1.5:0;
+  bear+=htfBias===-1?1.5:0;
+  bull+=last.close>emaFast?.5:0;
+  bear+=last.close<emaFast?.5:0;
+
+  const emaBullCross=prevFast<=prevSlow&&emaFast>emaSlow;
+  const emaBearCross=prevFast>=prevSlow&&emaFast<emaSlow;
+  const bullMomentum=last.close>emaFast&&last.close>emaSlow;
+  const bearMomentum=last.close<emaFast&&last.close<emaSlow;
+  const rsiNotOB=rsi<75;
+  const rsiNotOS=rsi>25;
+
+  const rawBuy=emaBullCross&&bullMomentum&&rsiNotOB&&bull>=p.effectiveScore&&passesGradeFilter(bull);
+  const rawSell=emaBearCross&&bearMomentum&&rsiNotOS&&bear>=p.effectiveScore&&passesGradeFilter(bear);
+
+  const key=getSniperStateKey(symbol);
+  const livePrice=live?live.close:last.close;
+  let st=updatePineTradeState(symbol,livePrice);
+
+  // Jika ada state aktif seperti TradingView, tampilkan ACTIVE walau score sekarang turun ke B.
+  // Invalidation utama: SL/TP3 atau opposite raw signal.
+  if(st && st.active){
+    if((st.dir==="LONG" && rawSell) || (st.dir==="SHORT" && rawBuy)){
+      st.active=false;
+      st.tradeStatus="REVERSE";
+      DEWA_TV_STATE[key]=st;
+      saveTvState();
+    }else{
+      return stateToResult(symbol,source,c,live,st,{
+        rsiText:rsi.toFixed(1), adxText:adx.adx.toFixed(1), htfText,
+        bullScore:bull, bearScore:bear, grade:getGrade(Math.max(bull,bear)),
+        structureHigh:Math.max(...c.slice(-10).map(x=>x.high)),
+        structureLow:Math.min(...c.slice(-10).map(x=>x.low)),
+        atrVal:a
+      });
+    }
+  }
+
+  let signal="WAIT",status="NO TRADE",color="yellow",entry,tp1,tp2,tp3,sl;
+  let grade=getGrade(Math.max(bull,bear));
+  const structureHigh=Math.max(...c.slice(-10).map(x=>x.high));
+  const structureLow=Math.min(...c.slice(-10).map(x=>x.low));
+
+  const lastDir = DEWA_LAST_DIR[symbol] || 0;
+
+  if(rawBuy && lastDir!==1){
+    entry=last.close;
+    sl=Math.max(entry-a*p.slMult,structureLow-a*.2);
+    const risk=Math.abs(entry-sl);
+    tp1=entry+risk;
+    tp2=entry+risk*2;
+    tp3=entry+risk*3;
+    signal="OPEN LONG";
+    status="SNIPER LONG";
+    color="green";
+    grade=getGrade(bull);
+    DEWA_LAST_DIR[symbol]=1; saveLastDir();
+    DEWA_TV_STATE[key]={active:true,dir:"LONG",entry,tp1,tp2,tp3,sl,tradeStatus:"ACTIVE",grade,bullScore:bull,bearScore:bear,createdAt:new Date().toISOString(),htfText};
+    saveTvState();
+  }else if(rawSell && lastDir!==-1){
+    entry=last.close;
+    sl=Math.min(entry+a*p.slMult,structureHigh+a*.2);
+    const risk=Math.abs(entry-sl);
+    tp1=entry-risk;
+    tp2=entry-risk*2;
+    tp3=entry-risk*3;
+    signal="OPEN SHORT";
+    status="SNIPER SHORT";
+    color="red";
+    grade=getGrade(bear);
+    DEWA_LAST_DIR[symbol]=-1; saveLastDir();
+    DEWA_TV_STATE[key]={active:true,dir:"SHORT",entry,tp1,tp2,tp3,sl,tradeStatus:"ACTIVE",grade,bullScore:bull,bearScore:bear,createdAt:new Date().toISOString(),htfText};
+    saveTvState();
+  }
+
+  const aiAnalysis=`
+    <b>⚡ DEWA SNIPER AI - PINE STATE</b><br>
+    <b>Pair:</b> ${symbol}<br>
+    <b>Engine:</b> SNIPER PINE STATE<br>
+    <b>Status:</b> ${status}<br>
+    <b>Trend:</b> ${emaFast>emaSlow?"BULLISH":"BEARISH"}<br>
+    <b>RSI:</b> ${rsi.toFixed(1)}<br>
+    <b>ADX:</b> ${adx.adx.toFixed(1)}<br>
+    <b>HTF:</b> ${htfText}<br>
+    <b>EMA Cross:</b> ${emaBullCross?"Bull Cross":emaBearCross?"Bear Cross":"No Cross"}<br>
+    <b>Bull:</b> ${bull} | <b>Bear:</b> ${bear} | <b>Grade:</b> ${grade}<br>
+    <b>Grade Filter:</b> ${passesGradeFilter(Math.max(bull,bear))?"PASS":"WAIT"}<br><br>
+    <b>Entry:</b> ${priceFmt(symbol,entry)}<br>
+    <b>TP1:</b> ${priceFmt(symbol,tp1)}<br>
+    <b>TP2:</b> ${priceFmt(symbol,tp2)}<br>
+    <b>TP3:</b> ${priceFmt(symbol,tp3)}<br>
+    <b>SL:</b> ${priceFmt(symbol,sl)}<br><br>
+    <b>Catatan:</b> Signal baru tetap butuh EMA Cross seperti Pine. Jika sudah muncul, state akan tetap ACTIVE sampai TP/SL/reverse.
+  `;
+
+  return {
+    symbol,source,signal,status,color,entry,tp1,tp2,tp3,sl,
+    candles:c,structureHigh,structureLow,atr:a,volOk:true,locked:false,livePrice:live.close,
+    engine:"SNIPER PINE STATE",bullScore:bull,bearScore:bear,grade,aiAnalysis
+  };
+}
+
+// Override hybrid agar memakai state sniper baru
+function analyzeHybrid(symbol,candles,source,htf){
+  const smc=analyzeSMCPine(symbol,candles,source,htf);
+  const sn=analyzeSniperFull(symbol,candles,source,htf);
+  if(smc.signal===sn.signal && smc.signal!=="WAIT" && ["A","A+"].includes(sn.grade)){
+    return {...sn,status:"HYBRID CONFIRM",engine:"HYBRID PINE STATE",aiAnalysis:(sn.aiAnalysis||"")+"<br><br><b>HYBRID:</b> SMC dan SNIPER searah."};
+  }
+  // Jika sniper masih ACTIVE, tetap tampilkan agar sama dengan TV
+  if((sn.status||"").startsWith("ACTIVE")){
+    return {...sn,engine:"HYBRID PINE STATE"};
+  }
+  return {...sn,signal:"WAIT",status:"WAIT HYBRID",color:"yellow",engine:"HYBRID PINE STATE"};
+}
+
+// RESET SIGNAL juga bersihkan state Pine
+const _oldResetSignals = resetSignals;
+resetSignals = function(){
+  locks={};
+  DEWA_TV_STATE={};
+  DEWA_LAST_DIR={};
+  saveLocks();
+  saveTvState();
+  saveLastDir();
+  log("Locked signals + Pine state reset");
+  render();
+};
+
+
+/* =========================================================
+   V7.1 A/A+ ONLY NOTIFICATION + EA EXECUTION
+   - Signal baru Grade A/A+ saja yang:
+     1) kirim push notification
+     2) disimpan ke EA endpoint
+     3) dieksekusi EA
+   - Grade B hanya tampil sebagai ACTIVE continuation jika berasal dari state lama.
+   ========================================================= */
+
+function isGradeAPlusWeb(g){
+  g = String(g || "").toUpperCase();
+  return g === "A" || g === "A+";
+}
+
+// Override saveSignal: EA server hanya menerima SNIPER A/A+.
+// Signal B continuation tetap bisa tampil di dashboard, tapi tidak dikirim sebagai entry EA.
+saveSignal = async function(sym,r){
+  try{
+    if(!r.entry)return;
+
+    const payload = {
+      key:`${sym}|${r.tf||tfLabel()}|${r.signal}|${r.entry}`,
+      pair:sym,
+      tf:r.tf||tfLabel(),
+      signal:r.signal,
+      entry:r.entry,
+      tp1:r.tp1,
+      tp2:r.tp2,
+      tp3:r.tp3,
+      sl:r.sl,
+      status:r.status,
+      createdAt:r.createdAt||new Date().toISOString(),
+      grade:r.grade,
+      engine:r.engine
+    };
+
+    // /api/signals/upsert tetap menyimpan history dashboard.
+    // Server sudah dipatch agar EA storage hanya menerima SNIPER A/A+.
+    await api("/api/signals/upsert",{method:"POST",body:JSON.stringify(payload)});
+  }catch(e){}
+};
+
+// Override broadcastSignal: push notification hanya untuk signal baru SNIPER A/A+.
+broadcastSignal = async function(sym,r){
+  try{
+    const engine = String(r.engine || "").toUpperCase();
+    const isSniper = engine.includes("SNIPER");
+    const isEntry = ["OPEN LONG","OPEN SHORT"].includes(r.signal);
+    const isA = isGradeAPlusWeb(r.grade);
+
+    if(!isSniper || !isEntry || !isA){
+      log("Notif/EA skip: hanya SNIPER Grade A/A+ yang dikirim. "+sym+" grade="+(r.grade||"-"));
+      return;
+    }
+
+    await api("/api/push/broadcast",{
+      method:"POST",
+      body:JSON.stringify({
+        pair:sym,
+        signal:r.signal,
+        grade:r.grade,
+        engine:r.engine,
+        entry:priceFmt(sym,r.entry),
+        tp1:priceFmt(sym,r.tp1),
+        tp2:priceFmt(sym,r.tp2),
+        tp3:priceFmt(sym,r.tp3),
+        sl:priceFmt(sym,r.sl)
+      })
+    });
+    log("Notif dikirim: "+sym+" "+r.signal+" Grade "+r.grade);
+  }catch(e){
+    log("Broadcast notif gagal: "+e.message);
+  }
+};
+
+
+/* =========================================================
+   V7.2 SMC STATE + SNIPER STATE 95 FINAL
+   SMC dibuat lebih mirip Pine/TradingView:
+   - Pivot swing high/low
+   - BOS body/close validation
+   - CHoCH trend shift
+   - BOS/CHoCH window 10 candle
+   - EMA 9/20 confirmation
+   - ATR volatility filter
+   - HTF bias
+   - Active state memory seperti TradingView
+   - Entry/TP/SL terkunci sampai TP/SL/reverse
+   ========================================================= */
+
+let DEWA_SMC_STATE = JSON.parse(localStorage.getItem("DEWA_SMC_STATE") || "{}");
+
+function saveSmcState(){
+  localStorage.setItem("DEWA_SMC_STATE", JSON.stringify(DEWA_SMC_STATE));
+}
+
+function getSmcStateKey(symbol){
+  return symbol + "|" + tfLabel() + "|SMC";
+}
+
+function smcPivotSwings(c,left=3,right=3){
+  const highs=[], lows=[];
+  for(let i=left;i<c.length-right;i++){
+    let isH=true,isL=true;
+    for(let j=i-left;j<=i+right;j++){
+      if(j===i)continue;
+      if(c[j].high>=c[i].high)isH=false;
+      if(c[j].low<=c[i].low)isL=false;
+    }
+    if(isH)highs.push({i,price:c[i].high,time:c[i].time});
+    if(isL)lows.push({i,price:c[i].low,time:c[i].time});
+  }
+  return {highs,lows};
+}
+
+function smcFindRecentEvent(c,structureHigh,structureLow,lookback=10){
+  let lastBull=null,lastBear=null;
+  for(let n=Math.max(1,c.length-lookback);n<c.length;n++){
+    const k=c[n];
+    const bodyHigh=Math.max(k.open,k.close);
+    const bodyLow=Math.min(k.open,k.close);
+    if(k.close>structureHigh && bodyHigh>structureHigh)lastBull={i:n,candle:k};
+    if(k.close<structureLow && bodyLow<structureLow)lastBear={i:n,candle:k};
+  }
+  return {lastBull,lastBear};
+}
+
+function updateSmcTradeState(symbol, livePrice){
+  const key=getSmcStateKey(symbol);
+  const st=DEWA_SMC_STATE[key];
+  if(!st||!Number.isFinite(livePrice))return null;
+
+  if(st.dir==="LONG"){
+    if(livePrice<=st.sl){st.tradeStatus="SL HIT";st.active=false;st.color="red";}
+    else if(livePrice>=st.tp3){st.tradeStatus="TP3 HIT";st.active=false;st.color="green";}
+    else if(livePrice>=st.tp2){st.tradeStatus="TP2 HIT";st.active=true;st.color="green";}
+    else if(livePrice>=st.tp1){st.tradeStatus="TP1 HIT";st.active=true;st.color="green";}
+    else{st.tradeStatus="ACTIVE";st.active=true;st.color="blue";}
+  }
+
+  if(st.dir==="SHORT"){
+    if(livePrice>=st.sl){st.tradeStatus="SL HIT";st.active=false;st.color="red";}
+    else if(livePrice<=st.tp3){st.tradeStatus="TP3 HIT";st.active=false;st.color="green";}
+    else if(livePrice<=st.tp2){st.tradeStatus="TP2 HIT";st.active=true;st.color="green";}
+    else if(livePrice<=st.tp1){st.tradeStatus="TP1 HIT";st.active=true;st.color="green";}
+    else{st.tradeStatus="ACTIVE";st.active=true;st.color="blue";}
+  }
+
+  DEWA_SMC_STATE[key]=st;
+  saveSmcState();
+  return st;
+}
+
+function smcStateToResult(symbol,source,c,live,st,extra={}){
+  const signal=st.dir==="LONG"?"OPEN LONG":"OPEN SHORT";
+  const status=(!st.active&&(st.tradeStatus==="SL HIT"||st.tradeStatus==="TP3 HIT"))?st.tradeStatus:"ACTIVE "+st.dir;
+  const color=st.tradeStatus==="SL HIT"?"red":st.tradeStatus.includes("TP")?"green":"blue";
+  const aiAnalysis=`
+    <b>⚡ DEWA SMC AI - PINE STATE</b><br>
+    <b>Pair:</b> ${symbol}<br>
+    <b>Engine:</b> SMC PINE STATE<br>
+    <b>Status:</b> ${status}<br>
+    <b>Market Structure:</b> ${st.mainSignal || "-"}<br>
+    <b>Momentum:</b> ${st.dir==="LONG"?"Bullish":"Bearish"}<br>
+    <b>EMA Confirm:</b> ${extra.emaText || st.emaText || "-"}<br>
+    <b>HTF Bias:</b> ${extra.htfText || st.htfText || "-"}<br>
+    <b>Volatility:</b> ${extra.volText || st.volText || "-"}<br>
+    <b>Score:</b> ${extra.score ?? st.score ?? "-"} |
+    <b>Grade:</b> ${extra.grade || st.grade || "-"}<br>
+    <b>Structure High:</b> ${priceFmt(symbol,extra.structureHigh ?? st.structureHigh)}<br>
+    <b>Structure Low:</b> ${priceFmt(symbol,extra.structureLow ?? st.structureLow)}<br><br>
+    <b>Entry:</b> ${priceFmt(symbol,st.entry)}<br>
+    <b>TP1:</b> ${priceFmt(symbol,st.tp1)}<br>
+    <b>TP2:</b> ${priceFmt(symbol,st.tp2)}<br>
+    <b>TP3:</b> ${priceFmt(symbol,st.tp3)}<br>
+    <b>SL:</b> ${priceFmt(symbol,st.sl)}<br><br>
+    <b>Catatan:</b> State SMC mengikuti gaya TradingView: signal tetap ACTIVE sampai TP/SL/reverse.
+  `;
+  return {
+    symbol,source,signal,status,color,
+    entry:st.entry,tp1:st.tp1,tp2:st.tp2,tp3:st.tp3,sl:st.sl,
+    candles:c,structureHigh:extra.structureHigh ?? st.structureHigh,
+    structureLow:extra.structureLow ?? st.structureLow,
+    atr:extra.atrVal ?? st.atr,
+    volOk:true,locked:false,livePrice:live?live.close:undefined,
+    engine:"SMC PINE STATE",
+    grade:extra.grade || st.grade,
+    score:extra.score ?? st.score,
+    aiAnalysis
+  };
+}
+
+function analyzeSMCPine(symbol,candles,source,htfCandles){
+  const c=candles.slice(0,-1);
+  const live=candles[candles.length-1];
+
+  if(c.length<80){
+    return {symbol,source,signal:"WAIT",status:"DATA LOW",color:"yellow",candles:c,engine:"SMC PINE STATE",livePrice:live?.close};
+  }
+
+  const last=c[c.length-1];
+  const close=c.map(x=>x.close);
+  const e9=ema(close.slice(-100),9);
+  const e20=ema(close.slice(-120),20);
+  const e50=ema(close.slice(-140),50);
+  const atrVal=atr(c,14);
+
+  let atrVals=[];
+  for(let i=34;i<c.length;i++)atrVals.push(atr(c.slice(0,i+1),14));
+  const atrAvg=sma(atrVals,20)||atrVal;
+  const volOk=atrVal>=atrAvg*0.85;
+
+  const sw=smcPivotSwings(c,3,3);
+  const lastSwingHigh=sw.highs.at(-1);
+  const lastSwingLow=sw.lows.at(-1);
+  const structureHigh=lastSwingHigh?lastSwingHigh.price:Math.max(...c.slice(-20).map(x=>x.high));
+  const structureLow=lastSwingLow?lastSwingLow.price:Math.min(...c.slice(-20).map(x=>x.low));
+
+  const event=smcFindRecentEvent(c,structureHigh,structureLow,10);
+  const bosBull=!!event.lastBull;
+  const bosBear=!!event.lastBear;
+
+  const prevTrend=e9>e20?"BULLISH":e9<e20?"BEARISH":"NEUTRAL";
+  const chochBull=prevTrend==="BEARISH"&&bosBull;
+  const chochBear=prevTrend==="BULLISH"&&bosBear;
+
+  const emaLong=e9>e20&&last.close>e9;
+  const emaShort=e9<e20&&last.close<e9;
+
+  let htfBias=e9>e20?1:e9<e20?-1:0;
+  let htfText=htfBias===1?"Bullish HTF":htfBias===-1?"Bearish HTF":"Neutral HTF";
+  if(htfCandles&&htfCandles.length>50){
+    const hc=htfCandles.slice(0,-1).map(x=>x.close);
+    const hf=ema(hc.slice(-100),9);
+    const hs=ema(hc.slice(-120),20);
+    const ht=ema(hc.slice(-140),50);
+    htfBias=(hf>hs&&hc.at(-1)>ht)?1:(hf<hs&&hc.at(-1)<ht)?-1:0;
+    htfText=htfBias===1?"Bullish HTF":htfBias===-1?"Bearish HTF":"Neutral HTF";
+  }
+
+  const key=getSmcStateKey(symbol);
+  const livePrice=live?live.close:last.close;
+  let st=updateSmcTradeState(symbol,livePrice);
+
+  // Jika state aktif, tetap tampil ACTIVE seperti TradingView, kecuali reverse SMC muncul.
+  if(st&&st.active){
+    const reverse=(st.dir==="LONG"&&bosBear&&emaShort)||(st.dir==="SHORT"&&bosBull&&emaLong);
+    if(reverse){
+      st.active=false;
+      st.tradeStatus="REVERSE";
+      DEWA_SMC_STATE[key]=st;
+      saveSmcState();
+    }else{
+      return smcStateToResult(symbol,source,c,live,st,{
+        emaText:emaLong?"Bullish":emaShort?"Bearish":"Neutral",
+        htfText,
+        volText:volOk?"OK":"LOW",
+        structureHigh,structureLow,atrVal,
+        score:st.score,
+        grade:st.grade
+      });
+    }
+  }
+
+  const distHigh=Math.abs(structureHigh-last.close)/last.close*100;
+  const distLow=Math.abs(last.close-structureLow)/last.close*100;
+  const prepareLong=last.close<structureHigh&&distHigh<=0.25&&emaLong;
+  const prepareShort=last.close>structureLow&&distLow<=0.25&&emaShort;
+
+  let score=0;
+  if(bosBull||bosBear)score+=2;
+  if(chochBull||chochBear)score+=1;
+  if(emaLong||emaShort)score+=1.5;
+  if(volOk)score+=1;
+  if((bosBull&&htfBias===1)||(bosBear&&htfBias===-1))score+=1.5;
+  if(last.close>e50&&bosBull)score+=0.5;
+  if(last.close<e50&&bosBear)score+=0.5;
+
+  let grade=getGrade(score);
+  let signal="WAIT",status="NO TRADE",color="yellow",entry,tp1,tp2,tp3,sl,mainSignal="Tidak ada";
+
+  const target=atrVal*2;
+
+  if((bosBull||chochBull)&&emaLong&&volOk&&htfBias!==-1&&score>=5){
+    signal="OPEN LONG";
+    status="SMC LONG";
+    color="green";
+    entry=structureHigh;
+    tp1=entry+target*.8;
+    tp2=entry+target*1.6;
+    tp3=entry+target*2.8;
+    sl=entry-target*1.2;
+    mainSignal=chochBull?"CHoCH BULLISH":"BOS BULLISH";
+    DEWA_SMC_STATE[key]={active:true,dir:"LONG",entry,tp1,tp2,tp3,sl,tradeStatus:"ACTIVE",grade,score,structureHigh,structureLow,atr:atrVal,mainSignal,htfText,volText:volOk?"OK":"LOW",emaText:"Bullish",createdAt:new Date().toISOString()};
+    saveSmcState();
+  }else if((bosBear||chochBear)&&emaShort&&volOk&&htfBias!==1&&score>=5){
+    signal="OPEN SHORT";
+    status="SMC SHORT";
+    color="red";
+    entry=structureLow;
+    tp1=entry-target*.8;
+    tp2=entry-target*1.6;
+    tp3=entry-target*2.8;
+    sl=entry+target*1.2;
+    mainSignal=chochBear?"CHoCH BEARISH":"BOS BEARISH";
+    DEWA_SMC_STATE[key]={active:true,dir:"SHORT",entry,tp1,tp2,tp3,sl,tradeStatus:"ACTIVE",grade,score,structureHigh,structureLow,atr:atrVal,mainSignal,htfText,volText:volOk?"OK":"LOW",emaText:"Bearish",createdAt:new Date().toISOString()};
+    saveSmcState();
+  }else if(prepareLong){
+    status="WAIT LONG";
+    color="yellow";
+    mainSignal="PREPARE LONG";
+  }else if(prepareShort){
+    status="WAIT SHORT";
+    color="yellow";
+    mainSignal="PREPARE SHORT";
+  }
+
+  const aiAnalysis=`
+    <b>⚡ DEWA SMC AI - PINE STATE</b><br>
+    <b>Pair:</b> ${symbol}<br>
+    <b>Engine:</b> SMC PINE STATE<br>
+    <b>Sinyal Utama:</b> ${mainSignal}<br>
+    <b>BOS Bull/Bear:</b> ${bosBull?"YES":"NO"} / ${bosBear?"YES":"NO"}<br>
+    <b>CHoCH Bull/Bear:</b> ${chochBull?"YES":"NO"} / ${chochBear?"YES":"NO"}<br>
+    <b>EMA 9/20:</b> ${emaLong?"Bullish":emaShort?"Bearish":"Neutral"}<br>
+    <b>HTF Bias:</b> ${htfText}<br>
+    <b>Volatility:</b> ${volOk?"OK":"LOW"}<br>
+    <b>Score:</b> ${score} |
+    <b>Grade:</b> ${grade}<br>
+    <b>Structure High:</b> ${priceFmt(symbol,structureHigh)}<br>
+    <b>Structure Low:</b> ${priceFmt(symbol,structureLow)}<br><br>
+    <b>Signal:</b> ${signal}<br>
+    <b>Status:</b> ${status}<br>
+    <b>Entry:</b> ${priceFmt(symbol,entry)}<br>
+    <b>TP1:</b> ${priceFmt(symbol,tp1)}<br>
+    <b>TP2:</b> ${priceFmt(symbol,tp2)}<br>
+    <b>TP3:</b> ${priceFmt(symbol,tp3)}<br>
+    <b>SL:</b> ${priceFmt(symbol,sl)}<br><br>
+    <b>Catatan:</b> SMC memakai BOS/CHoCH window + active state agar lebih mirip TradingView.
+  `;
+
+  return {symbol,source,signal,status,color,entry,tp1,tp2,tp3,sl,candles:c,structureHigh,structureLow,atr:atrVal,volOk,locked:false,livePrice:live.close,engine:"SMC PINE STATE",grade,score,aiAnalysis};
+}
+
+// Hybrid tetap memakai SMC state + Sniper state
+function analyzeHybrid(symbol,candles,source,htf){
+  const smc=analyzeSMCPine(symbol,candles,source,htf);
+  const sn=analyzeSniperFull(symbol,candles,source,htf);
+
+  if(smc.signal===sn.signal && smc.signal!=="WAIT" && ["A","A+"].includes(sn.grade)){
+    return {...sn,status:"HYBRID CONFIRM",engine:"HYBRID PINE STATE",aiAnalysis:(sn.aiAnalysis||"")+"<br><br><b>HYBRID:</b> SMC dan SNIPER searah."};
+  }
+
+  // Jika salah satu state ACTIVE, tetap tampilkan yang aktif sesuai mode hybrid.
+  if((sn.status||"").startsWith("ACTIVE")) return {...sn,engine:"HYBRID PINE STATE"};
+  if((smc.status||"").startsWith("ACTIVE")) return {...smc,engine:"HYBRID PINE STATE"};
+
+  return {...sn,signal:"WAIT",status:"WAIT HYBRID",color:"yellow",engine:"HYBRID PINE STATE"};
+}
+
+// Extend reset: hapus state SMC juga
+const _oldResetSignalsV72 = resetSignals;
+resetSignals = function(){
+  locks={};
+  DEWA_TV_STATE={};
+  DEWA_SMC_STATE={};
+  DEWA_LAST_DIR={};
+  saveLocks();
+  if(typeof saveTvState==="function")saveTvState();
+  saveSmcState();
+  saveLastDir();
+  log("Reset: locked signal + Sniper state + SMC state");
+  render();
+};
+
+
+/* =========================================================
+   V7.3 EXACT SMC PINE OVERRIDE
+   Berdasarkan Pine Script DewaSMC ELITE:
+   - structurePeriod = 20
+   - confirmationType = Body
+   - ta.pivothigh/ta.pivotlow dengan left/right = structurePeriod
+   - highBreakPending / lowBreakPending
+   - trendDirection + CHoCH
+   - entry/TP/SL formula sama:
+     targetRange = ATR14 * 2.0
+     TP1 0.8, TP2 1.6, TP3 2.8, SL 1.2
+   - prepare zone = 0.25%
+   - EMA confirm = EMA9/20 + close di sisi EMA
+   - volatilityOK = ATR14 > SMA(ATR14, 20)
+   - trade state dihitung ulang dari histori candle seperti Pine
+   ========================================================= */
+
+function pineAtrSeries(c, period=14){
+  const out = Array(c.length).fill(null);
+  const tr = Array(c.length).fill(null);
+  for(let i=1;i<c.length;i++){
+    tr[i]=Math.max(
+      c[i].high-c[i].low,
+      Math.abs(c[i].high-c[i-1].close),
+      Math.abs(c[i].low-c[i-1].close)
     );
-    return signal;
+  }
+  let vals=[];
+  for(let i=1;i<c.length;i++){
+    vals.push(tr[i]);
+    if(vals.length>=period){
+      out[i]=vals.slice(-period).reduce((a,b)=>a+b,0)/period;
+    }
+  }
+  return out;
+}
+
+function pinePivotHighAt(c, pivotIndex, left, right){
+  if(pivotIndex-left<0 || pivotIndex+right>=c.length) return null;
+  const v=c[pivotIndex].high;
+  for(let j=pivotIndex-left;j<=pivotIndex+right;j++){
+    if(j===pivotIndex) continue;
+    if(c[j].high>=v) return null;
+  }
+  return v;
+}
+
+function pinePivotLowAt(c, pivotIndex, left, right){
+  if(pivotIndex-left<0 || pivotIndex+right>=c.length) return null;
+  const v=c[pivotIndex].low;
+  for(let j=pivotIndex-left;j<=pivotIndex+right;j++){
+    if(j===pivotIndex) continue;
+    if(c[j].low<=v) return null;
+  }
+  return v;
+}
+
+function emulateDewaSMC(c, opts={}){
+  const structurePeriod = opts.structurePeriod || 20;
+  const confirmationType = opts.confirmationType || "Body";
+  const volatilityMultiplier = 2.0;
+
+  const atrArr = pineAtrSeries(c,14);
+  const closes = c.map(x=>x.close);
+  const ema9Arr = seriesEma(closes,9);
+  const ema20Arr = seriesEma(closes,20);
+
+  let lastHigh = NaN, lastLow = NaN;
+  let lastHighBar = null, lastLowBar = null;
+  let trendDirection = 0;
+  let highBreakPending = false;
+  let lowBreakPending = false;
+
+  let entryLevel=NaN,tp1Level=NaN,tp2Level=NaN,tp3Level=NaN,stopLevel=NaN;
+  let tradeDirection=0,tp1Hit=false,tp2Hit=false,tp3Hit=false,lastTradeBar=null;
+  let lastEvent=null;
+  let lastAlertPrice=NaN;
+
+  for(let i=0;i<c.length;i++){
+    const k=c[i];
+
+    // ta.pivothigh/low confirms on current bar i for pivot at i-structurePeriod
+    const pivotIndex = i - structurePeriod;
+    if(pivotIndex>=0){
+      const ph = pinePivotHighAt(c, pivotIndex, structurePeriod, structurePeriod);
+      const pl = pinePivotLowAt(c, pivotIndex, structurePeriod, structurePeriod);
+
+      if(ph!==null){
+        lastHigh=ph;
+        lastHighBar=pivotIndex;
+        highBreakPending=true;
+      }
+      if(pl!==null){
+        lastLow=pl;
+        lastLowBar=pivotIndex;
+        lowBreakPending=true;
+      }
+    }
+
+    let highBroken=false, lowBroken=false;
+
+    if(highBreakPending && Number.isFinite(lastHigh)){
+      if((confirmationType==="Body" && k.close>lastHigh) || (confirmationType==="Wick" && k.high>lastHigh)){
+        highBroken=true;
+        highBreakPending=false;
+      }
+    }
+
+    if(lowBreakPending && Number.isFinite(lastLow)){
+      if((confirmationType==="Body" && k.close<lastLow) || (confirmationType==="Wick" && k.low<lastLow)){
+        lowBroken=true;
+        lowBreakPending=false;
+      }
+    }
+
+    const prevTrend=trendDirection;
+    if(highBroken) trendDirection=1;
+    else if(lowBroken) trendDirection=-1;
+
+    const chochSignal=(prevTrend===-1 && trendDirection===1) || (prevTrend===1 && trendDirection===-1);
+
+    const atrVal=atrArr[i] || atr(c.slice(0,i+1),14);
+    const targetRange=atrVal*volatilityMultiplier;
+
+    if(highBroken && Number.isFinite(lastHigh)){
+      entryLevel=lastHigh;
+      tp1Level=entryLevel+targetRange*0.8;
+      tp2Level=entryLevel+targetRange*1.6;
+      tp3Level=entryLevel+targetRange*2.8;
+      stopLevel=entryLevel-targetRange*1.2;
+      tradeDirection=1;
+      tp1Hit=false;tp2Hit=false;tp3Hit=false;lastTradeBar=i;
+      lastEvent={i,dir:"LONG",type:chochSignal?"CHoCH BULLISH":"BOS BULLISH",entry:entryLevel,tp1:tp1Level,tp2:tp2Level,tp3:tp3Level,sl:stopLevel,trend:trendDirection,choch:chochSignal,atr:atrVal,structHigh:lastHigh,structLow:lastLow,highBar:lastHighBar,lowBar:lastLowBar};
+    }
+
+    if(lowBroken && Number.isFinite(lastLow)){
+      entryLevel=lastLow;
+      tp1Level=entryLevel-targetRange*0.8;
+      tp2Level=entryLevel-targetRange*1.6;
+      tp3Level=entryLevel-targetRange*2.8;
+      stopLevel=entryLevel+targetRange*1.2;
+      tradeDirection=-1;
+      tp1Hit=false;tp2Hit=false;tp3Hit=false;lastTradeBar=i;
+      lastEvent={i,dir:"SHORT",type:chochSignal?"CHoCH BEARISH":"BOS BEARISH",entry:entryLevel,tp1:tp1Level,tp2:tp2Level,tp3:tp3Level,sl:stopLevel,trend:trendDirection,choch:chochSignal,atr:atrVal,structHigh:lastHigh,structLow:lastLow,highBar:lastHighBar,lowBar:lastLowBar};
+    }
+
+    // TP hit logic persis Pine
+    if(tradeDirection===1){
+      if(!tp1Hit && k.high>=tp1Level) tp1Hit=true;
+      if(!tp2Hit && k.high>=tp2Level) tp2Hit=true;
+      if(!tp3Hit && k.high>=tp3Level) tp3Hit=true;
+    }
+    if(tradeDirection===-1){
+      if(!tp1Hit && k.low<=tp1Level) tp1Hit=true;
+      if(!tp2Hit && k.low<=tp2Level) tp2Hit=true;
+      if(!tp3Hit && k.low<=tp3Level) tp3Hit=true;
+    }
   }
 
-  const stateKey = pair + "|" + tf;
-  const lastKey = state.lastSignalByPairTf[stateKey];
+  const i=c.length-1;
+  const last=c[i];
+  const atrVal=atrArr[i] || atr(c,14);
+  const atrSma20=sma(atrArr.filter(x=>Number.isFinite(x)),20);
+  const volatilityOK=Number.isFinite(atrSma20)?atrVal>atrSma20:true;
 
-  if (lastKey === signal.key) {
-    console.log("[SCAN]", pair, tfLabel(tf), "signal sudah pernah dikirim");
-    return signal;
+  const ema9=ema9Arr[i], ema20=ema20Arr[i];
+  const emaAlignedLong=ema9>ema20 && last.close>ema9;
+  const emaAlignedShort=ema9<ema20 && last.close<ema9;
+
+  const prepThresholdLong=Number.isFinite(lastHigh)?lastHigh*(0.25/100):NaN;
+  const prepThresholdShort=Number.isFinite(lastLow)?lastLow*(0.25/100):NaN;
+  const prepLong=Number.isFinite(lastHigh) && !(lastEvent&&lastEvent.i===i&&lastEvent.dir==="LONG") && Math.abs(last.close-lastHigh)<=prepThresholdLong && last.close<lastHigh && emaAlignedLong;
+  const prepShort=Number.isFinite(lastLow) && !(lastEvent&&lastEvent.i===i&&lastEvent.dir==="SHORT") && Math.abs(last.close-lastLow)<=prepThresholdShort && last.close>lastLow && emaAlignedShort;
+
+  return {
+    lastHigh,lastLow,lastHighBar,lastLowBar,trendDirection,
+    entryLevel,tp1Level,tp2Level,tp3Level,stopLevel,
+    tradeDirection,tp1Hit,tp2Hit,tp3Hit,lastTradeBar,
+    lastEvent,atrVal,volatilityOK,ema9,ema20,emaAlignedLong,emaAlignedShort,
+    prepLong,prepShort
+  };
+}
+
+function analyzeSMCPine(symbol,candles,source,htfCandles){
+  const c=candles.slice(0,-1);
+  const live=candles[candles.length-1];
+
+  if(c.length<70){
+    return {symbol,source,signal:"WAIT",status:"DATA LOW",color:"yellow",candles:c,engine:"SMC PINE EXACT",livePrice:live?.close};
   }
 
-  await saveSignal(signal);
-  await sendNotification(signal);
+  const smc=emulateDewaSMC(c,{structurePeriod:20,confirmationType:"Body"});
+  const last=c[c.length-1];
+  const event=smc.lastEvent;
+  const isFresh=event && event.i===c.length-1;
 
-  state.lastSignalByPairTf[stateKey] = signal.key;
-  state.lastDirectionByPairTf[stateKey] = signal.direction;
-  saveState(state);
+  let signal="WAIT",status="NO TRADE",color="yellow";
+  let entry=smc.entryLevel,tp1=smc.tp1Level,tp2=smc.tp2Level,tp3=smc.tp3Level,sl=smc.stopLevel;
+  let mainSignal="Tidak ada";
 
-  console.log(
-    "[SIGNAL]",
-    signal.pair,
-    signal.tf,
-    signal.signal,
-    "EMA_ACTIONABLE",
-    "Entry",
-    fmtPrice(signal.entry),
-    "SL",
-    fmtPrice(signal.sl),
-    "TP1",
-    fmtPrice(signal.tp1),
-    "EMA",
-    signal.emaConfirm || "-",
-    "VOL",
-    signal.volatilityOk ? "OK" : "LOW",
-    signal.sourceMode || ""
-  );
+  if(isFresh && event.dir==="LONG"){
+    signal="OPEN LONG";
+    status="SMC LONG";
+    color="green";
+    mainSignal=event.type;
+  }else if(isFresh && event.dir==="SHORT"){
+    signal="OPEN SHORT";
+    status="SMC SHORT";
+    color="red";
+    mainSignal=event.type;
+  }else if(smc.tradeDirection===1 && Number.isFinite(entry)){
+    signal="OPEN LONG";
+    status=smc.tp3Hit?"TP3 HIT":smc.tp2Hit?"TP2 HIT":smc.tp1Hit?"TP1 HIT":"ACTIVE LONG";
+    color=smc.tp3Hit||smc.tp2Hit||smc.tp1Hit?"green":"blue";
+    mainSignal=event?event.type:"ACTIVE LONG";
+  }else if(smc.tradeDirection===-1 && Number.isFinite(entry)){
+    signal="OPEN SHORT";
+    status=smc.tp3Hit?"TP3 HIT":smc.tp2Hit?"TP2 HIT":smc.tp1Hit?"TP1 HIT":"ACTIVE SHORT";
+    color=smc.tp3Hit||smc.tp2Hit||smc.tp1Hit?"green":"blue";
+    mainSignal=event?event.type:"ACTIVE SHORT";
+  }else if(smc.prepLong){
+    status="WAIT LONG";
+    color="yellow";
+    mainSignal="PREPARE LONG";
+  }else if(smc.prepShort){
+    status="WAIT SHORT";
+    color="yellow";
+    mainSignal="PREPARE SHORT";
+  }
 
+  const confidence =
+    ((smc.emaAlignedLong||smc.emaAlignedShort) && event && event.choch && smc.volatilityOK) ? "HIGH" :
+    ((smc.emaAlignedLong||smc.emaAlignedShort) && event && smc.volatilityOK) ? "MEDIUM" : "LOW";
+
+  const aiAnalysis=`
+    <b>⚡ DEWA SMC AI - EXACT PINE CORE</b><br>
+    <b>Pair:</b> ${symbol}<br>
+    <b>Engine:</b> SMC PINE EXACT<br>
+    <b>Structure Period:</b> 20<br>
+    <b>Confirmation:</b> Body close<br>
+    <b>Sinyal Utama:</b> ${mainSignal}<br>
+    <b>Trend:</b> ${smc.trendDirection===1?"Bullish":smc.trendDirection===-1?"Bearish":"Neutral"}<br>
+    <b>EMA 9/20:</b> ${smc.emaAlignedLong?"LONG YES":smc.emaAlignedShort?"SHORT YES":"NO"}<br>
+    <b>Volatility:</b> ${smc.volatilityOK?"OK":"LOW"}<br>
+    <b>Confidence:</b> ${confidence}<br>
+    <b>Structure High:</b> ${priceFmt(symbol,smc.lastHigh)}<br>
+    <b>Structure Low:</b> ${priceFmt(symbol,smc.lastLow)}<br>
+    <b>TP Status:</b> TP1 ${smc.tp1Hit?"✓":"-"} | TP2 ${smc.tp2Hit?"✓":"-"} | TP3 ${smc.tp3Hit?"✓":"-"}<br><br>
+    <b>Signal:</b> ${signal}<br>
+    <b>Status:</b> ${status}<br>
+    <b>Entry:</b> ${priceFmt(symbol,entry)}<br>
+    <b>TP1:</b> ${priceFmt(symbol,tp1)}<br>
+    <b>TP2:</b> ${priceFmt(symbol,tp2)}<br>
+    <b>TP3:</b> ${priceFmt(symbol,tp3)}<br>
+    <b>SL:</b> ${priceFmt(symbol,sl)}<br><br>
+    <b>Catatan:</b> Logic ini meniru Pine Script SMC yang Anda kirim: pivot 20/20, pending break, BOS/CHoCH, EMA 9/20, ATR target.
+  `;
+
+  return {
+    symbol,source,signal,status,color,
+    entry,tp1,tp2,tp3,sl,
+    candles:c,
+    structureHigh:smc.lastHigh,
+    structureLow:smc.lastLow,
+    atr:smc.atrVal,
+    volOk:smc.volatilityOK,
+    locked:false,
+    livePrice:live?live.close:undefined,
+    engine:"SMC PINE EXACT",
+    grade:confidence==="HIGH"?"A+":confidence==="MEDIUM"?"A":"B",
+    score:confidence==="HIGH"?8:confidence==="MEDIUM"?6.5:5,
+    aiAnalysis
+  };
+}
+
+
+/* =========================================================
+   V7.4 EA PRIORITY UPDATE
+   Rule:
+   - EA execute: SMC Grade A/A+ prioritas pertama.
+   - Jika tidak ada SMC A/A+, EA boleh execute SNIPER Grade A/A+.
+   - HYBRID tidak dipakai EA.
+   - Notifikasi dikirim untuk SMC A/A+ dan SNIPER A/A+.
+   ========================================================= */
+function isGradeAPlusV74(g){
+  g=String(g||"").toUpperCase();
+  return g==="A" || g==="A+";
+}
+function isEaAllowedEngineV74(engine){
+  engine=String(engine||"").toUpperCase();
+  if(engine.includes("HYBRID")) return false;
+  return engine.includes("SMC") || engine.includes("SNIPER");
+}
+saveSignal = async function(sym,r){
+  try{
+    if(!r.entry)return;
+    const payload={
+      key:`${sym}|${r.tf||tfLabel()}|${r.signal}|${r.entry}`,
+      pair:sym,
+      tf:r.tf||tfLabel(),
+      signal:r.signal,
+      entry:r.entry,
+      tp1:r.tp1,
+      tp2:r.tp2,
+      tp3:r.tp3,
+      sl:r.sl,
+      status:r.status,
+      createdAt:r.createdAt||new Date().toISOString(),
+      grade:r.grade,
+      engine:r.engine
+    };
+    await api("/api/signals/upsert",{method:"POST",body:JSON.stringify(payload)});
+  }catch(e){}
+};
+broadcastSignal = async function(sym,r){
+  try{
+    const sig=String(r.signal||"");
+const stat=String(r.status||"");
+
+const isEntry=
+[
+  "OPEN LONG",
+  "OPEN SHORT",
+  "REVERSE LONG",
+  "REVERSE SHORT",
+  "NEW LONG",
+  "NEW SHORT"
+].includes(sig)
+||
+[
+  "REVERSE LONG",
+  "REVERSE SHORT",
+  "NEW LONG",
+  "NEW SHORT"
+].includes(stat);
+    const isA=isGradeAPlusV74(r.grade);
+    const allowed=isEaAllowedEngineV74(r.engine);
+    if(!isEntry || !isA || !allowed){
+      log("Notif/EA skip: hanya SMC/SNIPER Grade A/A+. "+sym+" engine="+(r.engine||"-")+" grade="+(r.grade||"-"));
+      return;
+    }
+    await api("/api/push/broadcast",{
+      method:"POST",
+      body:JSON.stringify({
+        pair:sym,
+        signal:r.signal,
+        grade:r.grade,
+        engine:r.engine,
+        priority:String(r.engine||"").toUpperCase().includes("SMC")?"SMC PRIORITY":"SNIPER BACKUP",
+        entry:priceFmt(sym,r.entry),
+        tp1:priceFmt(sym,r.tp1),
+        tp2:priceFmt(sym,r.tp2),
+        tp3:priceFmt(sym,r.tp3),
+        sl:priceFmt(sym,r.sl)
+      })
+    });
+    log("Notif dikirim: "+sym+" "+r.signal+" "+(r.engine||"-")+" Grade "+r.grade);
+  }catch(e){
+    log("Broadcast notif gagal: "+e.message);
+  }
+};
+/* ================================
+   DEWA V7.6 REVERSE STATE PATCH
+================================ */
+
+let DEWA_REVERSE_STATE = JSON.parse(localStorage.getItem("DEWA_REVERSE_STATE") || "{}");
+
+function saveReverseState(){
+  localStorage.setItem("DEWA_REVERSE_STATE", JSON.stringify(DEWA_REVERSE_STATE));
+}
+
+function isReverseCooldownOk(symbol){
+  const tf = Number($("tf").value || 5);
+  const last = DEWA_REVERSE_STATE[symbol];
+  if(!last) return true;
+  return Date.now() - last.ts > tf * 3 * 60 * 1000;
+}
+
+function markReverse(symbol){
+  DEWA_REVERSE_STATE[symbol] = { ts: Date.now() };
+  saveReverseState();
+}
+
+function normalizeSignalName(signal){
+  if(signal === "OPEN LONG") return "NEW LONG";
+  if(signal === "OPEN SHORT") return "NEW SHORT";
   return signal;
 }
 
-const runningByTf = { "5": false, "15": false };
-const LAST_DISTANCE_BY_KEY = {};
-
-function diagnosticDistance(signal) {
-  const d = signal?.diagnostic;
-  if (!d) return Number.POSITIVE_INFINITY;
-
-  const candidates = [
-    d.distanceToEntryPct,
-    d.distanceToHighPct,
-    d.distanceToLowPct
-  ]
-    .map(Number)
-    .filter(Number.isFinite);
-
-  return candidates.length
-    ? Math.min(...candidates)
-    : Number.POSITIVE_INFINITY;
+function oppositeSignal(activeSignal, newSignal){
+  const a = String(activeSignal || "");
+  const n = String(newSignal || "");
+  if(a.includes("LONG") && n.includes("SHORT")) return "REVERSE SHORT";
+  if(a.includes("SHORT") && n.includes("LONG")) return "REVERSE LONG";
+  return null;
 }
 
-function buildScanPlanForTf(tf) {
-  const jobs = ACTIVE_PAIR_SETTINGS
-    .filter(pairConfig =>
-      Array.isArray(pairConfig.timeframes) &&
-      pairConfig.timeframes.includes(String(tf))
-    )
-    .map(pairConfig => ({
-      pairConfig,
-      tf: String(tf),
-      distance:
-        LAST_DISTANCE_BY_KEY[pairConfig.symbol + "|" + tf] ??
-        Number.POSITIVE_INFINITY
-    }));
+function reverseAllowed(symbol, activeLock, newSig){
+  if(!activeLock || !newSig) return false;
 
-  // Priority first, then pair nearest to structure, then scan_order.
-  jobs.sort((a, b) => {
-    const p =
-      priorityWeight(a.pairConfig.priority) -
-      priorityWeight(b.pairConfig.priority);
-    if (p !== 0) return p;
+  const rev = oppositeSignal(activeLock.signal, newSig.signal);
+  if(!rev) return false;
 
-    if (a.distance !== b.distance) {
-      return a.distance - b.distance;
-    }
+  const grade = String(newSig.grade || "").toUpperCase();
+  if(!(grade === "A" || grade === "A+")) return false;
 
-    return (
-      Number(a.pairConfig.scanOrder || 0) -
-      Number(b.pairConfig.scanOrder || 0)
-    );
-  });
+  const atrVal = Number(newSig.atr || 0);
+  const entryOld = Number(activeLock.entry);
+  const entryNew = Number(newSig.entry);
 
-  return jobs;
+  if(!Number.isFinite(atrVal) || atrVal <= 0) return false;
+  if(!Number.isFinite(entryOld) || !Number.isFinite(entryNew)) return false;
+
+  const distanceOk = Math.abs(entryNew - entryOld) >= atrVal * 0.5;
+  if(!distanceOk) return false;
+
+  if(!isReverseCooldownOk(symbol)) return false;
+
+  return rev;
 }
 
-async function runScannerForTf(tf, mode) {
-  tf = String(tf);
+function displaySignalName(signal, status){
+  status = String(status || "");
+  signal = String(signal || "");
 
-  if (runningByTf[tf]) {
-    console.log("[WORKER]", tfLabel(tf), "scan sebelumnya masih berjalan, skip.");
-    return;
+  if(status.includes("TP1")) return "TP1 HIT";
+  if(status.includes("TP2")) return "TP2 HIT";
+  if(status.includes("TP3")) return "TP3 HIT";
+  if(status.includes("FULL TP")) return "TP3 HIT";
+  if(status.includes("SL")) return "SL HIT";
+
+  if(status === "REVERSE LONG") return "REVERSE LONG";
+  if(status === "REVERSE SHORT") return "REVERSE SHORT";
+  if(status === "REPLACE LONG") return "REPLACE LONG";
+  if(status === "REPLACE SHORT") return "REPLACE SHORT";
+  if(status.includes("ACTIVE") || status.includes("RUNNING")){
+    if(signal.includes("LONG")) return "ACTIVE LONG";
+    if(signal.includes("SHORT")) return "ACTIVE SHORT";
   }
 
-  runningByTf[tf] = true;
-  const started = Date.now();
-  const scanPlan = buildScanPlanForTf(tf);
+  if(signal === "OPEN LONG") return "NEW LONG";
+  if(signal === "OPEN SHORT") return "NEW SHORT";
 
-  console.log(
-    "\n[WORKER]",
-    mode,
-    "scan mulai",
-    tfLabel(tf),
-    new Date().toISOString(),
-    "jobs=" + scanPlan.length,
-    "configRefreshedAt=" + (LAST_CONFIG_REFRESH_AT || "ENV")
+  return signal || "-";
+}
+/* ==================================
+   DEWA V7.7 REPLACE STATE PATCH
+================================== */
+
+let DEWA_REPLACE_STATE =
+  JSON.parse(localStorage.getItem("DEWA_REPLACE_STATE") || "{}");
+
+function saveReplaceState(){
+  localStorage.setItem(
+    "DEWA_REPLACE_STATE",
+    JSON.stringify(DEWA_REPLACE_STATE)
   );
+}
 
+function isReplaceCooldownOk(symbol){
+  const tf = Number($("tf").value || 5);
+  const last = DEWA_REPLACE_STATE[symbol];
+
+  if(!last) return true;
+
+  return Date.now() - last.ts > tf * 3 * 60 * 1000;
+}
+
+function markReplace(symbol){
+  DEWA_REPLACE_STATE[symbol] = {
+    ts: Date.now()
+  };
+  saveReplaceState();
+}
+
+function replaceAllowed(symbol, activeLock, newSig){
+
+  if(!activeLock || !newSig) return false;
+
+  const oldDir =
+    String(activeLock.signal || "").includes("LONG")
+      ? "LONG"
+      : "SHORT";
+
+  const newDir =
+    String(newSig.signal || "").includes("LONG")
+      ? "LONG"
+      : "SHORT";
+
+  if(oldDir !== newDir) return false;
+
+  const grade = String(newSig.grade || "").toUpperCase();
+
+  if(!(grade === "A" || grade === "A+"))
+    return false;
+
+  const atrVal = Number(newSig.atr || 0);
+
+  if(!Number.isFinite(atrVal) || atrVal <= 0)
+    return false;
+
+  const oldEntry = Number(activeLock.entry);
+  const newEntry = Number(newSig.entry);
+
+  if(!Number.isFinite(oldEntry) || !Number.isFinite(newEntry))
+    return false;
+
+  const distanceOk =
+    Math.abs(newEntry - oldEntry) >= atrVal * 0.5;
+
+  if(!distanceOk)
+    return false;
+
+  if(!isReplaceCooldownOk(symbol))
+    return false;
+
+  return oldDir === "LONG"
+    ? "REPLACE LONG"
+    : "REPLACE SHORT";
+}
+
+window.login = login;
+window.requestAccess = requestAccess;
+window.logout = logout;
+window.changePassword = changePassword;
+window.start = start;
+window.stop = stop;
+window.resetSignals = resetSignals;
+window.enablePush = enablePush;
+
+
+
+async function simpleLoadMembers() {
   try {
-    for (const job of scanPlan) {
-      const { pairConfig } = job;
-      const stateKey = pairConfig.symbol + "|" + tf;
+    const data = await api("/api/admin/v10/members");
+    const rows = data.members || [];
+    const box = $("simpleMembers");
+    if (!box) return;
 
-      try {
-        const signal = await processPairTf(pairConfig, tf);
-        LAST_DISTANCE_BY_KEY[stateKey] = diagnosticDistance(signal);
-      } catch (error) {
-        console.error(
-          "[SCAN ERROR]",
-          pairConfig.symbol,
-          tfLabel(tf),
-          error.message
-        );
-      }
-
-      // Keep a buffer between Twelve Data requests.
-      await sleep(1500);
+    if (!rows.length) {
+      box.innerHTML = '<div class="sub">Belum ada member EA.</div>';
+      return;
     }
-  } finally {
-    runningByTf[tf] = false;
 
-    console.log(
-      "[WORKER]",
-      mode,
-      tfLabel(tf),
-      "scan selesai dalam",
-      Math.round((Date.now() - started) / 1000),
-      "detik"
-    );
+    box.innerHTML = rows.map(m => `
+      <div class="usercard">
+        <div class="row">
+          <span>
+            <b>${m.name || m.email}</b><br>
+            <span class="muted">${m.email} • MT5 ${m.mt5Account}</span><br>
+            <span class="muted">${m.broker || "-"} • berakhir ${m.expiresAt ? new Date(m.expiresAt).toLocaleString("id-ID") : "-"}</span>
+          </span>
+          <span class="badge">${m.status} • ${m.remainingDays ?? 0} hari</span>
+        </div>
+        <div class="mini">
+          <input id="days-${m.id}" type="number" min="1" value="30" placeholder="Hari">
+          <button class="btn2" onclick="simpleExtendMember('${m.id}')">TAMBAH HARI</button>
+          <button class="btn2" onclick="simpleSetMemberDays('${m.id}')">SET DARI HARI INI</button>
+        </div>
+        <button class="btn2" onclick="simpleToggleMember('${m.id}','${m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE"}')">
+          ${m.status === "ACTIVE" ? "SUSPEND" : "AKTIFKAN"}
+        </button>
+        <button class="btnred" onclick="simpleDeleteMember('${m.id}')">HAPUS</button>
+      </div>
+    `).join("");
+  } catch (error) {
+    log("Membership: " + error.message);
   }
 }
 
-async function main() {
-  console.log("==============================================");
-  console.log("DEWA SMC SERVER SCANNER WORKER V11.3 ATR SNAPSHOT + ATOMIC PIVOT TIME");
-  console.log("APP:", APP_BASE_URL);
-  console.log("PAIR ENV FALLBACK:", DEFAULT_PAIRS.join(", "));
-  console.log("TF ENV FALLBACK:", DEFAULT_TFS.join(", "));
-  console.log("FAST M5:", FAST_SCAN_SECONDS, "detik");
-  console.log("SLOW M15:", SLOW_SCAN_SECONDS, "detik");
-  console.log("CONFIG REFRESH:", SCAN_SECONDS, "detik");
-  console.log("==============================================");
+async function simpleAddMember() {
+  try {
+    await api("/api/admin/v10/members", {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("simpleMemberName").value,
+        email: $("simpleMemberEmail").value,
+        mt5Account: $("simpleMemberMt5").value,
+        broker: $("simpleMemberBroker").value,
+        days: Number($("simpleMemberDays").value || 30)
+      })
+    });
 
-  if (!ENABLED) {
-    console.log("[WORKER] WORKER_ENABLED=false. Worker tidak dijalankan.");
-    return;
+    ["simpleMemberName","simpleMemberEmail","simpleMemberMt5","simpleMemberBroker"]
+      .forEach(id => { if ($(id)) $(id).value = ""; });
+
+    alert("Member EA berhasil diaktifkan.");
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
   }
-
-  if (!API_KEYS.length) {
-    throw new Error("Tidak ada TWELVE_DATA_API_KEY_*");
-  }
-
-  await login();
-  await refreshWorkerConfig();
-
-  // Initial scan.
-  await runScannerForTf("5", "FAST");
-  await runScannerForTf("15", "SLOW");
-
-  // Fast M5 loop: catches PREPARE before breakout.
-  setInterval(() => {
-    runScannerForTf("5", "FAST").catch(error => {
-      console.error("[WORKER FAST LOOP]", error);
-    });
-  }, FAST_SCAN_SECONDS * 1000);
-
-  // Slower M15 loop.
-  setInterval(() => {
-    runScannerForTf("15", "SLOW").catch(error => {
-      console.error("[WORKER SLOW LOOP]", error);
-    });
-  }, SLOW_SCAN_SECONDS * 1000);
-
-  // Configuration refresh is independent from market scans.
-  setInterval(() => {
-    refreshWorkerConfig().catch(error => {
-      console.error("[WORKER CONFIG LOOP]", error);
-    });
-  }, SCAN_SECONDS * 1000);
 }
 
-main().catch(error => {
-  console.error("[WORKER START ERROR]", error);
-  process.exit(1);
-});
+async function simpleExtendMember(id) {
+  try {
+    const days = Number($("days-" + id).value || 30);
+    await api("/api/admin/v10/members/" + id + "/extend", {
+      method: "POST",
+      body: JSON.stringify({ days })
+    });
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleSetMemberDays(id) {
+  try {
+    const days = Number($("days-" + id).value || 30);
+    await api("/api/admin/v10/members/" + id + "/set-days", {
+      method: "POST",
+      body: JSON.stringify({ days })
+    });
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleToggleMember(id, status) {
+  try {
+    await api("/api/admin/v10/members/" + id, {
+      method: "PUT",
+      body: JSON.stringify({
+        status,
+        eaEnabled: status === "ACTIVE"
+      })
+    });
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleDeleteMember(id) {
+  if (!confirm("Hapus member ini?")) return;
+  try {
+    await api("/api/admin/v10/members/" + id, { method: "DELETE" });
+    await simpleLoadMembers();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleLoadPairs() {
+  try {
+    const data = await api("/api/admin/v10/pairs");
+    const rows = data.pairs || [];
+    const box = $("simplePairs");
+    if (!box) return;
+
+    box.innerHTML = rows.map(p => `
+      <div class="usercard">
+        <div class="row">
+          <span>
+            <b>${p.symbol}</b><br>
+            <span class="muted">TF ${(p.timeframes || []).map(x => "M" + x).join(", ")} • ${p.priority}</span>
+          </span>
+          <span class="badge">${p.enabled ? "SCAN ON" : "OFF"}</span>
+        </div>
+        <button class="btn2" onclick="simpleTogglePair('${p.id}',${!p.enabled})">
+          ${p.enabled ? "NONAKTIFKAN" : "AKTIFKAN"}
+        </button>
+        <button class="btnred" onclick="simpleDeletePair('${p.id}')">HAPUS</button>
+      </div>
+    `).join("");
+  } catch (error) {
+    log("Pair Management: " + error.message);
+  }
+}
+
+async function simpleAddPair() {
+  try {
+    await api("/api/admin/v10/pairs", {
+      method: "POST",
+      body: JSON.stringify({
+        symbol: $("v10PairSymbol").value,
+        timeframes: $("v10PairTf").value.split(","),
+        priority: $("v10PairPriority").value,
+        enabled: true
+      })
+    });
+    $("v10PairSymbol").value = "";
+    await simpleLoadPairs();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleTogglePair(id, enabled) {
+  try {
+    await api("/api/admin/v10/pairs/" + id, {
+      method: "PUT",
+      body: JSON.stringify({ enabled })
+    });
+    await simpleLoadPairs();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleDeletePair(id) {
+  if (!confirm("Hapus pair ini?")) return;
+  try {
+    await api("/api/admin/v10/pairs/" + id, { method: "DELETE" });
+    await simpleLoadPairs();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function simpleLoadAdmin() {
+  await Promise.allSettled([simpleLoadMembers(), simpleLoadPairs()]);
+}
+
+console.log("DEWA SMC WEB V12 ONE SOURCE OF TRUTH - signal dihitung Background Worker");

@@ -1,4 +1,5 @@
 require('dotenv').config();
+console.log('DEWA SMC V12 ONE SOURCE OF TRUTH: WEB = WORKER = EA');
 const express=require('express'),cors=require('cors'),fetch=require('node-fetch'),path=require('path'),fs=require('fs'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken'),webpush=require('web-push'),crypto=require('crypto'),{v4:uuid}=require('uuid');
 const { createClient } = require('@supabase/supabase-js');
 const { createEaV9Store } = require('./lib/ea-v9-store');
@@ -799,6 +800,172 @@ app.post('/api/signals/upsert',auth,(req,res)=>{
     });
   }
 });
+
+app.get('/api/scanner/current',auth,(req,res)=>{
+  try{
+    const tf=normalizeEaTimeframe(req.query.tf||'5');
+    const requestedEngine=String(req.query.engine||'SMC').toUpperCase();
+    const rawSymbols=String(req.query.symbols||'')
+      .split(',')
+      .map(x=>x.trim())
+      .filter(Boolean);
+
+    const requestedSymbols=rawSymbols
+      .map(normalizeEaSymbol)
+      .filter(Boolean);
+
+    const engineFamily=value=>{
+      const e=String(value||'').toUpperCase();
+      if(e.includes('HYBRID')) return 'HYBRID';
+      if(e.includes('SNIPER')) return 'SNIPER';
+      if(e.includes('SMC')) return 'SMC';
+      return e;
+    };
+
+    const requestedFamily=engineFamily(requestedEngine);
+    const terminalStatuses=[
+      'TP3',
+      'STOP_LOSS',
+      'CLOSED',
+      'CANCELLED',
+      'SUPERSEDED',
+      'ERROR'
+    ];
+
+    const all=eadb().signals
+      .filter(s=>{
+        const pair=normalizeEaSymbol(s.pair);
+        const signalTf=normalizeEaTimeframe(s.tf);
+        const exec=String(
+          (s.execution&&s.execution.status)||'NEW'
+        ).toUpperCase();
+
+        return (
+          pair &&
+          signalTf===tf &&
+          (!requestedSymbols.length || requestedSymbols.includes(pair)) &&
+          engineFamily(s.engine)===requestedFamily &&
+          String(s.lifecycleStatus||'ACTIVE').toUpperCase()!=='SUPERSEDED' &&
+          !terminalStatuses.includes(exec)
+        );
+      })
+      .sort((a,b)=>
+        new Date(b.updatedAt||b.createdAt||0)-
+        new Date(a.updatedAt||a.createdAt||0)
+      );
+
+    const latestByPair=new Map();
+    for(const s of all){
+      const pair=normalizeEaSymbol(s.pair);
+      if(!latestByPair.has(pair)){
+        latestByPair.set(pair,s);
+      }
+    }
+
+    const displayStatus=(s)=>{
+      const exec=String(
+        (s.execution&&s.execution.status)||'NEW'
+      ).toUpperCase();
+      const dir=String(s.direction||'').toUpperCase();
+
+      if(exec==='EXECUTED') return 'ACTIVE '+dir;
+      if(exec==='TP1') return 'TP1 HIT';
+      if(exec==='TP2') return 'TP2 HIT';
+      if(exec==='BREAKEVEN') return 'BREAKEVEN';
+      if(exec==='PARTIAL_CLOSE') return 'PARTIAL CLOSE';
+      if(exec==='NEW'){
+        const raw=String(s.signal||'').toUpperCase();
+        if(raw==='PREPARE LONG') return 'PREPARE LONG';
+        if(raw==='PREPARE SHORT') return 'PREPARE SHORT';
+        return raw||'NEW';
+      }
+      return exec;
+    };
+
+    const rows=[];
+
+    const symbolsToRender=requestedSymbols.length
+      ?requestedSymbols
+      :[...latestByPair.keys()];
+
+    for(const pair of symbolsToRender){
+      const s=latestByPair.get(pair);
+
+      if(!s){
+        rows.push({
+          pair,
+          symbol:pair,
+          tf:tf+'m',
+          source:'SERVER WORKER',
+          signal:'WAIT',
+          status:'NO ACTIVE SIGNAL',
+          direction:null,
+          entry:null,
+          tp1:null,
+          tp2:null,
+          tp3:null,
+          sl:null,
+          signalId:null,
+          emaConfirm:null,
+          engine:requestedFamily,
+          lifecycleStatus:null,
+          executionStatus:null,
+          updatedAt:null
+        });
+        continue;
+      }
+
+      const rawSignal=String(s.signal||'').toUpperCase();
+      const direction=String(
+        s.direction||
+        (rawSignal.includes('LONG')?'LONG':
+         rawSignal.includes('SHORT')?'SHORT':'')
+      ).toUpperCase()||null;
+
+      rows.push({
+        pair,
+        symbol:pair,
+        tf:normalizeEaTimeframe(s.tf)+'m',
+        source:'SERVER WORKER',
+        signal:rawSignal,
+        status:displayStatus(s),
+        direction,
+        entry:Number(s.entry||0)||null,
+        tp1:Number(s.tp1||0)||null,
+        tp2:Number(s.tp2||0)||null,
+        tp3:Number(s.tp3||0)||null,
+        sl:Number(s.sl||0)||null,
+        signalId:String(s.id||''),
+        emaConfirm:String(s.emaConfirm||''),
+        engine:String(s.engine||''),
+        lifecycleStatus:String(s.lifecycleStatus||'ACTIVE'),
+        executionStatus:String(
+          (s.execution&&s.execution.status)||'NEW'
+        ),
+        createdAt:s.createdAt||null,
+        updatedAt:s.updatedAt||s.createdAt||null
+      });
+    }
+
+    return res.json({
+      ok:true,
+      source:'EA_SIGNAL_STORE',
+      sourceOfTruth:'BACKGROUND_WORKER',
+      tf:tf+'m',
+      engine:requestedFamily,
+      count:rows.length,
+      rows
+    });
+
+  }catch(err){
+    console.error('scanner current error:',err);
+    return res.status(500).json({
+      ok:false,
+      error:err.message||'Gagal mengambil signal scanner worker'
+    });
+  }
+});
+
 app.get('/api/signals/analytics',auth,(req,res)=>{let all=sigdb().signals,win=all.filter(x=>x.result==='WIN').length,loss=all.filter(x=>x.result==='LOSS').length;res.json({today:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},allTime:{total:all.length,win,loss,running:all.length-win-loss,winrate:win+loss?+(win/(win+loss)*100).toFixed(2):0},pairs:[],latest:all.slice(-30).reverse()})});
 
 app.get('/api/push/public-key',auth,(req,res)=>{setupPush();res.json({publicKey:keys().publicKey})});

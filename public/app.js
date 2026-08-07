@@ -314,9 +314,8 @@ function stop() {
 }
 
 function resetSignals() {
-  locks = {};
-  saveLocks();
-  render();
+  scanQueue();
+  log("RESET SIGNAL sekarang hanya refresh tampilan. Source of truth ada di worker/server.");
 }
 
 function start() {
@@ -394,175 +393,132 @@ async function scanQueue(){
 
   queueRunning=true;
 
-  let list=symbols();
+  try{
+    let list=symbols();
 
-  if(limits&&list.length>limits.maxPairs){
-    list=list.slice(0,limits.maxPairs);
-  }
-
-  results=[];
-  render();
-
-  for(let i=0;i<list.length;i++){
-    let sym=list[i];
-
-    try{
-      let data=await fetchCandles(sym);
-      let htf=null;
-
-      try{
-        htf=await fetchCandles(sym,getHTFTf());
-      }catch(e){}
-
-      let sig=analyzeEngine(
-        sym,
-        data.candles,
-        data.source,
-        htf?htf.candles:null
-      );
-
-      let live=sig.livePrice;
-
-      if(locks[sym]){
-        const reverseStatus=reverseAllowed(sym,locks[sym],sig);
-        const replaceStatus=replaceAllowed(sym,locks[sym],sig);
-
-        if(reverseStatus){
-          sig.signal=reverseStatus;
-          sig.status=reverseStatus;
-          sig.color="purple";
-          sig.locked=true;
-
-          locks[sym]={
-            signal:sig.signal,
-            status:sig.status,
-            color:sig.color,
-            entry:sig.entry,
-            tp1:sig.tp1,
-            tp2:sig.tp2,
-            tp3:sig.tp3,
-            sl:sig.sl,
-            createdAt:new Date().toISOString(),
-            tf:tfLabel(),
-            pair:sym,
-            grade:sig.grade,
-            engine:sig.engine,
-            reverse:true
-          };
-
-          markReverse(sym);
-          saveLocks();
-          saveSignal(sym,sig);
-          broadcastSignal(sym,sig);
-
-        }else if(replaceStatus){
-          sig.signal=replaceStatus;
-          sig.status=replaceStatus;
-          sig.color="deepskyblue";
-          sig.locked=true;
-
-          locks[sym]={
-            signal:sig.signal,
-            status:sig.status,
-            color:sig.color,
-            entry:sig.entry,
-            tp1:sig.tp1,
-            tp2:sig.tp2,
-            tp3:sig.tp3,
-            sl:sig.sl,
-            createdAt:new Date().toISOString(),
-            tf:tfLabel(),
-            pair:sym,
-            grade:sig.grade,
-            engine:sig.engine,
-            replace:true
-          };
-
-          markReplace(sym);
-          saveLocks();
-          saveSignal(sym,sig);
-          broadcastSignal(sym,sig);
-
-        }else if(lockExpired(sym)){
-          delete locks[sym];
-          saveLocks();
-
-        }else{
-          let updated=updateLockedSignal(sym,live);
-
-          sig={
-            ...sig,
-            ...updated,
-            candles:sig.candles,
-            locked:true,
-            source:data.source
-          };
-        }
-      }
-
-      if(!locks[sym]&&["SMC LONG","SMC SHORT","SNIPER LONG","SNIPER SHORT","HYBRID CONFIRM"].includes(sig.status)){
-        locks[sym]={
-          signal:sig.signal,
-          status:"🔵 RUNNING",
-          color:"blue",
-          entry:sig.entry,
-          tp1:sig.tp1,
-          tp2:sig.tp2,
-          tp3:sig.tp3,
-          sl:sig.sl,
-          createdAt:new Date().toISOString(),
-          tf:tfLabel(),
-          pair:sym,
-          grade:sig.grade,
-          engine:sig.engine
-        };
-
-        saveLocks();
-        sig.status="🔵 RUNNING";
-        sig.color="blue";
-        sig.locked=true;
-
-        saveSignal(sym,sig);
-        broadcastSignal(sym,sig);
-      }
-
-      results.push(sig);
-      log(sym+" OK");
-
-    }catch(e){
-      results.push({
-        symbol:sym,
-        source:"-",
-        signal:"ERROR",
-        status:e.message,
-        color:"yellow",
-        candles:[]
-      });
-
-      log(sym+" error: "+e.message);
+    if(limits&&list.length>limits.maxPairs){
+      list=list.slice(0,limits.maxPairs);
     }
+
+    const tf=String($("tf").value||"5");
+    const engineRaw=String($("engine").value||"SMC").toUpperCase();
+
+    let engine="SMC";
+    if(engineRaw.includes("HYBRID")) engine="HYBRID";
+    else if(engineRaw.includes("SNIPER")) engine="SNIPER";
+
+    $("scanStatus").textContent="Sync worker...";
+
+    const q=new URLSearchParams({
+      tf,
+      engine,
+      symbols:list.join(",")
+    });
+
+    const data=await api("/api/scanner/current?"+q.toString());
+    const rows=Array.isArray(data.rows)?data.rows:[];
+
+    results=rows.map(r=>{
+      const rawSignal=String(r.signal||"WAIT").toUpperCase();
+      const status=String(r.status||"NO ACTIVE SIGNAL").toUpperCase();
+      const direction=String(r.direction||"").toUpperCase();
+
+      let color="yellow";
+      if(direction==="LONG") color="green";
+      if(direction==="SHORT") color="red";
+      if(status.includes("TP")) color="green";
+      if(status.includes("STOP")||status.includes("SL")) color="red";
+
+      return {
+        symbol:r.symbol||r.pair,
+        source:"SERVER WORKER",
+        signal:rawSignal,
+        status:r.status||"NO ACTIVE SIGNAL",
+        color,
+        entry:r.entry,
+        tp1:r.tp1,
+        tp2:r.tp2,
+        tp3:r.tp3,
+        sl:r.sl,
+        candles:[],
+        structureHigh:null,
+        structureLow:null,
+        atr:null,
+        locked:!!r.signalId,
+        signalId:r.signalId,
+        emaConfirm:r.emaConfirm,
+        engine:r.engine,
+        createdAt:r.createdAt,
+        updatedAt:r.updatedAt,
+        aiAnalysis:
+          "<b>⚡ ONE SOURCE OF TRUTH</b><br>"+
+          "<b>Signal ID:</b> "+(r.signalId||"-")+"<br>"+
+          "<b>Source:</b> Background Worker<br>"+
+          "<b>Engine:</b> "+(r.engine||engine)+"<br>"+
+          "<b>EMA:</b> "+(r.emaConfirm||"-")+"<br>"+
+          "<b>Lifecycle:</b> "+(r.lifecycleStatus||"-")+"<br>"+
+          "<b>Execution:</b> "+(r.executionStatus||"-")
+      };
+    });
 
     render();
 
-    if(results.length===1)pick(results[0].symbol);
+    if(results.length){
+      const keep=selected&&results.find(x=>x.symbol===selected.symbol);
+      pick(keep?keep.symbol:results[0].symbol);
+    }
 
-    if(i<list.length-1){
-      await sleep(Math.max(Number($("delay").value),limits?limits.delayMs:0));
-  }
-  }
+    $("scanStatus").textContent=
+      "Synced • Source: Background Worker • "+new Date().toLocaleTimeString("id-ID");
 
-  $("scanStatus").textContent="Scan complete";
-  queueRunning=false;
-  loadAnalytics();
+    log("Web sync OK: "+rows.length+" pair dari Background Worker");
+
+  }catch(e){
+    $("scanStatus").textContent="Sync error";
+    log("Web worker sync error: "+e.message);
+  }finally{
+    queueRunning=false;
+  }
 }
-  
+
 function updateLockedSignal(sym,price){let L=locks[sym];if(!L||!Number.isFinite(price))return L;if(L.signal==="OPEN LONG"){if(price>=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price>=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price>=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price<=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}if(L.signal==="OPEN SHORT"){if(price<=L.tp3){L.status="🏆 FULL TP";L.color="green"}else if(price<=L.tp2){L.status="🟢 TP2 HIT";L.color="green"}else if(price<=L.tp1){L.status="🟢 TP1 HIT";L.color="green"}else if(price>=L.sl){L.status="🔴 SL HIT";L.color="red"}else{L.status="🔵 RUNNING";L.color="blue"}}saveSignal(sym,L);return L}async function saveSignal(sym,r){try{if(!r.entry)return;await api("/api/signals/upsert",{method:"POST",body:JSON.stringify({key:`${sym}|${r.tf||tfLabel()}|${r.signal}|${r.entry}`,pair:sym,tf:r.tf||tfLabel(),signal:r.signal,entry:r.entry,tp1:r.tp1,tp2:r.tp2,tp3:r.tp3,sl:r.sl,status:r.status,createdAt:r.createdAt||new Date().toISOString(),grade:r.grade,engine:r.engine})})}catch(e){}}
 function ema(a,p){if(!a.length)return NaN;let k=2/(p+1),e=a[0];for(let i=1;i<a.length;i++)e=a[i]*k+e*(1-k);return e}function atr(c,p=14){let t=[];for(let i=1;i<c.length;i++)t.push(Math.max(c[i].high-c[i].low,Math.abs(c[i].high-c[i-1].close),Math.abs(c[i].low-c[i-1].close)));let s=t.slice(-p);return s.length?s.reduce((a,b)=>a+b,0)/s.length:0}function sma(a,p){let s=a.slice(-p);return s.length?s.reduce((x,y)=>x+y,0)/s.length:0}function seriesEma(v,p){let out=Array(v.length).fill(null),k=2/(p+1),e=v[0];out[0]=e;for(let i=1;i<v.length;i++){e=v[i]*k+e*(1-k);out[i]=e}return out}function pineRsi(v,p=14){if(v.length<=p)return 50;let g=0,l=0;for(let i=1;i<=p;i++){let d=v[i]-v[i-1];if(d>=0)g+=d;else l-=d}let ag=g/p,al=l/p;for(let i=p+1;i<v.length;i++){let d=v[i]-v[i-1];ag=(ag*(p-1)+Math.max(d,0))/p;al=(al*(p-1)+Math.max(-d,0))/p}if(al===0)return 100;return 100-(100/(1+ag/al))}function pineMacd(v){let e12=seriesEma(v,12),e26=seriesEma(v,26),m=v.map((_,i)=>(e12[i]||0)-(e26[i]||0)),s=seriesEma(m,9),i=v.length-1;return{macdVal:m[i]||0,macdSig:s[i]||0,macdHist:(m[i]||0)-(s[i]||0)}}function getGrade(s){if(s>=8)return"A+";if(s>=6.5)return"A";if(s>=5)return"B";return"C"}function dmi(c,p=14){let trs=[],pd=[],md=[];for(let i=1;i<c.length;i++){let up=c[i].high-c[i-1].high,down=c[i-1].low-c[i].low;trs.push(Math.max(c[i].high-c[i].low,Math.abs(c[i].high-c[i-1].close),Math.abs(c[i].low-c[i-1].close)));pd.push(up>down&&up>0?up:0);md.push(down>up&&down>0?down:0)}let tr=sma(trs,p),diPlus=tr?100*sma(pd,p)/tr:0,diMinus=tr?100*sma(md,p)/tr:0,adx=(diPlus+diMinus)?100*Math.abs(diPlus-diMinus)/(diPlus+diMinus):0;return{adx,diPlus,diMinus}}function vwap(c){let pv=0,v=0;for(let k of c){let vol=k.volume||1,typ=(k.high+k.low+k.close)/3;pv+=typ*vol;v+=vol}return v?pv/v:c[c.length-1].close}
 function pineParams(){let tf=Number($("tf").value||5);if(tf<=5)return{preset:"Scalping",emaFast:5,emaSlow:13,emaTrend:34,rsiLen:8,atrLen:10,effectiveScore:4,slMult:.8};if(tf<=60)return{preset:"Default",emaFast:9,emaSlow:21,emaTrend:55,rsiLen:13,atrLen:14,effectiveScore:5,slMult:1.5};return{preset:"Swing",emaFast:13,emaSlow:34,emaTrend:89,rsiLen:21,atrLen:20,effectiveScore:6,slMult:2.5}}
 function analyzeSMCPine(symbol,candles,source,htfCandles){let c=candles.slice(0,-1),live=candles[candles.length-1];if(c.length<80)return{symbol,source,signal:"WAIT",status:"DATA LOW",color:"yellow",candles:c,engine:"SMC PINE",livePrice:live?.close};let last=c[c.length-1],close=c.map(x=>x.close),e9=ema(close.slice(-80),9),e20=ema(close.slice(-80),20),a=atr(c,14),s=c.slice(-20),structureHigh=Math.max(...s.map(x=>x.high)),structureLow=Math.min(...s.map(x=>x.low)),bosBull=last.close>structureHigh,bosBear=last.close<structureLow,emaLong=e9>e20&&last.close>e9,emaShort=e9<e20&&last.close<e9,htfBias=e9>e20?1:-1;if(htfCandles&&htfCandles.length>50){let hc=htfCandles.slice(0,-1).map(x=>x.close),hf=ema(hc.slice(-80),9),hs=ema(hc.slice(-80),20);htfBias=hf>hs?1:hf<hs?-1:0}let score=0;if(bosBull||bosBear)score+=2;if(emaLong||emaShort)score+=1.5;score+=1;if((bosBull&&htfBias===1)||(bosBear&&htfBias===-1))score+=1.5;let grade=getGrade(score),signal="WAIT",status="NO TRADE",color="yellow",entry,tp1,tp2,tp3,sl,target=a*2;if(bosBull&&emaLong&&htfBias!==-1&&score>=5){signal="OPEN LONG";status="SMC LONG";color="green";entry=structureHigh;tp1=entry+target*.8;tp2=entry+target*1.6;tp3=entry+target*2.8;sl=entry-target*1.2}else if(bosBear&&emaShort&&htfBias!==1&&score>=5){signal="OPEN SHORT";status="SMC SHORT";color="red";entry=structureLow;tp1=entry-target*.8;tp2=entry-target*1.6;tp3=entry-target*2.8;sl=entry+target*1.2}let aiAnalysis=`<b>⚡ DEWA SMC AI</b><br><b>Pair:</b> ${symbol}<br><b>Engine:</b> SMC PINE<br><b>HTF:</b> ${htfBias===1?"Bullish":"Bearish"}<br><b>Grade:</b> ${grade}<br><br><b>Entry:</b> ${priceFmt(symbol,entry)}<br><b>TP1:</b> ${priceFmt(symbol,tp1)}<br><b>TP2:</b> ${priceFmt(symbol,tp2)}<br><b>TP3:</b> ${priceFmt(symbol,tp3)}<br><b>SL:</b> ${priceFmt(symbol,sl)}`;return{symbol,source,signal,status,color,entry,tp1,tp2,tp3,sl,candles:c,structureHigh,structureLow,atr:a,volOk:true,locked:false,livePrice:live.close,engine:"SMC PINE",grade,score,aiAnalysis}}
 function analyzeSniperFull(symbol,candles,source,htfCandles){let c=candles.slice(0,-1),live=candles[candles.length-1];if(c.length<80)return{symbol,source,signal:"WAIT",status:"DATA LOW",color:"yellow",candles:c,engine:"SNIPER PINE HTF",livePrice:live?.close};let p=pineParams(),last=c[c.length-1],close=c.map(x=>x.close),ef=seriesEma(close,p.emaFast),es=seriesEma(close,p.emaSlow),et=ema(close.slice(-140),p.emaTrend),emaFast=ef.at(-1),emaSlow=es.at(-1),prevFast=ef.at(-2),prevSlow=es.at(-2),rsi=pineRsi(close,p.rsiLen),mac=pineMacd(close),adx=dmi(c,14),vw=vwap(c),a=atr(c,p.atrLen),vol=c.map(x=>x.volume||1),volAbove=vol.at(-1)>sma(vol,20)*1.2,htfBias=emaFast>emaSlow?1:-1;if(htfCandles&&htfCandles.length>50){let hc=htfCandles.slice(0,-1).map(x=>x.close),hf=ema(hc.slice(-120),p.emaFast),hs=ema(hc.slice(-120),p.emaSlow),ht=ema(hc.slice(-140),p.emaTrend);htfBias=(hf>hs&&hc.at(-1)>ht)?1:(hf<hs&&hc.at(-1)<ht)?-1:0}let bull=0,bear=0;bull+=emaFast>emaSlow?1:0;bear+=emaFast<emaSlow?1:0;bull+=last.close>et?1:0;bear+=last.close<et?1:0;bull+=rsi>50&&rsi<75?1:0;bear+=rsi<50&&rsi>25?1:0;bull+=mac.macdHist>0?1:0;bear+=mac.macdHist<0?1:0;bull+=mac.macdVal>mac.macdSig?1:0;bear+=mac.macdVal<mac.macdSig?1:0;bull+=last.close>vw?1:0;bear+=last.close<vw?1:0;bull+=volAbove?1:0;bear+=volAbove?1:0;bull+=adx.adx>20&&adx.diPlus>adx.diMinus?1:0;bear+=adx.adx>20&&adx.diMinus>adx.diPlus?1:0;bull+=htfBias===1?1.5:0;bear+=htfBias===-1?1.5:0;let crossB=prevFast<=prevSlow&&emaFast>emaSlow,crossS=prevFast>=prevSlow&&emaFast<emaSlow,rawB=crossB&&last.close>emaFast&&last.close>emaSlow&&rsi<75&&bull>=p.effectiveScore&&bull>=6.5,rawS=crossS&&last.close<emaFast&&last.close<emaSlow&&rsi>25&&bear>=p.effectiveScore&&bear>=6.5,lastDir=DEWA_LAST_DIR[symbol]||0,signal="WAIT",status="NO TRADE",color="yellow",entry,tp1,tp2,tp3,sl,grade=getGrade(Math.max(bull,bear)),sh=Math.max(...c.slice(-10).map(x=>x.high)),lo=Math.min(...c.slice(-10).map(x=>x.low));if(rawB&&lastDir!==1){entry=last.close;sl=Math.max(entry-a*p.slMult,lo-a*.2);let risk=Math.abs(entry-sl);tp1=entry+risk;tp2=entry+risk*2;tp3=entry+risk*3;signal="OPEN LONG";status="SNIPER LONG";color="green";DEWA_LAST_DIR[symbol]=1;saveLastDir()}else if(rawS&&lastDir!==-1){entry=last.close;sl=Math.min(entry+a*p.slMult,sh+a*.2);let risk=Math.abs(entry-sl);tp1=entry-risk;tp2=entry-risk*2;tp3=entry-risk*3;signal="OPEN SHORT";status="SNIPER SHORT";color="red";DEWA_LAST_DIR[symbol]=-1;saveLastDir()}let aiAnalysis=`<b>⚡ DEWA SNIPER AI</b><br><b>Pair:</b> ${symbol}<br><b>Engine:</b> SNIPER PINE HTF<br><b>Bull:</b> ${bull} | <b>Bear:</b> ${bear} | <b>Grade:</b> ${grade}<br><b>HTF:</b> ${htfBias===1?"Bullish":"Bearish"}<br><br><b>Entry:</b> ${priceFmt(symbol,entry)}<br><b>TP1:</b> ${priceFmt(symbol,tp1)}<br><b>TP2:</b> ${priceFmt(symbol,tp2)}<br><b>TP3:</b> ${priceFmt(symbol,tp3)}<br><b>SL:</b> ${priceFmt(symbol,sl)}`;return{symbol,source,signal,status,color,entry,tp1,tp2,tp3,sl,candles:c,structureHigh:sh,structureLow:lo,atr:a,volOk:true,locked:false,livePrice:live.close,engine:"SNIPER PINE HTF",bullScore:bull,bearScore:bear,grade,aiAnalysis}}
 function analyzeHybrid(symbol,candles,source,htf){let smc=analyzeSMCPine(symbol,candles,source,htf),sn=analyzeSniperFull(symbol,candles,source,htf);if(smc.signal===sn.signal&&smc.signal!=="WAIT"&&["A","A+"].includes(sn.grade))return{...sn,status:"HYBRID CONFIRM",engine:"HYBRID PINE HTF"};return{...sn,signal:"WAIT",status:"WAIT HYBRID",color:"yellow",engine:"HYBRID PINE HTF"}}function analyzeEngine(symbol,candles,source,htf){let mode=$("engine").value;if(mode==="sniper")return analyzeSniperFull(symbol,candles,source,htf);if(mode==="hybrid")return analyzeHybrid(symbol,candles,source,htf);return analyzeSMCPine(symbol,candles,source,htf)}
-function render(){$("body").innerHTML=results.length?results.map((r,i)=>`<tr onclick="pick('${r.symbol}')"><td>${i+1}</td><td>${r.symbol}</td><td>${r.source||"-"}</td><td class="${r.color}"><b>${displaySignalName(r.signal,r.status)}</b></td><td class="${r.color}"><b>${r.status}</b></td><td>${priceFmt(r.symbol,r.entry)}</td><td>${priceFmt(r.symbol,r.tp1)}</td><td>${priceFmt(r.symbol,r.tp2)}</td><td>${priceFmt(r.symbol,r.tp3)}</td><td>${priceFmt(r.symbol,r.sl)}</td><td>${r.locked?"🔒 LOCKED":"-"}</td></tr>`).join(""):'<tr><td colspan="11" class="muted">Waiting scan...</td></tr>';$("stTotal").textContent=results.length;$("stLong").textContent=results.filter(r=>r.signal==="OPEN LONG").length;$("stShort").textContent=results.filter(r=>r.signal==="OPEN SHORT").length;$("stWait").textContent=results.filter(r=>["WAIT","🔵 RUNNING","WAIT HYBRID","NO TRADE"].includes(r.status)).length;$("stErr").textContent=results.filter(r=>r.signal==="ERROR").length}function pick(sym){let r=results.find(x=>x.symbol===sym);if(!r)return;selected=r;$("chartTitle").textContent=r.symbol+" - "+r.signal;$("mSignal").textContent=r.signal;$("mSignal").className=r.color;$("mStatus").textContent=r.status;$("mStatus").className=r.color;$("mSource").textContent=r.source||"-";$("mHigh").textContent=priceFmt(r.symbol,r.structureHigh);$("mLow").textContent=priceFmt(r.symbol,r.structureLow);$("dEntry").textContent=priceFmt(r.symbol,r.entry);$("dTP1").textContent=priceFmt(r.symbol,r.tp1);$("dTP2").textContent=priceFmt(r.symbol,r.tp2);$("dTP3").textContent=priceFmt(r.symbol,r.tp3);$("dSL").textContent=priceFmt(r.symbol,r.sl);$("dATR").textContent=priceFmt(r.symbol,r.atr);$("aiAnalysis").innerHTML=r.aiAnalysis||"Belum ada analisa";draw(r);calcLot()}
+function render(){
+  $("body").innerHTML=results.length
+    ?results.map((r,i)=>`
+      <tr onclick="pick('${r.symbol}')">
+        <td>${i+1}</td>
+        <td>${r.symbol}</td>
+        <td>${r.source||"-"}</td>
+        <td class="${r.color}"><b>${displaySignalName(r.signal,r.status)}</b></td>
+        <td class="${r.color}"><b>${r.status}</b></td>
+        <td>${priceFmt(r.symbol,r.entry)}</td>
+        <td>${priceFmt(r.symbol,r.tp1)}</td>
+        <td>${priceFmt(r.symbol,r.tp2)}</td>
+        <td>${priceFmt(r.symbol,r.tp3)}</td>
+        <td>${priceFmt(r.symbol,r.sl)}</td>
+        <td>${r.signalId?"#"+r.signalId:"-"}</td>
+      </tr>`).join("")
+    :'<tr><td colspan="11" class="muted">No worker signal.</td></tr>';
+
+  $("stTotal").textContent=results.length;
+  $("stLong").textContent=results.filter(r=>
+    String(r.signal||"").includes("LONG")||
+    String(r.status||"").includes("LONG")
+  ).length;
+  $("stShort").textContent=results.filter(r=>
+    String(r.signal||"").includes("SHORT")||
+    String(r.status||"").includes("SHORT")
+  ).length;
+  $("stWait").textContent=results.filter(r=>
+    !r.signalId||String(r.signal||"")==="WAIT"
+  ).length;
+  $("stErr").textContent=0;
+}function pick(sym){let r=results.find(x=>x.symbol===sym);if(!r)return;selected=r;$("chartTitle").textContent=r.symbol+" - "+r.signal;$("mSignal").textContent=r.signal;$("mSignal").className=r.color;$("mStatus").textContent=r.status;$("mStatus").className=r.color;$("mSource").textContent=r.source||"-";$("mHigh").textContent=priceFmt(r.symbol,r.structureHigh);$("mLow").textContent=priceFmt(r.symbol,r.structureLow);$("dEntry").textContent=priceFmt(r.symbol,r.entry);$("dTP1").textContent=priceFmt(r.symbol,r.tp1);$("dTP2").textContent=priceFmt(r.symbol,r.tp2);$("dTP3").textContent=priceFmt(r.symbol,r.tp3);$("dSL").textContent=priceFmt(r.symbol,r.sl);$("dATR").textContent=priceFmt(r.symbol,r.atr);$("aiAnalysis").innerHTML=r.aiAnalysis||"Belum ada analisa";draw(r);calcLot()}
 function getSymbolSpec(pair){
   const symbol = String(pair || "")
     .toUpperCase()
@@ -1952,91 +1908,39 @@ window.enablePush = enablePush;
 
 
 
-
-let SIMPLE_MEMBER_CACHE = [];
-let SIMPLE_MEMBER_FILTERED = null;
-
-function simpleMemberSearchText(m){
-  return [
-    m && (m.name || m.memberName),
-    m && m.email,
-    m && m.mt5Account,
-    m && m.broker,
-    m && m.status
-  ].filter(Boolean).join(" ").toLowerCase();
-}
-
-function simpleFilterMembers(){
-  const q = String(($("simpleMemberSearch") && $("simpleMemberSearch").value) || "")
-    .trim().toLowerCase();
-  const tokens = q.split(/\s+/).filter(Boolean);
-
-  SIMPLE_MEMBER_FILTERED = !tokens.length
-    ? null
-    : SIMPLE_MEMBER_CACHE.filter(m => {
-        const text = simpleMemberSearchText(m);
-        return tokens.every(t => text.includes(t));
-      });
-
-  simpleRenderMemberSearch();
-}
-
-function simpleClearMemberSearch(){
-  const el = $("simpleMemberSearch");
-  if(el) el.value = "";
-  SIMPLE_MEMBER_FILTERED = null;
-  simpleRenderMemberSearch();
-  if(el) el.focus();
-}
-
-function simpleRenderMemberSearch(){
-  const rows = SIMPLE_MEMBER_FILTERED || SIMPLE_MEMBER_CACHE;
-  const info = $("simpleMemberSearchInfo");
-  if(info){
-    info.textContent = SIMPLE_MEMBER_FILTERED
-      ? `${rows.length} dari ${SIMPLE_MEMBER_CACHE.length} member`
-      : `${SIMPLE_MEMBER_CACHE.length} member`;
-  }
-
-  const box = $("simpleMembers");
-  if(!box) return;
-
-  if(!rows.length){
-    box.innerHTML = '<div class="sub">Member tidak ditemukan.</div>';
-    return;
-  }
-
-  box.innerHTML = rows.map(m => `
-    <div class="usercard">
-      <div class="row">
-        <span>
-          <b>${m.name || m.email}</b><br>
-          <span class="muted">${m.email} • MT5 ${m.mt5Account}</span><br>
-          <span class="muted">${m.broker || "-"} • berakhir ${m.expiresAt ? new Date(m.expiresAt).toLocaleString("id-ID") : "-"}</span>
-        </span>
-        <span class="badge">${m.status} • ${m.remainingDays ?? 0} hari</span>
-      </div>
-
-      <div class="mini">
-        <input id="days-${m.id}" type="number" min="1" value="30" placeholder="Hari">
-        <button class="btn2" onclick="simpleExtendMember('${m.id}')">TAMBAH HARI</button>
-        <button class="btn2" onclick="simpleSetMemberDays('${m.id}')">SET DARI HARI INI</button>
-      </div>
-
-      <button class="btn2" onclick="simpleToggleMember('${m.id}','${m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE"}')">
-        ${m.status === "ACTIVE" ? "SUSPEND" : "AKTIFKAN"}
-      </button>
-
-      <button class="btnred" onclick="simpleDeleteMember('${m.id}')">HAPUS</button>
-    </div>
-  `).join("");
-}
-
 async function simpleLoadMembers() {
   try {
     const data = await api("/api/admin/v10/members");
-    SIMPLE_MEMBER_CACHE = Array.isArray(data.members) ? data.members : [];
-    simpleFilterMembers();
+    const rows = data.members || [];
+    const box = $("simpleMembers");
+    if (!box) return;
+
+    if (!rows.length) {
+      box.innerHTML = '<div class="sub">Belum ada member EA.</div>';
+      return;
+    }
+
+    box.innerHTML = rows.map(m => `
+      <div class="usercard">
+        <div class="row">
+          <span>
+            <b>${m.name || m.email}</b><br>
+            <span class="muted">${m.email} • MT5 ${m.mt5Account}</span><br>
+            <span class="muted">${m.broker || "-"} • berakhir ${m.expiresAt ? new Date(m.expiresAt).toLocaleString("id-ID") : "-"}</span>
+          </span>
+          <span class="badge">${m.status} • ${m.remainingDays ?? 0} hari</span>
+        </div>
+        <div class="mini">
+          <input id="days-${m.id}" type="number" min="1" value="30" placeholder="Hari">
+          <button class="btn2" onclick="simpleExtendMember('${m.id}')">TAMBAH HARI</button>
+          <button class="btn2" onclick="simpleSetMemberDays('${m.id}')">SET DARI HARI INI</button>
+        </div>
+        <button class="btn2" onclick="simpleToggleMember('${m.id}','${m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE"}')">
+          ${m.status === "ACTIVE" ? "SUSPEND" : "AKTIFKAN"}
+        </button>
+        <button class="btnred" onclick="simpleDeleteMember('${m.id}')">HAPUS</button>
+      </div>
+    `).join("");
   } catch (error) {
     log("Membership: " + error.message);
   }
@@ -2065,53 +1969,13 @@ async function simpleAddMember() {
   }
 }
 
-
-function simpleFindMember(id){
-  return SIMPLE_MEMBER_CACHE.find(m => String(m.id) === String(id)) || null;
-}
-
-function simpleMemberLabel(member){
-  if(!member) return "member ini";
-  const name = member.name || member.memberName || member.email || "Member";
-  const mt5 = member.mt5Account ? ` • MT5 ${member.mt5Account}` : "";
-  return `${name}${mt5}`;
-}
-
-function simpleConfirmLayered(title, detail, finalWarning){
-  const first = confirm(
-    `${title}\n\n${detail}\n\nLanjutkan ke konfirmasi kedua?`
-  );
-  if(!first) return false;
-
-  return confirm(
-    `KONFIRMASI TERAKHIR\n\n${finalWarning}\n\nTekan OK hanya jika Anda benar-benar yakin.`
-  );
-}
-
 async function simpleExtendMember(id) {
   try {
-    const member = simpleFindMember(id);
     const days = Number($("days-" + id).value || 30);
-
-    if(!Number.isFinite(days) || days < 1){
-      alert("Jumlah hari tidak valid.");
-      return;
-    }
-
-    const ok = simpleConfirmLayered(
-      "Tambah masa aktif?",
-      `${simpleMemberLabel(member)}
-Tambah ${days} hari dari masa aktif yang sekarang.`,
-      `Masa aktif ${simpleMemberLabel(member)} akan DITAMBAH ${days} hari.`
-    );
-    if(!ok) return;
-
     await api("/api/admin/v10/members/" + id + "/extend", {
       method: "POST",
       body: JSON.stringify({ days })
     });
-
-    alert(`Berhasil menambah ${days} hari.`);
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
@@ -2120,33 +1984,11 @@ Tambah ${days} hari dari masa aktif yang sekarang.`,
 
 async function simpleSetMemberDays(id) {
   try {
-    const member = simpleFindMember(id);
     const days = Number($("days-" + id).value || 30);
-
-    if(!Number.isFinite(days) || days < 1){
-      alert("Jumlah hari tidak valid.");
-      return;
-    }
-
-    const currentExpiry = member && member.expiresAt
-      ? new Date(member.expiresAt).toLocaleString("id-ID")
-      : "-";
-
-    const ok = simpleConfirmLayered(
-      "Set ulang masa aktif dari hari ini?",
-      `${simpleMemberLabel(member)}
-Expired saat ini: ${currentExpiry}
-Akan diubah menjadi ${days} hari dihitung dari hari ini.`,
-      `PERHATIAN: tanggal expired lama akan diganti. Masa aktif baru = ${days} hari dari hari ini.`
-    );
-    if(!ok) return;
-
     await api("/api/admin/v10/members/" + id + "/set-days", {
       method: "POST",
       body: JSON.stringify({ days })
     });
-
-    alert(`Masa aktif berhasil diset ${days} hari dari hari ini.`);
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
@@ -2155,27 +1997,13 @@ Akan diubah menjadi ${days} hari dihitung dari hari ini.`,
 
 async function simpleToggleMember(id, status) {
   try {
-    const member = simpleFindMember(id);
-    const isActive = status === "ACTIVE";
-    const action = isActive ? "AKTIFKAN" : "SUSPEND";
-
-    const ok = simpleConfirmLayered(
-      `${action} member?`,
-      `${simpleMemberLabel(member)}
-Status akan diubah menjadi ${status}.`,
-      `${action} ${simpleMemberLabel(member)} sekarang?`
-    );
-    if(!ok) return;
-
     await api("/api/admin/v10/members/" + id, {
       method: "PUT",
       body: JSON.stringify({
         status,
-        eaEnabled: isActive
+        eaEnabled: status === "ACTIVE"
       })
     });
-
-    alert(`Status member berhasil diubah menjadi ${status}.`);
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
@@ -2183,21 +2011,9 @@ Status akan diubah menjadi ${status}.`,
 }
 
 async function simpleDeleteMember(id) {
-  const member = simpleFindMember(id);
-  const label = simpleMemberLabel(member);
-
-  const ok = simpleConfirmLayered(
-    "Hapus member?",
-    `${label}
-Data member akan dihapus dari sistem membership.`,
-    `HAPUS PERMANEN ${label}?
-Tindakan ini tidak dapat dibatalkan dari tombol Undo.`
-  );
-  if(!ok) return;
-
+  if (!confirm("Hapus member ini?")) return;
   try {
     await api("/api/admin/v10/members/" + id, { method: "DELETE" });
-    alert("Member berhasil dihapus.");
     await simpleLoadMembers();
   } catch (error) {
     alert(error.message);
@@ -2274,3 +2090,5 @@ async function simpleDeletePair(id) {
 async function simpleLoadAdmin() {
   await Promise.allSettled([simpleLoadMembers(), simpleLoadPairs()]);
 }
+
+console.log("DEWA SMC WEB V12 ONE SOURCE OF TRUTH - signal dihitung Background Worker");
